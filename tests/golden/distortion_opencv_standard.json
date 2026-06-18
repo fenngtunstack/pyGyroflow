@@ -1,0 +1,106 @@
+{
+  "description": "Distortion model reference: opencv_standard",
+  "model": "opencv_standard",
+  "coefficients": {
+    "k1": [
+      -0.05,
+      0.01,
+      0.0,
+      0.0
+    ],
+    "k2": [
+      0.001,
+      -0.001,
+      0.0,
+      0.0
+    ],
+    "k3": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "test_points": [
+    {
+      "input_3d": [
+        0.1,
+        0.2,
+        1.0
+      ],
+      "distorted": [
+        0.09975750037147489,
+        0.19951500074294978
+      ],
+      "undistorted": [
+        0.09999999999999998,
+        0.19999999999999996
+      ],
+      "roundtrip_error": 6.206335383118183e-17
+    },
+    {
+      "input_3d": [
+        0.3,
+        0.4,
+        1.0
+      ],
+      "distorted": [
+        0.29651631652280397,
+        0.39535508869707203
+      ],
+      "undistorted": [
+        0.3,
+        0.4
+      ],
+      "roundtrip_error": 0.0
+    },
+    {
+      "input_3d": [
+        -0.2,
+        0.3,
+        1.0
+      ],
+      "distorted": [
+        -0.19876007819128602,
+        0.298140117286929
+      ],
+      "undistorted": [
+        -0.2,
+        0.3
+      ],
+      "roundtrip_error": 0.0
+    },
+    {
+      "input_3d": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "distorted": [
+        0.0,
+        0.49419386087134
+      ],
+      "undistorted": [
+        0.0,
+        0.5
+      ],
+      "roundtrip_error": 0.0
+    },
+    {
+      "input_3d": [
+        0.5,
+        0.0,
+        1.0
+      ],
+      "distorted": [
+        0.49419386087134,
+        0.0
+      ],
+      "undistorted": [
+        0.5,
+        0.0
+      ],
+      "roundtrip_error": 0.0
+    }
+  ]
+}

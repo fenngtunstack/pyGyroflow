@@ -1,0 +1,94 @@
+<mxGraphModel>
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+    
+    <!-- Title -->
+    <mxCell id="t1" value="PyGyroFlow 系统架构" style="text;html=1;fontSize=20;fontStyle=1;align=center;verticalAlign=middle;fillColor=none;strokeColor=none;fontColor=#1a1a2e;" vertex="1" parent="1">
+      <mxGeometry x="200" y="10" width="400" height="40" as="geometry"/>
+    </mxCell>
+    
+    <!-- Layer 0: Types -->
+    <mxCell id="L0" value="Layer 0: 基础类型" style="rounded=1;whiteSpace=wrap;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=5;" vertex="1" parent="1">
+      <mxGeometry x="40" y="60" width="720" height="90" as="geometry"/>
+    </mxCell>
+    <mxCell id="m01" value="Quat64&#xa;(scipy Rotation)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="60" y="90" width="120" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m02" value="KernelParams&#xa;(ctypes 320B)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="200" y="90" width="120" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m03" value="TimeQuat / TimeIMU&#xa;(dict + dataclass)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="340" y="90" width="130" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m04" value="Enums / Errors&#xa;(ReadoutDir, DistModel)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="490" y="90" width="140" height="45" as="geometry"/>
+    </mxCell>
+    
+    <!-- Layer 1: Data Processing -->
+    <mxCell id="L1" value="Layer 1: 数据处理" style="rounded=1;whiteSpace=wrap;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=5;" vertex="1" parent="1">
+      <mxGeometry x="40" y="165" width="720" height="90" as="geometry"/>
+    </mxCell>
+    <mxCell id="m11" value="IMU 积分&#xa;(6种算法)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="60" y="195" width="110" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m12" value="滤波&#xa;(Butterworth + Median)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="190" y="195" width="130" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m13" value="镜头标定&#xa;(Profile + DB + Calibrator)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="340" y="195" width="150" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m14" value="关键帧&#xa;(27种 + Easing)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="510" y="195" width="120" height="45" as="geometry"/>
+    </mxCell>
+    
+    <!-- Layer 2: Stabilization Core -->
+    <mxCell id="L2" value="Layer 2: 防抖核心" style="rounded=1;whiteSpace=wrap;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=5;" vertex="1" parent="1">
+      <mxGeometry x="40" y="270" width="720" height="90" as="geometry"/>
+    </mxCell>
+    <mxCell id="m21" value="平滑算法&#xa;(Default/Plain/Fixed/Horizon)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="60" y="300" width="160" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m22" value="畸变模型&#xa;(10种: Fisheye→GoPro)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="240" y="300" width="150" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m23" value="帧变换&#xa;(FrameTransform + RS校正)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="410" y="300" width="160" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m24" value="自适应缩放&#xa;(FOV迭代 + 动态平滑)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="590" y="300" width="150" height="45" as="geometry"/>
+    </mxCell>
+    
+    <!-- Layer 3: Integration -->
+    <mxCell id="L3" value="Layer 3: 集成层" style="rounded=1;whiteSpace=wrap;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=5;" vertex="1" parent="1">
+      <mxGeometry x="40" y="375" width="720" height="90" as="geometry"/>
+    </mxCell>
+    <mxCell id="m31" value="同步&#xa;(光流 + 位姿估计 + RS Sync)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="60" y="405" width="180" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m32" value="GPU 管线&#xa;(wgpu-py + WGSL/SPIR-V)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="260" y="405" width="160" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m33" value="渲染&#xa;(PyAV 编解码 + 音频)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="440" y="405" width="150" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m34" value="Telemetry&#xa;(GPMF/DJI + PyO3 Bridge)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="610" y="405" width="140" height="45" as="geometry"/>
+    </mxCell>
+    
+    <!-- Layer 4: Application -->
+    <mxCell id="L4" value="Layer 4: 应用层" style="rounded=1;whiteSpace=wrap;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=5;" vertex="1" parent="1">
+      <mxGeometry x="40" y="480" width="720" height="90" as="geometry"/>
+    </mxCell>
+    <mxCell id="m41" value="StabilizationManager&#xa;(中央协调器)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#b85450;fontSize=10;fontStyle=1;" vertex="1" parent="1">
+      <mxGeometry x="120" y="510" width="160" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m42" value="CLI&#xa;(argparse)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#b85450;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="340" y="510" width="100" height="45" as="geometry"/>
+    </mxCell>
+    <mxCell id="m43" value="GUI&#xa;(PySide6 + wgpu预览)" style="rounded=1;whiteSpace=wrap;fillColor=#ffffff;strokeColor=#b85450;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="470" y="510" width="150" height="45" as="geometry"/>
+    </mxCell>
+    
+  </root>
+</mxGraphModel>
