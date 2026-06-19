@@ -89,7 +89,7 @@ tests/test_rust_golden.py::test_agreement_summary                              P
 | 限制 | 说明 | 影响 | 计划 |
 |------|------|------|------|
 | Telemetry 解析 | 纯 Python GPMF/DJI 解析（PyO3 bridge 空壳已移除） | 仅 GoPro/DJI 格式 | 扩展格式覆盖 |
-| GPU 管线 | uint8 上传的 `_pack_to_u32` 位重解释 bug 已修（改走 f32 上传），但 compute 管线在 lavapipe（CI 的软件 Vulkan，非合规）下仍输出全 0；默认 `use_gpu=False` | GPU 路径产出错误结果，xfail 跟踪 | 需真实 GPU 环境逐层调试（shader/bind group/dispatch） |
+| GPU 管线 | uint8 上传的 `_pack_to_u32` 位重解释 bug 已修（改走 f32 上传），但 compute 管线仍输出全 0；默认 `use_gpu=False`。xfail 跟踪 | GPU 路径产出错误结果 | **环境阻塞**：当前机器只有 llvmpipe（纯软件 Vulkan，非合规），无真实 GPU；完整修复需在有 Vulkan compute 的机器上逐层调试（shader 编译/bind group/dispatch/readback），本地无法可靠验证 |
 | complementary 对齐 | Python 是早期简化版镜像（8 行），Rust 真实实现是论文 V1/V2（600 行），max_err=0.71 | xfail(strict) 跟踪 | 用论文版重写 Python ComplementaryIntegrator |
 | VQF 对齐 | Python 与 Rust 同源但初始 heading 处理不同（~24°），max_err=0.34 | xfail(strict) 跟踪 | 逐行对齐 VQF heading 初始化 |
 | GUI | 基础框架已实现，未完整测试 | 功能不完整 | 后续迭代完善 |
