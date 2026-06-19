@@ -82,7 +82,7 @@ tests/test_rust_golden.py::test_agreement_summary                              P
 | 限制 | 说明 | 影响 | 计划 |
 |------|------|------|------|
 | Telemetry 解析 | 纯 Python GPMF/DJI 解析（PyO3 bridge 空壳已移除） | 仅 GoPro/DJI 格式 | 扩展格式覆盖 |
-| GPU 管线 | wgpu-py 设备初始化在某些环境可能失败 | 自动降级到 CPU | 增加更多设备兼容性测试 |
+| GPU 管线 | uint8 上传的 `_pack_to_u32` 位重解释 bug 已修（改走 f32 上传），但 compute 管线在 lavapipe（CI 的软件 Vulkan，非合规）下仍输出全 0；默认 `use_gpu=False` | GPU 路径产出错误结果，xfail 跟踪 | 需真实 GPU 环境逐层调试（shader/bind group/dispatch） |
 | VQF Rust 对比 | Rust 黄金数据生成器未包含 VQF | VQF 无 Rust 对比 | 在 golden-gen crate 中移植 Gyroflow VQF |
 | GUI | 基础框架已实现，未完整测试 | 功能不完整 | 后续迭代完善 |
 | 端到端视频对比 | 未做 PyGyroFlow vs Gyroflow 逐帧 PSNR | 像素级一致性未验证 | 用实际视频对比 |

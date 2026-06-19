@@ -70,8 +70,11 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.xfail(
-    reason="P0#1: GPU uint8 pack/unpack corrupts input (_pack_to_u32 bit "
-    "reinterpretation); output buffer dtype mismatch on u32 path",
+    reason="GPU undistort still outputs all-zeros vs CPU reference. The "
+    "_pack_to_u32 bit-reinterpretation bug is fixed (uint8 now promoted to "
+    "f32 on upload), but the pipeline still produces no output under the "
+    "lavapipe (non-conformant Vulkan) software adapter used in CI. Full "
+    "diagnosis requires a real GPU. Tracked in 06-test-report known limits.",
     strict=True,
     raises=AssertionError,
 )

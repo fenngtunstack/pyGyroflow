@@ -217,17 +217,13 @@ class WgpuBackend:
 
         import wgpu  # type: ignore[import-untyped]
 
-        # Determine scalar type for the shader.
-        if input_frame.dtype == np.uint8:
-            scalar_type = "u32"
-            # Pack into u32 for GPU upload.
-            padded = _pack_to_u32(input_frame)
-        elif input_frame.dtype in (np.float32, np.uint16):
-            scalar_type = "f32"
-            padded = input_frame.astype(np.float32)
-        else:
-            scalar_type = "f32"
-            padded = input_frame.astype(np.float32)
+        # Determine scalar type for the shader. All integer dtypes are
+        # promoted to f32 on upload (the shader's f32 path reads values
+        # directly via f32(input_buffer[...])); the prior u32 path packed
+        # each uint8 into a float32 bit-pattern via view(), which corrupted
+        # values (255 -> 3.57e-43). f32 upload + clip-on-readback is correct.
+        scalar_type = "f32"
+        padded = input_frame.astype(np.float32)
 
         out_h = kernel_params.output_height
         out_w = kernel_params.output_width
@@ -373,17 +369,4 @@ class WgpuBackend:
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
-
-def _pack_to_u32(frame: np.ndarray) -> np.ndarray:
-    """Pack a uint8 image into float32 for u32 shader path.
-
-    The WGSL compute shader with SCALAR=u32 expects u32 values in the
-    buffer. Since wgpu-py does not expose a direct u32 storage buffer
-    upload path from uint8 numpy, we reinterpret the bytes as float32
-    (same bit pattern, different type tag) so the GPU sees the correct
-    values.
-    """
-    raw = frame.astype(np.uint32)
-    if raw.ndim == 2:
-        raw = raw[:, :, np.newaxis]
-    return raw.view(np.float32)
+# (removed) _pack_to_u32: see note at the f32 upload path above.
