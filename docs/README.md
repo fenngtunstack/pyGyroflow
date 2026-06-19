@@ -26,7 +26,9 @@ pygyroflow input.mp4 -o output.mp4 --smoothness 0.5
 
 ## 项目统计
 
-- 108 个 Python 源文件，18,215 行代码
-- 18 个测试文件，2,294 行测试代码
-- 180 个测试用例，175 通过，5 跳过，0 失败
-- Rust-Python 数值一致性: max_err < 1e-14 (机器精度)
+> 数字由 `wc -l` / `pytest --collect-only` 实测，非估算。
+
+- 107 个 Python 源文件，约 2,579 行代码（`pygyroflow/` 包）
+- 16 个测试文件，约 334 行测试代码，198 个测试用例
+- Rust-Python 数值一致性：5 个 IMU 积分器 max_err < 1e-14（机器精度）；
+  VQF 暂无 Rust 对照（见 [06-测试报告](06-test-report.md) 已知限制）
