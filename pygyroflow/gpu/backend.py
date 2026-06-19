@@ -37,12 +37,20 @@ class WgpuBackend:
     when wgpu is not installed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, force_fallback: bool = False) -> None:
+        """Initialize the wgpu backend.
+
+        Args:
+            force_fallback: If True, request a software/CPU fallback adapter
+                (``force_fallback_adapter=True``). Used by headless tests
+                without a physical GPU.
+        """
         self._device: object | None = None
         self._queue: object | None = None
         self._pipeline_cache: dict[str, object] = {}
         self._initialized: bool = False
         self._available: Optional[bool] = None
+        self._force_fallback: bool = force_fallback
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -61,7 +69,8 @@ class WgpuBackend:
             import wgpu  # type: ignore[import-untyped]
 
             adapter = wgpu.gpu.request_adapter_sync(
-                power_preference="high-performance"
+                power_preference="high-performance",
+                force_fallback_adapter=self._force_fallback,
             )
             if adapter is None:
                 raise GPUError("No suitable GPU adapter found")

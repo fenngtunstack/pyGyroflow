@@ -373,7 +373,11 @@ class StabilizationManager:
             options: Dict with render options:
                 - codec: "H.264/AVC", "H.265/HEVC", "ProRes" (default: "H.265/HEVC")
                 - bitrate: Bitrate in Mbps (0 = auto)
-                - use_gpu: Whether to use GPU acceleration (default: True)
+                - use_gpu: Whether to use GPU acceleration (default: False).
+                  The GPU (wgpu) undistort path is known-broken for the
+                  common uint8/RGB input (pack/unpack contract mismatch,
+                  see tests/test_gpu_undistort.py xfail); CPU is used by
+                  default. Opt in only for experimentation.
         """
         options = options or {}
 
@@ -382,7 +386,7 @@ class StabilizationManager:
 
         codec = options.get("codec", "H.265/HEVC")
         bitrate = options.get("bitrate", 0)
-        use_gpu = options.get("use_gpu", True)
+        use_gpu = options.get("use_gpu", False)
 
         proc = FfmpegProcessor()
         info = proc.open_input(input_path)
@@ -400,6 +404,13 @@ class StabilizationManager:
         distortion_model = None
 
         if use_gpu:
+            import warnings
+            warnings.warn(
+                "GPU (wgpu) undistort path is known-broken for uint8/RGB input "
+                "(pack/unpack contract mismatch) and is untested. Output may be "
+                "corrupt. Use CPU (use_gpu=False) for correct results.",
+                stacklevel=2,
+            )
             try:
                 from pygyroflow.gpu import WgpuBackend
                 from pygyroflow.stabilization.distortion_models import from_name as dm_from_name

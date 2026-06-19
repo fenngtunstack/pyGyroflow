@@ -8,7 +8,8 @@ Options:
     --bitrate     Output bitrate in Mbps (0 = auto)
     --lens        Lens profile name or path
     --smoothness  Smoothness factor 0-1 (default: 0.5)
-    --no-gpu      Disable GPU acceleration
+    --no-gpu      (removed) GPU is disabled by default
+    --gpu         Enable GPU acceleration (known-broken, experimental)
 """
 
 from __future__ import annotations
@@ -58,9 +59,9 @@ def main() -> None:
         help="Smoothness factor 0-1 (default: 0.5)",
     )
     parser.add_argument(
-        "--no-gpu",
+        "--gpu",
         action="store_true",
-        help="Disable GPU acceleration",
+        help="Enable GPU acceleration (known-broken uint8 path, experimental)",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -124,7 +125,7 @@ def main() -> None:
                 {
                     "codec": args.codec,
                     "bitrate": args.bitrate,
-                    "use_gpu": not args.no_gpu,
+                    "use_gpu": args.gpu,
                 },
             )
             log.info("Done: %s", output)
