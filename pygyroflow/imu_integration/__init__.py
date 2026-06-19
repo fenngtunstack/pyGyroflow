@@ -5,8 +5,8 @@ Available integrators:
 - SimpleGyroAccelIntegrator: Gyro + simple accelerometer gravity correction
 - MahonyIntegrator: Mahony PI-controller complementary filter
 - MadgwickIntegrator: Madgwick gradient-descent filter
-- ComplementaryIntegrator: Basic complementary filter (placeholder for V2)
-- VQFIntegrator: VQF algorithm (placeholder, not yet implemented)
+- ComplementaryIntegrator: Basic complementary filter
+- VQFIntegrator: VQF (Versatile Quaternion Filter) — offline gyro+accel+mag fusion
 
 Utilities:
 - QuaternionConverter: Re-integrate with a different method and apply SLERP correction

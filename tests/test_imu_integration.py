@@ -148,6 +148,62 @@ class TestComplementary:
         _assert_unit_quaternions(result)
 
 
+class TestVQF:
+    """VQF integrator (Python self-consistency).
+
+    NOTE: VQF has no Rust golden reference (rust_imu_vqf.json is absent and
+    msgyro-golden-gen does not generate one). These tests cover determinism
+    and structural correctness only; numerical cross-check against the Rust
+    port is a tracked follow-up (deferred: the Rust golden-gen lives outside
+    this repo's version control).
+    """
+
+    def test_empty_input_returns_empty(self):
+        from pygyroflow.imu_integration import VQFIntegrator
+        integrator = VQFIntegrator()
+        result = integrator.integrate([], 1000.0)
+        assert result == {}
+
+    def test_produces_valid_quaternions(self, sample_imu_data):
+        from pygyroflow.imu_integration import VQFIntegrator
+        integrator = VQFIntegrator()
+        result = integrator.integrate(sample_imu_data, 5000.0)
+        assert len(result) > 0
+        _assert_unit_quaternions(result)
+
+    def test_deterministic(self, sample_imu_data):
+        """Two runs on identical input must produce identical quaternions."""
+        from pygyroflow.imu_integration import VQFIntegrator
+        integ = VQFIntegrator()
+        r1 = integ.integrate(sample_imu_data, 5000.0)
+        r2 = integ.integrate(sample_imu_data, 5000.0)
+        assert set(r1.keys()) == set(r2.keys())
+        for ts in r1:
+            assert_allclose(r1[ts].quaternion(), r2[ts].quaternion(), atol=1e-15,
+                            err_msg=f"VQF non-deterministic at t={ts}")
+
+    def test_rotation_accumulates(self):
+        """Constant Z-axis rotation must accumulate a monotonic yaw."""
+        from pygyroflow.imu_integration import VQFIntegrator
+        rate = 200.0
+        n = 1000
+        dt = 1000.0 / rate
+        data = [
+            TimeIMU(timestamp_ms=i * dt,
+                    gyro=np.array([0.0, 0.0, 10.0]),
+                    accl=np.array([0.0, 0.0, 9.8]),
+                    magn=None)
+            for i in range(n)
+        ]
+        integ = VQFIntegrator()
+        result = integ.integrate(data, n * dt)
+        times = sorted(result)
+        yaws = [result[t].euler_angles()[2]
+                for t in (times[0], times[len(times) // 2], times[-1])]
+        assert yaws[1] > yaws[0], f"yaw did not accumulate: {yaws}"
+        assert yaws[2] > yaws[1], f"yaw did not accumulate: {yaws}"
+
+
 class TestQuaternionConverter:
     def test_convert_returns_same_timestamps(self, sample_imu_data):
         from pygyroflow.imu_integration import SimpleGyroIntegrator, QuaternionConverter

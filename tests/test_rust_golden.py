@@ -170,6 +170,7 @@ class TestRustPythonGoldenSummary:
         from pygyroflow.imu_integration import (
             SimpleGyroIntegrator, SimpleGyroAccelIntegrator,
             MahonyIntegrator, MadgwickIntegrator, ComplementaryIntegrator,
+            VQFIntegrator,
         )
         integrators = {
             "simple_gyro": SimpleGyroIntegrator,
@@ -177,6 +178,9 @@ class TestRustPythonGoldenSummary:
             "mahony": MahonyIntegrator,
             "madgwick": MadgwickIntegrator,
             "complementary": ComplementaryIntegrator,
+            # VQF has no Rust golden yet (msgyro-golden-gen doesn't emit it);
+            # included here so the coverage gap is visible in the summary.
+            "vqf": VQFIntegrator,
         }
 
         results = []
