@@ -93,18 +93,44 @@ class TestCliSmoke:
 
 
 # ---------------------------------------------------------------------------
-# stmap — KNOWN BROKEN IMPORT (tracked)
+# stmap — was broken import (fixed: switched to _vectorized_rotate_distort)
 # ---------------------------------------------------------------------------
 
 class TestStmapSmoke:
-    @pytest.mark.xfail(
-        reason="stmap/exporter.py imports _rotate_and_distort from "
-        "cpu_undistort, but that function was renamed to "
-        "_vectorized_rotate_distort during a refactor; the scalar version "
-        "stmap expects no longer exists. Module is unimportable until fixed.",
-        strict=True,
-        raises=ImportError,
-    )
     def test_stmap_imports(self):
-        # Should succeed once the broken import is fixed.
-        from pygyroflow.stmap import STMapExporter, STMapFormat  # noqa: F401
+        from pygyroflow.stmap import STMapExporter, STMapFormat
+        assert STMapExporter is not None
+        assert {f.value for f in STMapFormat} == {"exr", "npz", "png16"}
+
+    def test_stmap_undistort_map(self):
+        """STMapExporter produces a finite (H, W, 2) undistort map.
+
+        Previously this module was unimportable (broken _rotate_and_distort
+        reference); the vectorized rewrite must still produce valid output.
+        """
+        import warnings
+
+        import numpy as np
+
+        from pygyroflow.stmap import STMapExporter
+        from pygyroflow.stabilization import ComputeParams
+        from pygyroflow.types.quaternion import Quat64
+
+        q = Quat64.from_euler_angles(0.0, 0.0, 0.0)
+        cp = ComputeParams(
+            width=16, height=16, output_width=16, output_height=16,
+            frame_count=1, scaled_fps=30.0, scaled_duration_ms=1000.0,
+            quaternions={0: q}, smoothed_quaternions={0: q},
+            fovs=[1.0], fov_scale=1.0,
+            camera_matrix=np.array([[8.0, 0, 8], [0, 8, 8], [0, 0, 1]]),
+            distortion_coeffs=[0.0] * 12, frame_readout_time=0.0,
+        )
+        exp = STMapExporter(cp)
+        # cpu_undistort emits a benign divide-by-zero RuntimeWarning at r=0;
+        # the result is masked correctly, suppress to keep test output clean.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            m = exp.compute_undistort_map(timestamp_ms=0.0, frame=0)
+        assert m.shape == (16, 16, 2)
+        assert m.dtype == np.float32
+        assert np.isfinite(m).all()

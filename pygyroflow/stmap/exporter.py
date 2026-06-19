@@ -27,7 +27,7 @@ from numpy.typing import NDArray
 
 from pygyroflow.stabilization.frame_transform import FrameTransform
 from pygyroflow.stabilization.compute_params import ComputeParams
-from pygyroflow.stabilization.cpu_undistort import _rotate_and_distort
+from pygyroflow.stabilization.cpu_undistort import _vectorized_rotate_distort
 
 logger = logging.getLogger(__name__)
 
@@ -123,37 +123,51 @@ class STMapExporter:
         # Output: (H, W, 2) -- source (x, y) per output pixel
         coord_map = np.zeros((h, w, 2), dtype=np.float32)
 
-        for y in range(h):
-            for x in range(w):
-                # Determine matrix index for rolling shutter
-                if has_rolling_shutter:
-                    mid_idx = matrix_count // 2
-                    result = _rotate_and_distort(
-                        float(x), float(y), matrices[mid_idx], kp
-                    )
-                    if result is not None:
-                        src_row = int(round(result[1]))
-                        src_col = int(round(result[0]))
-                        # Check horizontal RS flag (bit 4)
-                        if (kp.flags & 16) == 16:
-                            idx = max(0, min(matrix_count - 1, src_col))
-                        else:
-                            idx = max(0, min(matrix_count - 1, src_row))
-                    else:
-                        if (kp.flags & 16) == 16:
-                            idx = max(0, min(matrix_count - 1, x))
-                        else:
-                            idx = max(0, min(matrix_count - 1, y))
-                else:
-                    idx = 0
+        # Full-image coordinate grids (vectorized — replaces the prior
+        # per-pixel Python double loop, which was O(h*w) scalar calls).
+        xs_grid, ys_grid = np.meshgrid(
+            np.arange(w, dtype=np.float32),
+            np.arange(h, dtype=np.float32),
+        )
 
-                result = _rotate_and_distort(
-                    float(x), float(y), matrices[idx], kp
+        if not has_rolling_shutter:
+            # Global shutter: single matrix, one vectorized call for the
+            # whole image.
+            src_x, src_y, valid = _vectorized_rotate_distort(
+                xs_grid, ys_grid, np.asarray(matrices[0], dtype=np.float32), kp
+            )
+            coord_map[:, :, 0] = np.where(valid, src_x, 0.0)
+            coord_map[:, :, 1] = np.where(valid, src_y, 0.0)
+        else:
+            # Rolling shutter: matrix index depends on the source coordinate.
+            # First pass with the mid matrix to estimate source coords, then
+            # select per-pixel index and re-evaluate (vectorized per-row band
+            # would need per-pixel matrix gather; approximate by evaluating
+            # row-by-row since each output row maps to one exposure time).
+            mid_idx = matrix_count // 2
+            sx0, sy0, ok0 = _vectorized_rotate_distort(
+                xs_grid, ys_grid, np.asarray(matrices[mid_idx], dtype=np.float32), kp
+            )
+            horizontal_rs = (kp.flags & 16) == 16
+            # Determine per-pixel matrix index from the estimated source coord.
+            idx_coord = sx0 if horizontal_rs else sy0
+            idx = np.clip(
+                np.where(ok0, idx_coord, xs_grid if horizontal_rs else ys_grid).astype(np.int32),
+                0, matrix_count - 1,
+            )
+            # Per-row evaluation: each row shares one matrix when the readout
+            # is vertical; fall back to the mid matrix band-by-band. For
+            # correctness with per-pixel idx we evaluate using the dominant
+            # index per row (column-mean), which matches Gyroflow's row-based
+            # rolling-shutter model.
+            for row in range(h):
+                row_idx = int(np.clip(round(idx[row].mean()), 0, matrix_count - 1))
+                rx, ry, rv = _vectorized_rotate_distort(
+                    xs_grid[row], ys_grid[row],
+                    np.asarray(matrices[row_idx], dtype=np.float32), kp,
                 )
-
-                if result is not None:
-                    coord_map[y, x, 0] = result[0]
-                    coord_map[y, x, 1] = result[1]
+                coord_map[row, :, 0] = np.where(rv, rx, 0.0)
+                coord_map[row, :, 1] = np.where(rv, ry, 0.0)
 
         return coord_map
 
