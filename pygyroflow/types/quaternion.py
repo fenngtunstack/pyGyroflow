@@ -137,22 +137,18 @@ class Quat64:
     # ------------------------------------------------------------------
 
     def __mul__(self, other: Quat64) -> Quat64:
-        """Quaternion composition: self * other.
+        """Quaternion composition: ``self * other``.
 
-        Result represents applying *other* first, then *self* (same as nalgebra).
+        Convention (verified by cross-check vs scipy matrix composition and
+        nalgebra in tests/test_quaternion_convention.py): ``self * other``
+        composes rotations so that, as a rotation matrix,
+        ``(self * other).to_rotation_matrix() == R_self @ R_other`` — i.e.
+        ``other`` is applied first, then ``self``. This matches both scipy's
+        ``Rotation.__mul__`` and nalgebra's ``UnitQuaternion`` product, so the
+        underlying scipy ``self._rot * other._rot`` is used directly.
         """
         if not isinstance(other, Quat64):
             return NotImplemented
-        # scipy: r1 * r2 means apply r1 then r2.
-        # nalgebra: q1 * q2 means apply q2 then q1 (Hamilton product convention).
-        # To match nalgebra: self * other = apply other first, then self.
-        # In scipy terms: self._rot * other._rot already means "apply self then other",
-        # but nalgebra q1*q2 means "apply q2 then q1", so we need other._rot * self._rot.
-        # Wait, let's think again:
-        #   - nalgebra: q1 * q2 rotates a vector v as q1 * (q2 * v * q2^-1) * q1^-1
-        #     i.e., q2 applied first, then q1.
-        #   - scipy: r1 * r2 means r2 applied first, then r1 (matrix composition r1 @ r2).
-        # So nalgebra q1*q2 == scipy r1*r2. Direct multiplication is correct.
         return Quat64(self._rot * other._rot)
 
     def __eq__(self, other: object) -> bool:

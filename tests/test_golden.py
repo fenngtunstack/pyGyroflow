@@ -215,9 +215,11 @@ class TestGoldenFrameTransform:
             assert ft.matrices.shape[0] == t_info["matrix_count"], \
                 f"Matrix count mismatch at frame {frame_idx}"
             if t_info["matrices_0"]:
+                # float32 matrices: observed max diff ~3.1e-6, so 5e-6 is a
+                # tight machine-precision-level tolerance (was 1e-5).
                 np.testing.assert_allclose(
                     ft.matrices[0].tolist(), t_info["matrices_0"],
-                    atol=1e-5, err_msg=f"Matrix mismatch at frame {frame_idx}",
+                    atol=5e-6, err_msg=f"Matrix mismatch at frame {frame_idx}",
                 )
             np.testing.assert_allclose(
                 ft.fov, t_info["fov"], atol=1e-6,
