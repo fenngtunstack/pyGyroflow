@@ -95,13 +95,24 @@ def main() -> None:
                 info["fps"], info["duration_ms"], info["frame_count"],
             )
 
+            # Warn loudly if no gyro data was extracted — stabilization would
+            # otherwise run on empty input and produce a "successful" but
+            # un-stabilized video. This is the loud guard for the silent
+            # telemetry-degradation path in manager.load_gyro_data.
+            if not mgr.gyro.quaternions:
+                log.warning(
+                    "No gyro/IMU data found in %s. Output will NOT be "
+                    "stabilized (only lens correction applies).", path,
+                )
+
             # Load lens profile
             if args.lens:
                 try:
                     mgr.load_lens_profile(args.lens)
                     log.info("Lens profile: %s", mgr.lens.get_display_name())
                 except Exception as exc:
-                    log.warning("Failed to load lens profile '%s': %s", args.lens, exc)
+                    log.error("Failed to load lens profile '%s': %s", args.lens, exc)
+                    sys.exit(1)
 
             # Configure smoothing
             mgr.smoothing.current().set_parameter("smoothness", args.smoothness)

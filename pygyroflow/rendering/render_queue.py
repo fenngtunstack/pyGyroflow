@@ -56,6 +56,7 @@ class RenderQueue:
         self._jobs: list[RenderJob] = []
         self._current_index: int = 0
         self._current_progress: float = 0.0
+        self._failures: list[tuple[RenderJob, Exception]] = []
 
     # ------------------------------------------------------------------
     # Queue management
@@ -88,6 +89,15 @@ class RenderQueue:
         base = self._current_index * per_job
         return min(base + self._current_progress * per_job, 1.0)
 
+    @property
+    def failures(self) -> list[tuple[RenderJob, Exception]]:
+        """Jobs that raised during processing (job, exception).
+
+        Non-empty after process_all() means some jobs failed; previously
+        such failures were swallowed and progress reported as 1.0.
+        """
+        return list(self._failures)
+
     # ------------------------------------------------------------------
     # Processing
     # ------------------------------------------------------------------
@@ -96,13 +106,16 @@ class RenderQueue:
         """Process the next pending job.
 
         Returns:
-            True if a job was processed, False if the queue is empty.
+            True if a job was processed (whether it succeeded or failed),
+            False if the queue is empty. Check :attr:`failures` afterwards
+            to detect jobs that errored — they are recorded, not swallowed.
         """
         if self._current_index >= len(self._jobs):
             return False
 
         job = self._jobs[self._current_index]
         self._current_progress = 0.0
+        failed = False
 
         try:
             if job.job_type == RenderJobType.Video:
@@ -115,16 +128,22 @@ class RenderQueue:
                 self._process_project_job(job)
             else:
                 log.warning("Unknown job type: %s", job.job_type)
-        except Exception:
+                failed = True
+        except Exception as exc:
+            failed = True
             log.error(
                 "Render job failed: %s -> %s",
                 job.input_path,
                 job.output_path,
                 exc_info=True,
             )
+            self._failures.append((job, exc))
 
         self._current_index += 1
-        self._current_progress = 1.0
+        # Only report full progress on success; a failed job should not show
+        # as 100% done.
+        if not failed:
+            self._current_progress = 1.0
         return True
 
     def process_all(self) -> None:
@@ -181,20 +200,17 @@ class RenderQueue:
             json.dump(data, f, indent=2)
 
     def _process_stmap_job(self, job: RenderJob) -> None:
-        """Generate an ST-map from the current stabilisation parameters."""
-        log.info("ST-map export: %s", job.output_path)
-        # Actual ST-map generation is a future feature.
-        # For now write a placeholder so the pipeline doesn't break.
-        import numpy as np
+        """Generate an ST-map from the current stabilisation parameters.
 
-        w = job.options.get("width", 1920)
-        h = job.options.get("height", 1080)
-        stmap = np.zeros((h, w, 2), dtype=np.float32)
-        # Identity map as placeholder.
-        ys, xs = np.mgrid[0:h, 0:w]
-        stmap[:, :, 0] = xs.astype(np.float32) / w
-        stmap[:, :, 1] = ys.astype(np.float32) / h
-        stmap.tofile(job.output_path)
+        Raises NotImplementedError: the queue-level ST-map path is not wired
+        to STMapExporter (which needs a full ComputeParams context). Writing
+        an identity-map placeholder would silently produce wrong output, so
+        we fail loudly instead. Use STMapExporter directly for real export.
+        """
+        raise NotImplementedError(
+            "RenderQueue ST-map export is not implemented. Use "
+            "pygyroflow.stmap.STMapExporter directly with a ComputeParams."
+        )
 
     def _process_project_job(self, job: RenderJob) -> None:
         """Save / export a full Gyroflow-compatible project file."""

@@ -232,22 +232,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Auto Sync", "No video loaded.")
             return
 
-        self.statusBar().showMessage("Running auto-sync...")
-        # Auto-sync is a longer-running operation; in a production version
-        # this would run in a QThread. For now, run synchronously.
-        try:
-            from pygyroflow.synchronization.autosync import AutoSync
-
-            sync = AutoSync()
-            offset = sync.find_offset(self.manager.gyro, self.manager.params)
-            if offset is not None:
-                self.settings_panel._offset_spin.setValue(offset)
-                self.statusBar().showMessage(f"Sync offset: {offset:.4f} s")
-            else:
-                self.statusBar().showMessage("Auto-sync: no offset found")
-        except Exception as exc:
-            log.warning("Auto-sync failed: %s", exc)
-            self.statusBar().showMessage(f"Auto-sync failed: {exc}")
+        # Auto Sync is not wired up: the previous code imported a non-existent
+        # ``AutoSync`` class (the real one is ``AutosyncProcess``, with a
+        # different API) and swallowed the resulting ImportError, so clicking
+        # the menu silently did nothing. Surface this honestly instead.
+        QMessageBox.information(
+            self,
+            "Auto Sync",
+            "Auto Sync is not yet implemented in the GUI. Use the CLI or the "
+            "synchronization module (find_offset_rs_sync / AutosyncProcess) directly.",
+        )
+        self.statusBar().showMessage("Auto Sync: not implemented")
 
     def _load_lens(self) -> None:
         self.lens_browser.browse()
