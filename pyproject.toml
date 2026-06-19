@@ -30,7 +30,6 @@ dev = [
     "pytest>=8.0",
     "pytest-cov",
     "pytest-xdist",
-    "hypothesis",
     "mypy",
     "ruff",
 ]

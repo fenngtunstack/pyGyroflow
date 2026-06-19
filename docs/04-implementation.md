@@ -12,7 +12,7 @@
 | 测试代码行数 | 2,294 |
 | 测试用例 | 180 |
 | Shader 文件 | 3 (WGSL + 2×SPIR-V) |
-| Rust bridge crate | 1 (telemetry_parser_bridge) |
+| Rust bridge crate | 0 (telemetry_parser_bridge 空壳已移除) |
 
 ## 2 模块实现明细
 
@@ -104,9 +104,9 @@
 | ffmpeg_processor.py | 280 | PyAV 解码/编码、帧回调 |
 | render_queue.py | 210 | 批量渲染队列 |
 | audio_resampler.py | 157 | PyAV 音频直通/重采样 |
-| **Telemetry** (3 文件) | **209** | |
-| parser.py | 170 | GPMF/DJI fallback 解析 + PyO3 bridge 调度 |
-| _native.py | 39 | telemetry_parser_bridge Python 接口 |
+| **Telemetry** (2 文件) | **~170** | |
+| parser.py | 170 | GPMF/DJI 纯 Python 解析 |
+| (bridge 已移除) | — | 原 telemetry_parser_bridge 为空壳，已删除 |
 
 ### 2.5 应用层 (Layer 4, 3,569 行)
 
@@ -119,21 +119,7 @@
 | gui/ (7 文件) | 963 | PySide6 主窗口、视频控件、时间线、设置面板 |
 | cli/main.py | 141 | argparse CLI |
 
-## 3 Rust Bridge
-
-`telemetry_parser_bridge/` — 独立 PyO3 crate：
-
-```rust
-#[pyfunction]
-fn parse_telemetry_file(path: &str, sample_index: Option<usize>) -> PyResult<PyTelemetryResult>
-
-#[pymodule]
-fn telemetry_parser_bridge(m: &Bound<PyModule>) -> PyResult<()>
-```
-
-构建: `maturin build --release`
-
-## 4 与 Gyroflow Rust 代码的对应关系
+## 3 与 Gyroflow Rust 代码的对应关系
 
 | Python 模块 | Rust 源文件 | Rust 行数 |
 |---|---|---|
@@ -147,14 +133,11 @@ fn telemetry_parser_bridge(m: &Bound<PyModule>) -> PyResult<()>
 | cpu_undistort.py | src/core/stabilization/cpu_undistort.rs | 1,116 |
 | autosync.py | src/core/synchronization/autosync.rs | 665 |
 
-## 5 构建和安装
+## 4 构建和安装
 
 ```bash
 # 安装 Python 包 (开发模式)
 pip install -e .
-
-# 构建 telemetry PyO3 bridge (可选)
-cd telemetry_parser_bridge && maturin build --release
 
 # 运行测试
 pytest tests/ -q

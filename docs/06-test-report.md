@@ -79,7 +79,7 @@ tests/test_rust_golden.py::test_agreement_summary                              P
 
 | 限制 | 说明 | 影响 | 计划 |
 |------|------|------|------|
-| Telemetry 解析 | PyO3 bridge 未编译，fallback GPMF 解析器不完整 | 无法从视频提取 IMU 数据 | 编译 telemetry_parser_bridge 或完善 fallback |
+| Telemetry 解析 | 纯 Python GPMF/DJI 解析（PyO3 bridge 空壳已移除） | 仅 GoPro/DJI 格式 | 扩展格式覆盖 |
 | GPU 管线 | wgpu-py 设备初始化在某些环境可能失败 | 自动降级到 CPU | 增加更多设备兼容性测试 |
 | VQF Rust 对比 | Rust 黄金数据生成器未包含 VQF | VQF 无 Rust 对比 | 在 golden-gen crate 中移植 Gyroflow VQF |
 | GUI | 基础框架已实现，未完整测试 | 功能不完整 | 后续迭代完善 |

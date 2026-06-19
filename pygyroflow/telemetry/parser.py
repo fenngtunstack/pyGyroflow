@@ -1,8 +1,8 @@
 """Telemetry parser -- extracts gyro data from video files.
 
-Tries the PyO3 native bridge (telemetry_parser_bridge built with maturin)
-first, then falls back to a pure-Python parser for GoPro GPMF and DJI
-protobuf telemetry formats.
+Pure-Python parser for GoPro GPMF and DJI protobuf telemetry formats.
+(A PyO3 bridge crate ``telemetry_parser_bridge`` once existed but was an
+empty scaffold and has been removed; this parser is the sole path.)
 """
 
 from __future__ import annotations
@@ -26,8 +26,8 @@ def parse_telemetry_file(
 ) -> FileMetadata:
     """Parse telemetry from a video file.
 
-    First tries the PyO3 bridge (telemetry_parser_bridge), falls back to a
-    basic GPMF parser for GoPro files if the bridge is not available.
+    Detects the camera brand from the file content and dispatches to the
+    appropriate parser (GoPro GPMF or DJI protobuf).
 
     Args:
         path: Path to the video file.
@@ -44,36 +44,23 @@ def parse_telemetry_file(
     if not os.path.isfile(path):
         raise TelemetryParseError(f"File not found: {path}")
 
-    # Try native bridge first
-    try:
-        from pygyroflow.telemetry._native import parse_telemetry
-
-        result = parse_telemetry(path, sample_index)
-        if result is not None:
-            return result
-    except ImportError:
-        log.info("telemetry_parser_bridge not available, using fallback parser")
-    except Exception as exc:
-        log.warning("Native telemetry parser failed: %s", exc)
-
-    # Fallback: try to parse based on file extension
     ext = os.path.splitext(path)[1].lower()
     if ext in (".mp4", ".mov"):
-        return _fallback_parse(path, sample_index, video_size, fps)
+        return _parse_embedded(path, sample_index, video_size, fps)
 
     raise TelemetryParseError(f"Unsupported file format: {ext}")
 
 
-def _fallback_parse(
+def _parse_embedded(
     path: str,
     sample_index: int | None = None,
     video_size: tuple[int, int] = (0, 0),
     fps: float = 0.0,
 ) -> FileMetadata:
-    """Fallback parser when telemetry_parser_bridge is not available.
+    """Parse embedded telemetry (GoPro GPMF or DJI protobuf).
 
     Detects the camera brand from the file content and dispatches to the
-    appropriate parser (GoPro GPMF or DJI protobuf).
+    appropriate parser.
     """
     try:
         with open(path, "rb") as f:

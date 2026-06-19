@@ -53,13 +53,11 @@ manager.py和lib.rs的差距最大。Rust的lib.rs 2232行里包含大量类型�
 
 vqf.py和default_algo.py的压缩比在25%左右，这是数学密集型模块的典型比例。算法本身的数学逻辑无法压缩，压缩掉的只有Rust的语法噪音。
 
-gpu/backend.py对应的是wgpu.rs（714行），这里的翻译不是简单的语言转换。Rust通过wgpu库直接操作Vulkan/Metal/DX12后端，Python版要么通过PyO3 bridge调用Rust的GPU代码，要么用CUDA/OpenCL的Python绑定重新实现。项目选择了前者——单独建了一个PyO3 crate（telemetry_parser_bridge），用maturin构建。这实际上是一个混合架构：Python做算法编排，Rust做底层GPU操作。
+gpu/backend.py对应的是wgpu.rs（714行），这里的翻译不是简单的语言转换。Rust通过wgpu库直接操作Vulkan/Metal/DX12后端，Python版用 wgpu-py 直接驱动同一套 WGSL compute shader（复用了 Gyroflow 的 stabilize.wgsl/SPIR-V），不再经过任何 Rust bridge。这是纯 Python 路径：Python 做算法编排，shader 做 GPU 像素重映射。
 
-## Rust Bridge的设计意图
+## GPU 与 Telemetry 路径的取舍
 
-telemetry_parser_bridge不是一个简单的FFI wrapper。它独立于主Gyroflow项目，有自己的Cargo.toml和构建流程。用maturin构建意味着它可以作为Python wheel发布，用户pip install就能用。
-
-这种设计的好处是解耦。主Gyroflow项目更新GPU后端代码时，bridge crate不需要同步更新——只要接口不变。代价是多了一层维护成本。但对于一个"用Python重写"的项目来说，承认Rust在某些领域（GPU计算、二进制解析）不可替代，然后优雅地桥接，比硬翻译更务实。
+项目早期曾尝试用一个 PyO3 bridge crate（telemetry_parser_bridge）桥接 Rust 的二进制解析能力，但最终只留下空壳——bridge 既没有落地实现，纯 Python 的 GPMF/DJI 解析也已够用，于是把这个空壳移除，避免误导。GPU 路径同理：与其维护一层 Rust FFI 转发，不如直接复用上游成熟的 WGSL shader。这种取舍的代价是 Python 在二进制解析、逐像素重映射上比 Rust 慢，但换来了零交叉编译负担和可调试性——对一个研究型库来说更务实。
 
 ## 构建和测试的工程细节
 
