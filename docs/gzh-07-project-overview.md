@@ -6,7 +6,7 @@ Gyroflow是视频防抖领域做得最好的开源项目之一，69000行Rust代
 
 但Rust生态对AI和ML研究者有个硬伤：你没法把它直接嵌入你的PyTorch推理管线。想在Jupyter里交互式调参？不行。想运行时替换积分算法？得重编译。想用TensorRT做实时推理？得自己写binding。
 
-PyGyroFlow就是为解决这个问题做的——把Gyroflow v1.6.3的核心算法移植到Python。不是包装一层Rust FFI，是真的用Python重写。最终的数据（`wc -l`/pytest 实测）：107 个 Python 源文件，约 2579 行代码，198 个测试用例。5 个 IMU 积分器与 Rust 移植版的数值误差在机器精度级别（max_err < 1e-14）；VQF 暂无 Rust 对照。
+PyGyroFlow就是为解决这个问题做的——把Gyroflow v1.6.3的核心算法完整移植到Python。不是包装一层Rust FFI，是真的用Python重写。最终的数据（`git show | wc -l`/pytest 实测）：107 个 Python 源文件，约 18,925 行代码，198 个测试用例。5 个 IMU 积分器与 Rust 移植版的数值误差在机器精度级别（max_err < 1e-14）；VQF 暂无 Rust 对照。
 
 <!-- ✏️ 编辑建议：在这里加一句你最初决定做Python移植时的动机，比如是某个具体场景卡住了你，还是纯粹想验证"Python能不能做到" -->
 
@@ -108,7 +108,7 @@ pipe.process("input.mp4", "output.mp4")
 
 ## 代价和取舍
 
-约 2579 行 Python 代码（实测）去对应上游数万行 Rust 代码。行数差距这么大，主因不是 Python 更"简洁"——而是这个版本是核心算法的精简移植，Rust 版有很多 GPU 渲染代码、跨平台 UI 代码、视频编解码代码，这些 PyGyroFlow 要么用了现成库（wgpu-py、PySide6、OpenCV），要么尚未实现。所以不能用行数压缩比来证明"Python 能等价重写 Rust 项目"，那是对读者的误导。
+约 18,925 行 Python 代码（实测）去对应上游约 6.9 万行 Rust 代码。行数少了约 73%，但这不是因为 Python 更"简洁"——Rust 版有很多 GPU 渲染代码、跨平台 UI 代码、视频编解码代码，这些 PyGyroFlow 要么用了现成库（wgpu-py、PySide6、OpenCV），要么精简了范围。所以这个压缩比里既有真正的语言红利，也有功能取舍，不能简单等同于"Python 等价重写了 Rust"。
 
 Python版的代价主要是性能和部署。Rust编译出来一个二进制文件就能跑，Python版需要一套Python环境加上NumPy、wgpu、OpenCV这些依赖。在资源极度受限的嵌入式场景（比如RTOS）上，Python方案不合适。
 

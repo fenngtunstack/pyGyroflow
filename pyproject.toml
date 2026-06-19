@@ -52,3 +52,16 @@ warn_unused_configs = true
 [tool.ruff]
 target-version = "py312"
 line-length = 120
+
+[tool.ruff.lint]
+# Conservative baseline: errors, pyflakes, warnings, import sorting, pyupgrade.
+# Extend as the codebase matures; do not add style rules that would churn
+# existing code without value.
+select = ["E", "F", "W", "I", "UP"]
+ignore = [
+    "E501",  # line length handled by line-length above; not enforced as error
+    "E402",  # module-level imports after code (common in __init__ with lazy imports)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]

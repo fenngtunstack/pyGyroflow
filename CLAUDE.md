@@ -4,12 +4,22 @@
 
 ## 项目定位
 
-pyGyroFlow 是 Gyroflow（Rust）核心防抖算法的 **Python 精简移植**，面向算法验证、Jupyter 交互、嵌入式端侧推理场景。**不是** Rust 全功能的等价重写——上游是数万行的桌面应用，本仓库约 2600 行，覆盖核心算法管线。
+pyGyroFlow 是 Gyroflow（Rust）核心防抖算法的 **Python 完整移植**（约 18,925 行、107 个源文件），面向算法验证、Jupyter 交互、嵌入式端侧推理场景。
 
 诚实约束（这些是已知事实，不要在文档/对外宣称里夸大）：
 - **数值一致性**：5 个 IMU 积分器与 Rust 移植版（`msgyro-imu-integration`）数值一致（max_err < 1e-14）；**VQF 暂无 Rust 对照**。golden 基准来自 Rust 移植版，**未与上游 Gyroflow 逐帧/逐像素验证**。
 - **GPU 路径**：wgpu undistort 的 uint8/RGB 路径**已知损坏**（pack/unpack 契约错误），默认关闭（`use_gpu=False`），仅作实验性 opt-in。
-- **测试覆盖**：核心算法模块有测试；`synchronization`/`telemetry`/`stmap`/`calibration`/`cli`/`gui` 仍缺测试。
+- **STMap 导入损坏**：`stmap/exporter.py` 导入的 `_rotate_and_distort` 已被重构改名（`_vectorized_rotate_distort`），整个 `pygyroflow.stmap` 模块当前不可导入（smoke 测试 xfail 跟踪）。
+- **测试覆盖**：核心算法模块有测试；`synchronization`/`telemetry`/`calibration`/`cli`/`gui` 已加 smoke 测试，但功能测试仍薄。
+
+## ⚠️ 工作区 inode 损坏（重要）
+
+本工作区部分文件的 inode/stat 元数据损坏（`stat` 报告的文件大小与实际内容不符）。后果：
+- `wc -l`、`stat`、`ruff`、`mypy` 等按 stat 大小读取的工具会读到越界二进制垃圾，**行数严重偏低、报 UTF-8 错误**。
+- `git show HEAD:<file>`、`awk`、Python `open()` 按 EOF 读，**拿到正确内容**。
+- 测行数/跑 lint 必须用 `git show HEAD:<file> | wc -l`，不要直接 `wc -l`。
+- 在干净的 CI clone 里不会出现此问题（git checkout 出来的 inode 正常）。
+- 这是工作区文件系统层面的脏状态，不在版本控制内，git 仓库内容本身是干净的。
 
 ## 目录约定
 
@@ -35,7 +45,7 @@ docs/                       # 0X-*.md 主文档 + gzh-*.md 公众号版（与 0X
 - 新增公共 API 加 `#[cfg(test)]` 等价的 pytest 测试。
 - **不修改** `opensource/gyroflow/`（父目录的上游只读参考）。
 - 不为了让代码跑起来注释掉报错或加绕过标记，找根本原因。
-- 文档里的统计数字（行数、测试数）必须用 `wc -l` / `pytest --collect-only` 实测，**禁止估算或沿用旧值**。历史版本曾出现虚高 7 倍的行数，是教训。
+- 文档里的统计数字（行数、测试数）必须实测：行数用 `git show HEAD:<file> | wc -l`（**不要直接 `wc -l`**，因工作区 inode 损坏会失真，见上），测试数用 `pytest --collect-only`。
 
 ## golden 数据机制（重要）
 

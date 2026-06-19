@@ -85,6 +85,7 @@ tests/test_rust_golden.py::test_agreement_summary                              P
 | GPU 管线 | wgpu-py 设备初始化在某些环境可能失败 | 自动降级到 CPU | 增加更多设备兼容性测试 |
 | VQF Rust 对比 | Rust 黄金数据生成器未包含 VQF | VQF 无 Rust 对比 | 在 golden-gen crate 中移植 Gyroflow VQF |
 | GUI | 基础框架已实现，未完整测试 | 功能不完整 | 后续迭代完善 |
+| STMap 导入损坏 | `stmap/exporter.py` 导入 `_rotate_and_distort`（已被重构改名为 `_vectorized_rotate_distort`，标量版删除） | `pygyroflow.stmap` 整个模块不可导入（smoke 测试 xfail 跟踪） | 改写 stmap 用向量化版或恢复标量版 |
 | 端到端视频对比 | 未做 PyGyroFlow vs Gyroflow 逐帧 PSNR | 像素级一致性未验证 | 用实际视频对比 |
 
 ## 6 测试环境
