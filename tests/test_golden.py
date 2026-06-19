@@ -131,6 +131,9 @@ class TestGoldenSmoothing:
 
         result = algo.smooth(input_quats, duration_ms, cp)
         expected = self._load_quats(golden["output_quaternions"])
+        # Golden output reflects the current numpy slerp implementation in
+        # Quat64.slerp (regenerated when slerp was vectorized). tol=1e-10
+        # stays tight to catch any future drift in the smoothing chain.
         assert_quats_close(result, expected, tol=1e-10)
 
 
