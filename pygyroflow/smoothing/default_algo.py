@@ -22,6 +22,7 @@ import math
 from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from pygyroflow.keyframes import KeyframeManager, KeyframeType
 from pygyroflow.smoothing.base import SmoothingAlgorithm
@@ -37,6 +38,56 @@ FOV_REFERENCE: float = 120.0
 
 # Radians to degrees conversion
 RAD_TO_DEG: float = 180.0 / math.pi
+
+
+# ---------------------------------------------------------------------------
+# Numpy quaternion helpers (scipy [x,y,z,w] convention).
+#
+# These mirror Quat64 operations exactly (verified to machine precision vs
+# scipy Rotation) but avoid constructing scipy Rotation objects — the dominant
+# cost in the hot smoothing loops. Used only on the default (per_axis=False)
+# path; the per_axis path keeps Quat64 for its euler decomposition.
+# ---------------------------------------------------------------------------
+
+def _q_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product of two [x,y,z,w] quaternions."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return np.array([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ])
+
+
+def _q_inv(a: np.ndarray) -> np.ndarray:
+    """Conjugate (inverse for a unit quaternion) of [x,y,z,w]."""
+    return np.array([-a[0], -a[1], -a[2], a[3]])
+
+
+def _q_angle(a: np.ndarray) -> float:
+    """Rotation angle (radians) of [x,y,z,w]; = 2*acos(|w|)."""
+    w = abs(a[3])
+    if w > 1.0:
+        w = 1.0
+    return 2.0 * math.acos(w)
+
+
+def _q_slerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
+    """Spherical lerp from a to b at parameter t. [x,y,z,w] convention."""
+    dot = float(a @ b)
+    if dot < 0.0:
+        b = -b
+        dot = -dot
+    if dot > 0.9995:
+        r = a * (1.0 - t) + b * t
+        return r / np.linalg.norm(r)
+    theta = math.acos(dot)
+    sin_theta = math.sin(theta)
+    return (math.sin((1.0 - t) * theta) / sin_theta) * a \
+        + (math.sin(t * theta) / sin_theta) * b
+
 
 
 class DefaultAlgo(SmoothingAlgorithm):
@@ -314,28 +365,40 @@ class DefaultAlgo(SmoothingAlgorithm):
         # Sorted timestamps for ordered iteration
         ts_sorted = sorted(trimmed.keys())
 
+        # Pre-extract raw [x,y,z,w] arrays for the default (per_axis=False)
+        # path, which avoids Quat64/scipy object construction in the hot loops.
+        # per_axis still uses the Quat64 objects (euler decomposition).
+        if not self.per_axis:
+            trim_xyzw = np.array(
+                [trimmed[ts]._rot.as_quat() for ts in ts_sorted],
+                dtype=np.float64,
+            )
+
         # ========== Step 1: Compute velocity ==========
         velocity: dict[int, list[float]] = {}
 
         first_ts = ts_sorted[0]
         velocity[first_ts] = [0.0, 0.0, 0.0]
 
-        prev_quat = trimmed[first_ts]
-        for ts in ts_sorted[1:]:
-            quat = trimmed[ts]
-            dist = prev_quat.inverse() * quat
-            if self.per_axis:
+        if not self.per_axis:
+            # Vectorized default path: angle via numpy quaternions.
+            for i in range(1, len(ts_sorted)):
+                dist = _q_mul(_q_inv(trim_xyzw[i - 1]), trim_xyzw[i])
+                angle = _q_angle(dist)
+                deg_per_sec = angle * rad_to_deg_per_sec
+                velocity[ts_sorted[i]] = [deg_per_sec, deg_per_sec, deg_per_sec]
+        else:
+            prev_quat = trimmed[first_ts]
+            for ts in ts_sorted[1:]:
+                quat = trimmed[ts]
+                dist = prev_quat.inverse() * quat
                 euler = dist.euler_angles()
                 velocity[ts] = [
                     abs(euler[0]) * rad_to_deg_per_sec,  # Pitch
                     abs(euler[1]) * rad_to_deg_per_sec,  # Yaw
                     abs(euler[2]) * rad_to_deg_per_sec,  # Roll
                 ]
-            else:
-                angle = dist.angle()
-                deg_per_sec = angle * rad_to_deg_per_sec
-                velocity[ts] = [deg_per_sec, deg_per_sec, deg_per_sec]
-            prev_quat = quat
+                prev_quat = quat
 
         # ========== Step 2: Smooth velocity (bidirectional) ==========
         # Forward pass
@@ -401,15 +464,27 @@ class DefaultAlgo(SmoothingAlgorithm):
                 vel[2] /= max_vel[2]
 
         # ========== First smoothing pass: forward ==========
-        q = trimmed[ts_sorted[0]]
-        smoothed1: TimeQuat = {}
-        for ts in ts_sorted:
-            x = trimmed[ts]
-            ratio = velocity[ts]
-            a_s = alpha_smoothness_per_ts.get(ts, alpha_smoothness)
-            a_0 = alpha_0_1s_per_ts.get(ts, alpha_0_1s)
+        n_ts = len(ts_sorted)
+        if not self.per_axis:
+            # Default path: recurse on raw [x,y,z,w] arrays (no Quat64 alloc).
+            q = trim_xyzw[0].copy()
+            s1_xyzw = np.empty((n_ts, 4), dtype=np.float64)
+            for i, ts in enumerate(ts_sorted):
+                ratio = velocity[ts]
+                a_s = alpha_smoothness_per_ts.get(ts, alpha_smoothness)
+                a_0 = alpha_0_1s_per_ts.get(ts, alpha_0_1s)
+                val = a_s * (1.0 - ratio[0]) + a_0 * ratio[0]
+                q = _q_slerp(q, trim_xyzw[i], min(val, 1.0))
+                s1_xyzw[i] = q
+        else:
+            q = trimmed[ts_sorted[0]]
+            smoothed1: TimeQuat = {}
+            for ts in ts_sorted:
+                x = trimmed[ts]
+                ratio = velocity[ts]
+                a_s = alpha_smoothness_per_ts.get(ts, alpha_smoothness)
+                a_0 = alpha_0_1s_per_ts.get(ts, alpha_0_1s)
 
-            if self.per_axis:
                 pitch_factor = a_s * (1.0 - ratio[0]) + a_0 * ratio[0]
                 yaw_factor = a_s * (1.0 - ratio[1]) + a_0 * ratio[1]
                 roll_factor = a_s * (1.0 - ratio[2]) + a_0 * ratio[2]
@@ -421,22 +496,29 @@ class DefaultAlgo(SmoothingAlgorithm):
                     euler_rot[2] * min(roll_factor, 1.0),
                 )
                 q = q * quat_rot
-            else:
-                val = a_s * (1.0 - ratio[0]) + a_0 * ratio[0]
-                q = q.slerp(x, min(val, 1.0))
-
-            smoothed1[ts] = q
+                smoothed1[ts] = q
 
         # ========== First smoothing pass: backward ==========
-        q = smoothed1[ts_sorted[-1]]
-        smoothed2: TimeQuat = {}
-        for ts in reversed(ts_sorted):
-            x = smoothed1[ts]
-            a_s = alpha_smoothness_per_ts.get(ts, alpha_smoothness)
-            a_0 = alpha_0_1s_per_ts.get(ts, alpha_0_1s)
-            ratio = velocity[ts]
+        if not self.per_axis:
+            q = s1_xyzw[-1].copy()
+            s2_xyzw = np.empty((n_ts, 4), dtype=np.float64)
+            for j, ts in enumerate(reversed(ts_sorted)):
+                i = n_ts - 1 - j
+                a_s = alpha_smoothness_per_ts.get(ts, alpha_smoothness)
+                a_0 = alpha_0_1s_per_ts.get(ts, alpha_0_1s)
+                ratio = velocity[ts]
+                val = a_s * (1.0 - ratio[0]) + a_0 * ratio[0]
+                q = _q_slerp(q, s1_xyzw[i], min(val, 1.0))
+                s2_xyzw[i] = q
+        else:
+            q = smoothed1[ts_sorted[-1]]
+            smoothed2: TimeQuat = {}
+            for ts in reversed(ts_sorted):
+                x = smoothed1[ts]
+                a_s = alpha_smoothness_per_ts.get(ts, alpha_smoothness)
+                a_0 = alpha_0_1s_per_ts.get(ts, alpha_0_1s)
+                ratio = velocity[ts]
 
-            if self.per_axis:
                 pitch_factor = a_s * (1.0 - ratio[0]) + a_0 * ratio[0]
                 yaw_factor = a_s * (1.0 - ratio[1]) + a_0 * ratio[1]
                 roll_factor = a_s * (1.0 - ratio[2]) + a_0 * ratio[2]
@@ -448,25 +530,32 @@ class DefaultAlgo(SmoothingAlgorithm):
                     euler_rot[2] * min(roll_factor, 1.0),
                 )
                 q = q * quat_rot
-            else:
-                val = a_s * (1.0 - ratio[0]) + a_0 * ratio[0]
-                q = q.slerp(x, min(val, 1.0))
-
-            smoothed2[ts] = q
+                smoothed2[ts] = q
 
         if not self.second_pass:
-            return smoothed2
+            if self.per_axis:
+                return smoothed2
+            return {ts: Quat64(Rotation.from_quat(s2_xyzw[i]))
+                    for i, ts in enumerate(ts_sorted)}
 
         # ========== Second pass: compute distance ==========
         distance: dict[int, list[float]] = {}
         max_distance = [0.0, 0.0, 0.0]
 
-        for ts in ts_sorted:
-            quat = smoothed2[ts]
-            orig = trimmed[ts]
-            dist = orig.inverse() * quat
+        if not self.per_axis:
+            # Default path: distance angle via numpy quaternions (s2_xyzw).
+            for i, ts in enumerate(ts_sorted):
+                dist = _q_mul(_q_inv(trim_xyzw[i]), s2_xyzw[i])
+                angle = _q_angle(dist)
+                distance[ts] = [angle, 0.0, 0.0]
+                if angle > max_distance[0]:
+                    max_distance[0] = angle
+        else:
+            for ts in ts_sorted:
+                quat = smoothed2[ts]
+                orig = trimmed[ts]
+                dist = orig.inverse() * quat
 
-            if self.per_axis:
                 euler = dist.euler_angles()
                 d = [abs(euler[0]), abs(euler[1]), abs(euler[2])]
                 distance[ts] = d
@@ -476,11 +565,6 @@ class DefaultAlgo(SmoothingAlgorithm):
                     max_distance[1] = d[1]
                 if d[2] > max_distance[2]:
                     max_distance[2] = d[2]
-            else:
-                angle = dist.angle()
-                distance[ts] = [angle, 0.0, 0.0]
-                if angle > max_distance[0]:
-                    max_distance[0] = angle
 
         # Normalize distance, discard under 0.5
         for ts in ts_sorted:
@@ -537,16 +621,27 @@ class DefaultAlgo(SmoothingAlgorithm):
                 d[2] = (d[2] + 1.0) / 2.0
 
         # ========== Second pass: forward ==========
-        q = smoothed2[ts_sorted[0]]
-        smoothed3: TimeQuat = {}
-        for ts in ts_sorted:
-            x = smoothed2[ts]
-            a_s = alpha_smoothness_per_ts.get(ts, alpha_smoothness)
-            a_0 = alpha_0_1s_per_ts.get(ts, alpha_0_1s)
-            vel_ratio = velocity[ts]
-            dist_ratio = distance[ts]
+        if not self.per_axis:
+            q = s2_xyzw[0].copy()
+            s3_xyzw = np.empty((n_ts, 4), dtype=np.float64)
+            for i, ts in enumerate(ts_sorted):
+                a_s = alpha_smoothness_per_ts.get(ts, alpha_smoothness)
+                a_0 = alpha_0_1s_per_ts.get(ts, alpha_0_1s)
+                vel_ratio = velocity[ts]
+                dist_ratio = distance[ts]
+                val = a_s * (1.0 - vel_ratio[0] * dist_ratio[0]) + a_0 * vel_ratio[0] * dist_ratio[0]
+                q = _q_slerp(q, s2_xyzw[i], min(val, 1.0))
+                s3_xyzw[i] = q
+        else:
+            q = smoothed2[ts_sorted[0]]
+            smoothed3: TimeQuat = {}
+            for ts in ts_sorted:
+                x = smoothed2[ts]
+                a_s = alpha_smoothness_per_ts.get(ts, alpha_smoothness)
+                a_0 = alpha_0_1s_per_ts.get(ts, alpha_0_1s)
+                vel_ratio = velocity[ts]
+                dist_ratio = distance[ts]
 
-            if self.per_axis:
                 pitch_factor = a_s * (1.0 - vel_ratio[0] * dist_ratio[0]) + a_0 * vel_ratio[0] * dist_ratio[0]
                 yaw_factor = a_s * (1.0 - vel_ratio[1] * dist_ratio[1]) + a_0 * vel_ratio[1] * dist_ratio[1]
                 roll_factor = a_s * (1.0 - vel_ratio[2] * dist_ratio[2]) + a_0 * vel_ratio[2] * dist_ratio[2]
@@ -558,13 +653,24 @@ class DefaultAlgo(SmoothingAlgorithm):
                     euler_rot[2] * min(roll_factor, 1.0),
                 )
                 q = q * quat_rot
-            else:
-                val = a_s * (1.0 - vel_ratio[0] * dist_ratio[0]) + a_0 * vel_ratio[0] * dist_ratio[0]
-                q = q.slerp(x, min(val, 1.0))
-
-            smoothed3[ts] = q
+                smoothed3[ts] = q
 
         # ========== Second pass: backward ==========
+        if not self.per_axis:
+            q = s3_xyzw[-1].copy()
+            res_xyzw = np.empty((n_ts, 4), dtype=np.float64)
+            for j, ts in enumerate(reversed(ts_sorted)):
+                i = n_ts - 1 - j
+                a_s = alpha_smoothness_per_ts.get(ts, alpha_smoothness)
+                a_0 = alpha_0_1s_per_ts.get(ts, alpha_0_1s)
+                vel_ratio = velocity[ts]
+                dist_ratio = distance[ts]
+                val = a_s * (1.0 - vel_ratio[0] * dist_ratio[0]) + a_0 * vel_ratio[0] * dist_ratio[0]
+                q = _q_slerp(q, s3_xyzw[i], min(val, 1.0))
+                res_xyzw[i] = q
+            return {ts: Quat64(Rotation.from_quat(res_xyzw[i]))
+                    for i, ts in enumerate(ts_sorted)}
+
         q = smoothed3[ts_sorted[-1]]
         result: TimeQuat = {}
         for ts in reversed(ts_sorted):
@@ -574,22 +680,17 @@ class DefaultAlgo(SmoothingAlgorithm):
             vel_ratio = velocity[ts]
             dist_ratio = distance[ts]
 
-            if self.per_axis:
-                pitch_factor = a_s * (1.0 - vel_ratio[0] * dist_ratio[0]) + a_0 * vel_ratio[0] * dist_ratio[0]
-                yaw_factor = a_s * (1.0 - vel_ratio[1] * dist_ratio[1]) + a_0 * vel_ratio[1] * dist_ratio[1]
-                roll_factor = a_s * (1.0 - vel_ratio[2] * dist_ratio[2]) + a_0 * vel_ratio[2] * dist_ratio[2]
+            pitch_factor = a_s * (1.0 - vel_ratio[0] * dist_ratio[0]) + a_0 * vel_ratio[0] * dist_ratio[0]
+            yaw_factor = a_s * (1.0 - vel_ratio[1] * dist_ratio[1]) + a_0 * vel_ratio[1] * dist_ratio[1]
+            roll_factor = a_s * (1.0 - vel_ratio[2] * dist_ratio[2]) + a_0 * vel_ratio[2] * dist_ratio[2]
 
-                euler_rot = (q.inverse() * x).euler_angles()
-                quat_rot = Quat64.from_euler_angles(
-                    euler_rot[0] * min(pitch_factor, 1.0),
-                    euler_rot[1] * min(yaw_factor, 1.0),
-                    euler_rot[2] * min(roll_factor, 1.0),
-                )
-                q = q * quat_rot
-            else:
-                val = a_s * (1.0 - vel_ratio[0] * dist_ratio[0]) + a_0 * vel_ratio[0] * dist_ratio[0]
-                q = q.slerp(x, min(val, 1.0))
-
+            euler_rot = (q.inverse() * x).euler_angles()
+            quat_rot = Quat64.from_euler_angles(
+                euler_rot[0] * min(pitch_factor, 1.0),
+                euler_rot[1] * min(yaw_factor, 1.0),
+                euler_rot[2] * min(roll_factor, 1.0),
+            )
+            q = q * quat_rot
             result[ts] = q
 
         return result
