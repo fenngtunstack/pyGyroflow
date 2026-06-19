@@ -51,19 +51,26 @@ tests/test_rust_golden.py::test_agreement_summary                              P
 
 ## 3 Rust-Python 数值一致性
 
-使用 `msGyroFlow/crates/msgyro-golden-gen` 生成的 Rust 黄金数据与 Python 输出对比：
+对照基准为 `msgyro-golden-gen` 产出的 Rust 黄金数据。**重要**：golden-gen 现在委托给生产级 `msgyro-imu-integration` crate（真实的 Gyroflow 算法移植），而非早期手写的简化副本。因此本节是 Python 实现与独立 Rust 实现的对照，不再是两份手抄互校。
 
 ```
 === Rust vs Python IMU Integration Comparison ===
-  simple_gyro       : PASS  max_err=5.44e-15  mean_err=2.74e-15  n=1000
-  simple_gyro_accel : PASS  max_err=2.22e-15  mean_err=1.31e-15  n=1000
-  mahony            : PASS  max_err=5.83e-16  mean_err=2.69e-16  n=1000
-  madgwick          : PASS  max_err=9.99e-16  mean_err=5.24e-16  n=1000
-  complementary     : PASS  max_err=4.33e-15  mean_err=2.63e-15  n=1000
-=========================================================
+  simple_gyro       : PASS  max_err=2.33e-15  n=1000
+  simple_gyro_accel : PASS  max_err=9.99e-16  n=1000
+  mahony            : PASS  max_err=5.83e-16  n=1000
+  madgwick          : PASS  max_err=9.99e-16  n=1000
+  complementary     : FAIL  max_err=7.14e-01  n=1000   (xfail, 见下)
+  vqf               : FAIL  max_err=3.38e-01  n=1000   (xfail, 见下)
+=======================================================
 ```
 
-**结论**: 所有积分器误差在机器精度级别 (~1e-15)，远优于 1e-6 容忍度。
+**结论**：
+- **4/6 积分器**（simple_gyro / simple_gyro_accel / mahony / madgwick）与 Rust 真实实现机器精度一致（max_err < 1e-14）。
+- **complementary** 与 **vqf** 与 Rust 真实实现有实质性偏差，测试标 `xfail(strict)`：
+  - `complementary`：Python 实现是早期 golden-gen 手写简化版的镜像（约 8 行），Rust 是论文 "Keeping a Good Attitude" 的 V1/V2 完整算法（约 600 行）—— 算法级不同，需重写 Python 端。
+  - `vqf`：Python 与 Rust 同源（Laidig VQF），但初始 heading 处理不同（约 24° 偏差），需逐行对齐 heading 初始化。
+
+历史版本曾声称"5 个积分器全部机器精度一致"——那是 Python 与手写简化 Rust 副本互校的结果（其中 complementary 恰好两边都是同一份简化实现，故"一致"）。换成独立真实基准后，该一致性不成立。
 
 ## 4 算法移植缺陷修复记录
 
@@ -83,7 +90,8 @@ tests/test_rust_golden.py::test_agreement_summary                              P
 |------|------|------|------|
 | Telemetry 解析 | 纯 Python GPMF/DJI 解析（PyO3 bridge 空壳已移除） | 仅 GoPro/DJI 格式 | 扩展格式覆盖 |
 | GPU 管线 | uint8 上传的 `_pack_to_u32` 位重解释 bug 已修（改走 f32 上传），但 compute 管线在 lavapipe（CI 的软件 Vulkan，非合规）下仍输出全 0；默认 `use_gpu=False` | GPU 路径产出错误结果，xfail 跟踪 | 需真实 GPU 环境逐层调试（shader/bind group/dispatch） |
-| VQF Rust 对比 | Rust 黄金数据生成器未包含 VQF | VQF 无 Rust 对比 | 在 golden-gen crate 中移植 Gyroflow VQF |
+| complementary 对齐 | Python 是早期简化版镜像（8 行），Rust 真实实现是论文 V1/V2（600 行），max_err=0.71 | xfail(strict) 跟踪 | 用论文版重写 Python ComplementaryIntegrator |
+| VQF 对齐 | Python 与 Rust 同源但初始 heading 处理不同（~24°），max_err=0.34 | xfail(strict) 跟踪 | 逐行对齐 VQF heading 初始化 |
 | GUI | 基础框架已实现，未完整测试 | 功能不完整 | 后续迭代完善 |
 | 端到端视频对比 | 未做 PyGyroFlow vs Gyroflow 逐帧 PSNR | 像素级一致性未验证 | 用实际视频对比 |
 

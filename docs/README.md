@@ -30,5 +30,6 @@ pygyroflow input.mp4 -o output.mp4 --smoothness 0.5
 
 - 107 个 Python 源文件，约 18,925 行代码（`pygyroflow/` 包）
 - 16 个测试文件，约 2,544 行测试代码，198 个测试用例
-- Rust-Python 数值一致性：5 个 IMU 积分器 max_err < 1e-14（机器精度）；
-  VQF 暂无 Rust 对照（见 [06-测试报告](06-test-report.md) 已知限制）
+- Rust-Python 数值一致性（对照基准为独立的 `msgyro-imu-integration` 真实移植版）：
+  4/6 积分器（simple_gyro/simple_gyro_accel/mahony/madgwick）max_err < 1e-14（机器精度）；
+  complementary 与 VQF 的 Python 实现与 Rust 算法有偏差，标 xfail 待对齐（见 [06-测试报告](06-test-report.md)）
