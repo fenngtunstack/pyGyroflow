@@ -28,7 +28,11 @@ from pygyroflow.types.quaternion import Quat64
 from pygyroflow.stabilization.compute_params import ComputeParams
 
 
-def _quat_at_timestamp(quats: dict[int, Quat64], timestamp_us: float) -> Quat64:
+def _quat_at_timestamp(
+    quats: dict[int, Quat64],
+    timestamp_us: float,
+    keys: list[int] | None = None,
+) -> Quat64:
     """Interpolate a quaternion at the given timestamp (microseconds).
 
     Uses nearest-neighbor lookup within the sorted timestamp keys,
@@ -37,6 +41,10 @@ def _quat_at_timestamp(quats: dict[int, Quat64], timestamp_us: float) -> Quat64:
     Args:
         quats: Map of timestamp_us -> Quat64.
         timestamp_us: Query timestamp in microseconds.
+        keys: Optional pre-sorted list of ``quats`` keys. Pass this when
+            calling in a tight loop (e.g. per rolling-shutter row) to avoid
+            re-sorting on every call — sorting is O(N log N) and dominated
+            per-frame cost when called once per output row.
 
     Returns:
         Interpolated quaternion, or identity if no data.
@@ -45,7 +53,8 @@ def _quat_at_timestamp(quats: dict[int, Quat64], timestamp_us: float) -> Quat64:
         return Quat64.identity()
 
     ts = round(timestamp_us)
-    keys = sorted(quats.keys())
+    if keys is None:
+        keys = sorted(quats.keys())
 
     if ts <= keys[0]:
         return quats[keys[0]]
@@ -298,7 +307,11 @@ class FrameTransform:
                 quat_offset_us = float(quat_keys[0])
 
         ts_us = timestamp_ms * 1000.0 + quat_offset_us
-        org_quat_center = _quat_at_timestamp(params.quaternions, ts_us).inverse()
+        # Pre-sort keys ONCE per at_timestamp call — the rolling-shutter path
+        # calls _quat_at_timestamp once per output row (up to 1080), and each
+        # call previously re-sorted all keys (O(N log N) per row).
+        org_keys = sorted(params.quaternions.keys()) if params.quaternions else None
+        org_quat_center = _quat_at_timestamp(params.quaternions, ts_us, org_keys).inverse()
         smoothed_quat_center = _quat_at_timestamp(params.smoothed_quaternions, ts_us)
 
         # --- 7. Compute per-row matrices ---
@@ -312,7 +325,9 @@ class FrameTransform:
             if has_rolling_shutter:
                 quat_time = start_ts + row_readout_time * y
                 # Rolling shutter: undo original at center, reapply at row time
-                org_at_time = _quat_at_timestamp(params.quaternions, quat_time * 1000.0 + quat_offset_us)
+                org_at_time = _quat_at_timestamp(
+                    params.quaternions, quat_time * 1000.0 + quat_offset_us, org_keys,
+                )
                 quat = smoothed_quat_center * org_quat_center * org_at_time
             else:
                 # No rolling shutter: just the stabilization delta
