@@ -15,6 +15,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .base import DistortionModelBase
 
 if TYPE_CHECKING:
@@ -67,6 +69,16 @@ class Poly5Model(DistortionModelBase):
         ru2 = x * x + y * y
         poly4 = 1.0 + k1 * ru2 + k2 * ru2 * ru2
         return (x * poly4, y * poly4)
+
+    def distort_points(self, xs, ys, zs, params):
+        """Vectorized forward poly5 distortion."""
+        k1 = float(params.k1[0])
+        k2 = float(params.k1[1])
+        x = xs / zs
+        y = ys / zs
+        ru2 = x * x + y * y
+        poly4 = 1.0 + k1 * ru2 + k2 * ru2 * ru2
+        return x * poly4, y * poly4
 
     # -- radial distortion limit -----------------------------------------
 

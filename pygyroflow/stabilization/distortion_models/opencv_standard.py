@@ -24,6 +24,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .base import DistortionModelBase
 
 if TYPE_CHECKING:
@@ -120,6 +122,35 @@ class OpenCVStandardModel(DistortionModelBase):
             y * cdist * icdist2 + k1_2 * a3 + k1_3 * a1 + k3_2 * r2 + k3_3 * r4
         )
         return (xd0, yd0)
+
+    def distort_points(self, xs, ys, zs, params):
+        """Vectorized forward Brown-Conrady distortion."""
+        k1_0 = float(params.k1[0]); k1_1 = float(params.k1[1])
+        k1_2 = float(params.k1[2]); k1_3 = float(params.k1[3])
+        k2_0 = float(params.k2[0]); k2_1 = float(params.k2[1])
+        k2_2 = float(params.k2[2]); k2_3 = float(params.k2[3])
+        k3_0 = float(params.k3[0]); k3_1 = float(params.k3[1])
+        k3_2 = float(params.k3[2]); k3_3 = float(params.k3[3])
+
+        x = xs / zs
+        y = ys / zs
+        r2 = x * x + y * y
+        r4 = r2 * r2
+        r6 = r4 * r2
+        a1 = 2.0 * x * y
+        a2 = r2 + 2.0 * x * x
+        a3 = r2 + 2.0 * y * y
+
+        cdist = 1.0 + k1_0 * r2 + k1_1 * r4 + k2_0 * r6
+        icdist2 = 1.0 / (1.0 + k2_1 * r2 + k2_2 * r4 + k2_3 * r6)
+
+        xd0 = (
+            x * cdist * icdist2 + k1_2 * a1 + k1_3 * a2 + k3_0 * r2 + k3_1 * r4
+        )
+        yd0 = (
+            y * cdist * icdist2 + k1_2 * a3 + k1_3 * a1 + k3_2 * r2 + k3_3 * r4
+        )
+        return xd0, yd0
 
     # -- radial distortion limit -----------------------------------------
 

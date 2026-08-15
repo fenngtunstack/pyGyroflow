@@ -39,6 +39,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .base import DistortionModelBase
 
 if TYPE_CHECKING:
@@ -134,6 +136,55 @@ class GoProSuperviewModel(DistortionModelBase):
                 break
 
         return ((px + 0.5) * size_w, (py + 0.5) * size_h)
+
+    def distort_points(self, xs, ys, zs, params):
+        """Vectorized Wide -> Superview via masked fixed-point iteration.
+
+        Same 12-step inversion of _superview as the scalar version, with
+        converged/diverged points frozen out of further updates.
+        """
+        size_w = float(params.width)
+        size_h = float(params.height)
+
+        # Normalise to [-0.5, 0.5] and apply 4:3 -> 16:9 stretch
+        nx = (xs / size_w) - 0.5
+        ny = (ys / size_h) - 0.5
+        nx = nx * _ASPECT_RATIO
+
+        px = nx.copy()
+        py = ny.copy()
+        active = np.ones(nx.shape, dtype=bool)
+
+        for _ in range(12):
+            if not active.any():
+                break
+            x2 = px * px
+            y2 = py * py
+            dp_x = px * (1.2100393 + x2 * (-1.2758402 + x2 * 1.7751845))
+            dp_y = py * (
+                0.9364505
+                + (0.4465308 - 0.7683315 * y2) * y2
+                + (-0.3574087 + 1.1584653 * y2 + 0.3529348 * x2) * x2
+            )
+            diff_x = dp_x - nx
+            diff_y = dp_y - ny
+
+            # Converged: freeze without applying the update
+            active &= ~((np.abs(diff_x) < 1e-6) & (np.abs(diff_y) < 1e-6))
+            if not active.any():
+                break
+
+            px = np.where(active, px - diff_x, px)
+            py = np.where(active, py - diff_y, py)
+
+            # Guard against divergence: reset and freeze
+            bad = active & ((np.abs(px) > 2.0) | (np.abs(py) > 2.0))
+            if bad.any():
+                px = np.where(bad, nx, px)
+                py = np.where(bad, ny, py)
+                active &= ~bad
+
+        return (px + 0.5) * size_w, (py + 0.5) * size_h
 
     # -- radial distortion limit -----------------------------------------
 

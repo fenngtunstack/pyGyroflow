@@ -25,6 +25,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .base import DistortionModelBase
 
 if TYPE_CHECKING:
@@ -61,6 +63,12 @@ class DigitalStretchModel(DistortionModelBase):
         sx = float(params.digital_lens_params[0])
         sy = float(params.digital_lens_params[1])
         return (x * sx, y * sy)
+
+    def distort_points(self, xs, ys, zs, params):
+        """Vectorized axis scaling (z unused)."""
+        sx = float(params.digital_lens_params[0])
+        sy = float(params.digital_lens_params[1])
+        return xs * sx, ys * sy
 
     # -- radial distortion limit -----------------------------------------
 

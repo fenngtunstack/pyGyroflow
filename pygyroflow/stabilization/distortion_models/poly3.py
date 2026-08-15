@@ -14,6 +14,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .base import DistortionModelBase
 
 if TYPE_CHECKING:
@@ -32,6 +34,9 @@ class Poly3Model(DistortionModelBase):
         self, x: float, y: float, params: "KernelParams"
     ) -> tuple[float, float] | None:
         k1 = float(params.k1[0])
+        if k1 == 0.0:
+            # No distortion: identity (mirrors the fisheye zero-coeffs guard)
+            return (x, y)
         inv_k1 = 1.0 / k1
 
         rd = math.sqrt(x * x + y * y)
@@ -67,6 +72,15 @@ class Poly3Model(DistortionModelBase):
         # r_d = r_u * (k1 * r_u^2 + 1)  =>  scale = k1 * r^2 + 1
         poly2 = k1 * (x * x + y * y) + 1.0
         return (x * poly2, y * poly2)
+
+    def distort_points(self, xs, ys, zs, params):
+        """Vectorized forward poly3 distortion."""
+        k1 = float(params.k1[0])
+        x = xs / zs
+        y = ys / zs
+        # r_d = r_u * (k1 * r_u^2 + 1)  =>  scale = k1 * r^2 + 1
+        poly2 = k1 * (x * x + y * y) + 1.0
+        return x * poly2, y * poly2
 
     # -- radial distortion limit -----------------------------------------
 

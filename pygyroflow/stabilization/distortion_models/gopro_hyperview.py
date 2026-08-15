@@ -47,6 +47,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .base import DistortionModelBase
 
 if TYPE_CHECKING:
@@ -161,6 +163,71 @@ class GoProHyperviewModel(DistortionModelBase):
                 break
 
         return ((px + 0.5) * size_w, (py + 0.5) * size_h)
+
+    def distort_points(self, xs, ys, zs, params):
+        """Vectorized Wide -> Hyperview via masked fixed-point iteration.
+
+        Same guarded inversion of _hyperview as the scalar version; the
+        7th-order polynomial needs more iterations and a tighter reset
+        policy, both mirrored from the scalar loop.
+        """
+        size_w = float(params.width)
+        size_h = float(params.height)
+
+        # Normalise to [-0.5, 0.5] and apply 8:7 -> 16:9 stretch
+        nx = (xs / size_w) - 0.5
+        ny = (ys / size_h) - 0.5
+        nx = nx * _ASPECT_RATIO
+
+        px = nx.copy()
+        py = ny.copy()
+        active = np.ones(nx.shape, dtype=bool)
+
+        for _ in range(_MAX_ITER):
+            if not active.any():
+                break
+            x2 = px * px
+            y2 = py * py
+            dp_x = (
+                px
+                * (
+                    1.5805143
+                    + x2
+                    * (
+                        -8.1668825
+                        + x2
+                        * (
+                            74.5198746
+                            + x2
+                            * (
+                                -451.5002441
+                                + x2 * (1551.2922363 + x2 * (-2735.5422363 + x2 * 1923.1572266))
+                            )
+                        )
+                    )
+                )
+                + y2 * -0.1086027
+            )
+            dp_y = py * (1.0238225 + y2 * -0.1025671 + x2 * (-0.2639930 + x2 * 0.2979266))
+            diff_x = dp_x - nx
+            diff_y = dp_y - ny
+
+            # Converged: freeze without applying the update
+            active &= ~((np.abs(diff_x) < 1e-6) & (np.abs(diff_y) < 1e-6))
+            if not active.any():
+                break
+
+            px = np.where(active, px - diff_x, px)
+            py = np.where(active, py - diff_y, py)
+
+            # Guard against divergence: reset and freeze
+            bad = active & ((np.abs(px) > _DIVERGENCE_LIMIT) | (np.abs(py) > _DIVERGENCE_LIMIT))
+            if bad.any():
+                px = np.where(bad, nx, px)
+                py = np.where(bad, ny, py)
+                active &= ~bad
+
+        return (px + 0.5) * size_w, (py + 0.5) * size_h
 
     # -- radial distortion limit -----------------------------------------
 

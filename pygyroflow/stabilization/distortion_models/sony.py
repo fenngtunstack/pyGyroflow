@@ -31,6 +31,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .base import DistortionModelBase
 
 if TYPE_CHECKING:
@@ -173,6 +175,46 @@ class SonyModel(DistortionModelBase):
         scale = theta_d / r if r != 0.0 else 1.0
 
         return (x * scale * post_scale_x, y * scale * post_scale_y)
+
+    def distort_points(self, xs, ys, zs, params):
+        """Vectorized forward angle-polynomial distortion."""
+        k0 = float(params.k1[0])
+        k1 = float(params.k1[1])
+        k2 = float(params.k1[2])
+        k3 = float(params.k1[3])
+        k4 = float(params.k2[0])
+        k5 = float(params.k2[1])
+        post_scale_x = float(params.k2[2])
+        post_scale_y = float(params.k2[3])
+
+        x = xs / zs
+        y = ys / zs
+
+        # Early exit: no distortion
+        if k0 == 0.0 and k1 == 0.0 and k2 == 0.0 and k3 == 0.0:
+            return x, y
+
+        r = np.sqrt(x * x + y * y)
+        theta = np.arctan(r)
+
+        theta2 = theta * theta
+        theta3 = theta2 * theta
+        theta4 = theta2 * theta2
+        theta5 = theta2 * theta3
+        theta6 = theta3 * theta3
+
+        theta_d = (
+            theta * k0
+            + theta2 * k1
+            + theta3 * k2
+            + theta4 * k3
+            + theta5 * k4
+            + theta6 * k5
+        )
+
+        scale = np.divide(theta_d, r, out=np.ones_like(r), where=r != 0.0)
+
+        return x * scale * post_scale_x, y * scale * post_scale_y
 
     # -- radial distortion limit -----------------------------------------
 

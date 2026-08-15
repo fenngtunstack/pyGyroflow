@@ -28,6 +28,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .base import DistortionModelBase
 
 if TYPE_CHECKING:
@@ -88,6 +90,33 @@ class Insta360Model(DistortionModelBase):
         r6 = r4 * r2
 
         # Radial factor common to both axes
+        radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+
+        return (
+            proj_x * radial + 2.0 * p1 * proj_x * proj_y + p2 * (r2 + 2.0 * proj_x * proj_x),
+            proj_y * radial + 2.0 * p2 * proj_x * proj_y + p1 * (r2 + 2.0 * proj_y * proj_y),
+        )
+
+    def distort_points(self, xs, ys, zs, params):
+        """Vectorized forward UCM + Brown-Conrady distortion."""
+        k1 = float(params.k1[0])
+        k2 = float(params.k1[1])
+        k3 = float(params.k1[2])
+        p1 = float(params.k1[3])
+        p2 = float(params.k2[0])
+        xi = float(params.k2[1])
+
+        length = np.sqrt(xs * xs + ys * ys + zs * zs)
+
+        # UCM projection: normalise to unit sphere, then apply mirror param.
+        # When xi=0 this degenerates to standard pinhole (x/z, y/z).
+        proj_x = (xs / length) / ((zs / length) + xi)
+        proj_y = (ys / length) / ((zs / length) + xi)
+
+        r2 = proj_x * proj_x + proj_y * proj_y
+        r4 = r2 * r2
+        r6 = r4 * r2
+
         radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
 
         return (

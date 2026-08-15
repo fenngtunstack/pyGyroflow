@@ -16,6 +16,9 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
+from numpy.typing import NDArray
+
 from .base import DistortionModelBase
 
 if TYPE_CHECKING:
@@ -111,6 +114,92 @@ class OpenCVFisheyeModel(DistortionModelBase):
         )
         scale = theta_d / r if r != 0.0 else 1.0
         return (x * scale, y * scale)
+
+    # -- vectorized batch --------------------------------------------------
+
+    def distort_points(self, xs, ys, zs, params):
+        """Vectorized forward Kannala-Brandt distortion.
+
+        Mirrors ``distort_point`` operation-for-operation; ``np.divide``
+        with ``where=`` avoids the 0/0 RuntimeWarning at the image center.
+        """
+        k0 = float(params.k1[0])
+        k1 = float(params.k1[1])
+        k2 = float(params.k1[2])
+        k3 = float(params.k1[3])
+
+        if k0 == 0.0 and k1 == 0.0 and k2 == 0.0 and k3 == 0.0:
+            return xs / zs, ys / zs
+
+        x = xs / zs
+        y = ys / zs
+        r = np.sqrt(x * x + y * y)
+        theta = np.arctan(r)
+        theta2 = theta * theta
+        theta4 = theta2 * theta2
+        theta6 = theta4 * theta2
+        theta8 = theta4 * theta4
+
+        theta_d = theta * (1.0 + k0 * theta2 + k1 * theta4 + k2 * theta6 + k3 * theta8)
+        scale = np.divide(theta_d, r, out=np.ones_like(theta_d), where=r != 0.0)
+        return x * scale, y * scale
+
+    def undistort_points(self, xs, ys, params):
+        """Vectorized inverse distortion via Newton iteration.
+
+        Same 10-step clamped Newton loop as the scalar ``undistort_point``,
+        evaluated for all points at once. Non-converged or flipped points
+        are set to NaN.
+        """
+        k0 = float(params.k1[0])
+        k1 = float(params.k1[1])
+        k2 = float(params.k1[2])
+        k3 = float(params.k1[3])
+
+        if k0 == 0.0 and k1 == 0.0 and k2 == 0.0 and k3 == 0.0:
+            return xs.copy(), ys.copy()
+
+        EPS = 1e-6
+        theta_d = np.sqrt(xs * xs + ys * ys)
+        # Clamp to [-pi, pi] for >180 deg FOV
+        theta_d = np.clip(theta_d, -np.pi, np.pi)
+
+        theta = np.zeros_like(theta_d)
+        converged = np.abs(theta_d) <= EPS
+
+        theta_fix = np.zeros_like(theta_d)
+        active = ~converged
+        if np.any(active):
+            th = np.zeros_like(theta_d[active])
+            for _ in range(10):
+                theta2 = th * th
+                theta4 = theta2 * theta2
+                theta6 = theta4 * theta2
+                theta8 = theta6 * theta2
+
+                k0_t2 = k0 * theta2
+                k1_t4 = k1 * theta4
+                k2_t6 = k2 * theta6
+                k3_t8 = k3 * theta8
+
+                theta_fix = (
+                    th * (1.0 + k0_t2 + k1_t4 + k2_t6 + k3_t8) - theta_d[active]
+                ) / (1.0 + 3.0 * k0_t2 + 5.0 * k1_t4 + 7.0 * k2_t6 + 9.0 * k3_t8)
+
+                # Clamp step to prevent divergence
+                theta_fix = np.clip(theta_fix, -0.9, 0.9)
+                th = th - theta_fix
+
+            theta[active] = th
+            converged[active] = np.abs(theta_fix) < EPS
+
+        safe_td = np.where(np.abs(theta_d) > EPS, theta_d, 1.0)
+        scale = np.tan(theta) / safe_td
+        theta_flipped = ((theta_d < 0.0) & (theta > 0.0)) | ((theta_d > 0.0) & (theta < 0.0))
+
+        ok = converged & ~theta_flipped & (np.abs(theta_d) > EPS)
+        out_scale = np.where(ok, scale, np.nan)
+        return xs * out_scale, ys * out_scale
 
     # -- radial distortion limit -----------------------------------------
 

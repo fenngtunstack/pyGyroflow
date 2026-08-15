@@ -16,6 +16,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .base import DistortionModelBase
 
 if TYPE_CHECKING:
@@ -72,6 +74,18 @@ class PTLensModel(DistortionModelBase):
         r = math.sqrt(ru2)
         poly3 = a * ru2 * r + b * ru2 + c * r + 1.0
         return (x * poly3, y * poly3)
+
+    def distort_points(self, xs, ys, zs, params):
+        """Vectorized forward PTLens distortion."""
+        a = float(params.k1[0])
+        b = float(params.k1[1])
+        c = float(params.k1[2])
+        x = xs / zs
+        y = ys / zs
+        ru2 = x * x + y * y
+        r = np.sqrt(ru2)
+        poly3 = a * ru2 * r + b * ru2 + c * r + 1.0
+        return x * poly3, y * poly3
 
     # -- radial distortion limit -----------------------------------------
 
