@@ -458,10 +458,10 @@ class DefaultAlgo(SmoothingAlgorithm):
                     max_vel[1] *= 0.5
                     max_vel[2] *= 0.5
 
-            vel[0] /= max_vel[0]
+            vel[0] /= max(max_vel[0], 1e-9)
             if self.per_axis:
-                vel[1] /= max_vel[1]
-                vel[2] /= max_vel[2]
+                vel[1] /= max(max_vel[1], 1e-9)
+                vel[2] /= max(max_vel[2], 1e-9)
 
         # ========== First smoothing pass: forward ==========
         n_ts = len(ts_sorted)

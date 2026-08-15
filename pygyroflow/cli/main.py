@@ -64,6 +64,16 @@ def main() -> None:
         help="Enable GPU acceleration (known-broken uint8 path, experimental)",
     )
     parser.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="Drop audio instead of copying it to the output",
+    )
+    parser.add_argument(
+        "--autosync",
+        action="store_true",
+        help="Auto-sync gyro to video via optical flow before stabilizing",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -117,6 +127,16 @@ def main() -> None:
             # Configure smoothing
             mgr.smoothing.current().set_parameter("smoothness", args.smoothness)
 
+            # Auto-sync gyro timeline to video (optical flow based)
+            if args.autosync:
+                try:
+                    offset = mgr.synchronize()
+                except Exception as exc:
+                    log.warning("Auto-sync failed: %s", exc)
+                    offset = None
+                if offset is None:
+                    log.warning("Continuing without sync offset")
+
             # Run stabilization pipeline
             log.info("Computing stabilization...")
             mgr.recompute_blocking()
@@ -137,6 +157,7 @@ def main() -> None:
                     "codec": args.codec,
                     "bitrate": args.bitrate,
                     "use_gpu": args.gpu,
+                    "audio": not args.no_audio,
                 },
             )
             log.info("Done: %s", output)

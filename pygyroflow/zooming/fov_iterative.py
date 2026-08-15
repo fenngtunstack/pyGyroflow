@@ -128,13 +128,27 @@ def _undistort_points_simple(
     if not points:
         return []
 
-    # Get rotation quaternion for this timestamp
+    # Get rotation quaternion for this timestamp.
+    # smoothed_quaternions stores the CORRECTION (sm^-1 * org, set in
+    # manager.recompute_smoothing mirroring upstream gyro_source.rs).
+    # Consume it exactly like FrameTransform: correction * org_c^-1 * org_row,
+    # which without rolling shutter reduces to the correction itself.
+    # Pre-sorted keys are cached on the params object — this function runs
+    # per frame per zoom iteration and each lookup otherwise re-sorts all
+    # quaternion timestamps (O(N log N) per call).
     ts_us = timestamp_ms * 1000.0
-    org_quat = _quat_at_timestamp(params.quaternions, ts_us).inverse()
-    smoothed_quat = _quat_at_timestamp(params.smoothed_quaternions, ts_us)
-
-    # Combined rotation
-    combined_quat = smoothed_quat * org_quat
+    if params.quaternions:
+        if params._fov_org_keys is None:
+            params._fov_org_keys = sorted(params.quaternions.keys())
+        org_c = _quat_at_timestamp(params.quaternions, ts_us, params._fov_org_keys)
+    else:
+        org_c = _quat_at_timestamp(params.quaternions, ts_us)
+    if params._fov_smoothed_keys is None:
+        params._fov_smoothed_keys = (
+            sorted(params.smoothed_quaternions.keys()) if params.smoothed_quaternions else None
+        )
+    correction = _quat_at_timestamp(params.smoothed_quaternions, ts_us, params._fov_smoothed_keys)
+    combined_quat = correction * org_c.inverse() * org_c
     rot_matrix = combined_quat.to_rotation_matrix()
 
     # Camera intrinsics

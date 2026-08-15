@@ -43,6 +43,9 @@ pygyroflow = "pygyroflow.cli.main:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+markers = [
+    "slow: end-to-end tests that encode/decode real video (several seconds each)",
+]
 
 [tool.mypy]
 python_version = "3.12"
