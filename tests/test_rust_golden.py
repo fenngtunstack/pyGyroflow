@@ -124,9 +124,13 @@ class TestRustPythonIMUIntegration:
         )),
         pytest.param("vqf", marks=pytest.mark.xfail(
             strict=True,
-            reason="Python and Rust VQF share the same source (Laidig VQF) "
-            "but diverge in initial heading handling (~24 deg). Same algorithm, "
-            "needs per-line alignment of heading init. max_err~0.34.",
+            reason="Python vs Rust VQF: pure-Z (heading) difference of "
+            "~24.3 deg at t0 growing to ~29.5 deg at end. Diagnosis (2026-08-15): "
+            "NOT the mag path (both yield delta=0 on zero mag; the 9D dispatch "
+            "changes little). Consistent with a z-gyro bias difference of "
+            "~0.017 rad/s in the covariance-weighted forward/backward bias "
+            "merge — needs a line-by-line diff of the bias merge + "
+            "rest-detection state that feeds it.",
         )),
     ])
     def test_imu_integration_matches_rust(self, integrator_name, imu_list, imu_data):
