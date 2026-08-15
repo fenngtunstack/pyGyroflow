@@ -268,7 +268,8 @@ class WgpuBackend:
 
         # Coefficients buffer (interpolation lookup table).
         if coeffs is None:
-            coeffs = np.zeros(484, dtype=np.float32)
+            from pygyroflow.gpu.coeffs_table import COEFFS
+            coeffs = COEFFS
         buf_coeffs = self._device.create_buffer_with_data(
             data=coeffs.astype(np.float32).tobytes(),
             usage=wgpu.BufferUsage.STORAGE,
@@ -346,24 +347,20 @@ class WgpuBackend:
 
         return result
 
+    @staticmethod
     def undistort_frame_cpu_fallback(
-        self,
         input_frame: np.ndarray,
-        kernel_params: KernelParams,
-        matrices: np.ndarray,
+        transform,
     ) -> np.ndarray:
         """CPU fallback when GPU is not available.
 
-        Delegates to the CPU undistortion module. This is a placeholder
-        that raises NotImplementedError until cpu_undistort is implemented.
+        ``transform`` is a stabilization.FrameTransform (carries both the
+        matrices and the kernel params — the old signature passed them
+        separately and crashed with TypeError on call).
         """
-        try:
-            from pygyroflow.stabilization.cpu_undistort import cpu_undistort
-            return cpu_undistort(input_frame, kernel_params, matrices)
-        except ImportError:
-            raise GPUError(
-                "Neither GPU nor CPU undistortion backend is available"
-            )
+        from pygyroflow.stabilization.cpu_undistort import cpu_undistort
+
+        return cpu_undistort(input_frame, transform)
 
 
 # ------------------------------------------------------------------
