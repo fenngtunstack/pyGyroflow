@@ -25,6 +25,8 @@ from scipy.spatial.transform import Rotation
 from pygyroflow.types.enums import BackgroundMode, ReadoutDirection
 from pygyroflow.types.kernel_params import KernelParams
 from pygyroflow.types.quaternion import Quat64
+from pygyroflow.gyro_source.source import GyroSource
+from pygyroflow.keyframes.types import KeyframeType as KT
 from pygyroflow.stabilization.compute_params import ComputeParams
 
 
@@ -161,12 +163,18 @@ def _get_fov(
         FOV scale factor (clamped to >= 0.001).
     """
     fov_scale = params.fov_scale
+    if params.keyframes:
+        kf_val = params.keyframes.value_at_video_timestamp(KT.Fov, timestamp_ms)
+        if kf_val is not None:
+            fov_scale = kf_val
 
     fov_overview_offset = 1.0 if params.fov_overview and use_fovs and not for_ui else 0.0
     fov_scale += fov_overview_offset
 
     if use_fovs and params.fovs:
-        per_frame = params.fovs[frame] if frame < len(params.fovs) else params.fovs[-1]
+        per_frame = params.fovs[frame] if frame < len(params.fovs) else (
+            params.fovs[-1] if len(params.fovs) > 1 else 1.0
+        )
         fov = per_frame * fov_scale
     else:
         fov = 1.0
@@ -231,6 +239,7 @@ class FrameTransform:
     fov: float = 1.0
     minimal_fov: float = 1.0
     focal_length: Optional[float] = None
+    distortion_model_name: str = "opencv_fisheye"
 
     @staticmethod
     def at_timestamp(
@@ -258,12 +267,27 @@ class FrameTransform:
             FrameTransform with matrices and kernel params.
         """
         # --- 1. Keyframe parameter queries ---
+        # Animated values are queried per timestamp like upstream
+        # frame_transform.rs (queries return None when not keyframed —
+        # fall back to the static param in that case).
+        keyframes = params.keyframes
         video_rotation = params.video_rotation
         background_margin = params.background_margin
         background_feather = params.background_margin_feather
         lens_correction_amount = params.lens_correction_amount
         adaptive_zoom_center_x = params.adaptive_zoom_center_offset[0]
         adaptive_zoom_center_y = params.adaptive_zoom_center_offset[1]
+        if keyframes:
+            def _kf(kt: "KT", fallback: float) -> float:
+                v = keyframes.value_at_video_timestamp(kt, timestamp_ms)
+                return v if v is not None else fallback
+
+            video_rotation = _kf(KT.VideoRotation, video_rotation)
+            background_margin = _kf(KT.BackgroundMargin, background_margin)
+            background_feather = _kf(KT.BackgroundFeather, background_feather)
+            lens_correction_amount = _kf(KT.LensCorrectionStrength, lens_correction_amount)
+            adaptive_zoom_center_x = _kf(KT.ZoomingCenterX, adaptive_zoom_center_x)
+            adaptive_zoom_center_y = _kf(KT.ZoomingCenterY, adaptive_zoom_center_y)
         light_refraction_coefficient = params.light_refraction_coefficient
 
         # --- 2. Lens data ---
@@ -306,13 +330,23 @@ class FrameTransform:
             if quat_keys:
                 quat_offset_us = float(quat_keys[0])
 
-        ts_us = timestamp_ms * 1000.0 + quat_offset_us
         # Pre-sort keys ONCE per at_timestamp call — the rolling-shutter path
         # calls _quat_at_timestamp once per output row (up to 1080), and each
         # call previously re-sorted all keys (O(N log N) per row).
         org_keys = sorted(params.quaternions.keys()) if params.quaternions else None
-        org_quat_center = _quat_at_timestamp(params.quaternions, ts_us, org_keys).inverse()
-        smoothed_quat_center = _quat_at_timestamp(params.smoothed_quaternions, ts_us)
+
+        def lookup_quat(quats: dict[int, Quat64], ts_ms: float, keys: list[int] | None = None) -> Quat64:
+            """Look up a quaternion at a video timestamp.
+
+            Applies the sync-offset correction first, mirroring Gyroflow's
+            ``GyroSource::quat_at_timestamp`` (``ts -= offset_at_video_timestamp(ts)``),
+            so offsets set by synchronization actually shift the lookup.
+            """
+            corrected = ts_ms - GyroSource.offset_at_timestamp(params.sync_offsets_adjusted, ts_ms)
+            return _quat_at_timestamp(quats, corrected * 1000.0 + quat_offset_us, keys)
+
+        org_quat_center = lookup_quat(params.quaternions, timestamp_ms, org_keys).inverse()
+        smoothed_quat_center = lookup_quat(params.smoothed_quaternions, timestamp_ms)
 
         # --- 7. Compute per-row matrices ---
         has_rolling_shutter = abs(frame_readout_time) > 0.0
@@ -321,17 +355,17 @@ class FrameTransform:
         matrices = np.zeros((num_rows, 14), dtype=np.float32)
 
         for y in range(num_rows):
-            # Time for this row's exposure
-            if has_rolling_shutter:
-                quat_time = start_ts + row_readout_time * y
-                # Rolling shutter: undo original at center, reapply at row time
-                org_at_time = _quat_at_timestamp(
-                    params.quaternions, quat_time * 1000.0 + quat_offset_us, org_keys,
-                )
-                quat = smoothed_quat_center * org_quat_center * org_at_time
-            else:
-                # No rolling shutter: just the stabilization delta
-                quat = smoothed_quat_center * org_quat_center
+            # Time for this row's exposure. Without rolling shutter this is
+            # the frame center time, so the org lookups cancel and the
+            # composite degenerates to the ABSOLUTE smoothed orientation —
+            # matching upstream frame_transform.rs (quat = smoothed * org_c⁻¹
+            # * org_row). The old two-factor form (smoothed * org_c⁻¹) was a
+            # porting bug: it stabilized by the org-relative delta and the
+            # output kept following the original shake.
+            quat_time = timestamp_ms if not has_rolling_shutter else start_ts + row_readout_time * y
+            org_at_time = lookup_quat(params.quaternions, quat_time, org_keys)
+            quat = smoothed_quat_center * org_quat_center * org_at_time
+
 
             # Quaternion -> 3x3 rotation matrix
             r = image_rotation @ quat.to_rotation_matrix()
@@ -386,7 +420,10 @@ class FrameTransform:
         kernel_params.interpolation = 2  # Bilinear
 
         kernel_params.background_mode = int(params.background_mode)
-        kernel_params.flags = 0
+        # HORIZONTAL_RS flag (bit 4, value 16): rolling-shutter direction is
+        # horizontal (matrices indexed by source column instead of row).
+        # Mirrors upstream kernel_flags.set(HORIZONTAL_RS, direction.is_horizontal()).
+        kernel_params.flags = 16 if is_horizontal else 0
         kernel_params.bytes_per_pixel = 3  # Will be set properly by caller
         kernel_params.pix_element_count = 3
 
@@ -441,4 +478,5 @@ class FrameTransform:
             fov=ui_fov,
             minimal_fov=params.minimal_fovs[frame] if frame < len(params.minimal_fovs) else 1.0,
             focal_length=params.focal_length,
+            distortion_model_name=params.distortion_model_name,
         )

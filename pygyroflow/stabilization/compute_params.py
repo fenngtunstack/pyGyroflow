@@ -50,9 +50,23 @@ class ComputeParams:
     quaternions: TimeQuat = field(default_factory=dict)
     smoothed_quaternions: TimeQuat = field(default_factory=dict)
 
+    # Gyro-to-video sync offsets (timestamp_us -> offset_ms), applied when
+    # looking up quaternions by video timestamp (mirrors Gyroflow's
+    # GyroSource::quat_at_timestamp offset correction).
+    sync_offsets_adjusted: dict[int, float] = field(default_factory=dict)
+
     # Per-frame FOV scale factors (from adaptive zoom)
     fovs: list[float] = field(default_factory=list)
     minimal_fovs: list[float] = field(default_factory=list)
+
+    # Camera diagonal FOV in degrees per frame (from the lens intrinsics).
+    # Consumed by DefaultAlgo to scale max_velocity (fov_ratio = dfov / 120).
+    camera_diagonal_fovs: list[float] = field(default_factory=lambda: [120.0])
+
+    # Cached pre-sorted quaternion keys for the zooming hot path (not part
+    # of the upstream struct; plain perf caches, never serialized).
+    _fov_org_keys: list[int] | None = None
+    _fov_smoothed_keys: list[int] | None = None
 
     # FOV control
     fov_scale: float = 1.0
