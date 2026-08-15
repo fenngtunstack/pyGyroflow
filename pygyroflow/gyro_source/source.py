@@ -356,15 +356,20 @@ class GyroSource:
 
     def offset_at_video_timestamp(self, timestamp_ms: float) -> float:
         """Get interpolated offset at a video timestamp."""
-        return self._offset_at_timestamp(self.offsets_adjusted, timestamp_ms)
+        return self.offset_at_timestamp(self.offsets_adjusted, timestamp_ms)
 
     def offset_at_gyro_timestamp(self, timestamp_ms: float) -> float:
         """Get interpolated offset at a gyro timestamp."""
-        return self._offset_at_timestamp(self.offsets, timestamp_ms)
+        return self.offset_at_timestamp(self.offsets, timestamp_ms)
 
     @staticmethod
-    def _offset_at_timestamp(offsets: dict[int, float], timestamp_ms: float) -> float:
-        """Interpolate offset at given timestamp."""
+    def offset_at_timestamp(offsets: dict[int, float], timestamp_ms: float) -> float:
+        """Interpolate offset at given timestamp.
+
+        Shared by GyroSource lookups and the stabilization layer
+        (frame_transform applies the same correction to quaternion
+        lookups, mirroring Gyroflow's ``quat_at_timestamp``).
+        """
         if not offsets:
             return 0.0
 
