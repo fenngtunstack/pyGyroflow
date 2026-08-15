@@ -51,6 +51,7 @@ class FfmpegProcessor(VideoProcessor):
         self._output_stream: object | None = None
         self._input_info: dict | None = None
         self._frame_index: int = 0
+        self._audio_pairs: list = []
 
     # ------------------------------------------------------------------
     # VideoProcessor interface
@@ -147,40 +148,142 @@ class FfmpegProcessor(VideoProcessor):
         if bitrate > 0:
             self._output_stream.bit_rate = int(bitrate * 1_000_000)
 
+    def prepare_audio(self) -> None:
+        """Add output audio streams mirroring the input's audio streams.
+
+        Must run before any packet is muxed (i.e. before ``process_frames``):
+        the container header is written on the first mux, and streams added
+        afterwards get a zero time base and cannot be muxed
+        (``ValueError: Cannot rebase to zero time``).
+        The actual audio packets are moved later by :meth:`copy_audio`.
+        """
+        if self._input_container is None or self._output_container is None:
+            raise VideoIOError("Both input and output must be opened first")
+
+        from pygyroflow.rendering.audio_resampler import prepare_audio_streams
+
+        self._audio_pairs = prepare_audio_streams(
+            self._input_container, self._output_container
+        )
+
     def process_frames(self, callback: FrameCallback) -> None:
-        """Decode all frames, apply *callback*, encode to output."""
+        """Decode all frames, apply *callback*, encode to output.
+
+        The input decoder is explicitly flushed after the demux loop: with
+        multi-threaded decode (``thread_type="AUTO"``) the decoder buffers
+        up to ~thread-count frames that only come out on flush. The demux
+        loop's ``dts is None`` packets are container flush markers and are
+        skipped, so without this the trailing frames would be lost
+        (~11 frames on a 438-frame GoPro clip).
+        """
         import av  # type: ignore[import-untyped]
 
         if self._input_container is None or self._output_container is None:
             raise VideoIOError("Both input and output must be opened first")
 
         self._frame_index = 0
-        for packet in self._input_container.demux(self._input_stream):
-            # Skip flush packets (empty packets at end of stream).
-            if packet.dts is None:
-                continue
-            for frame in packet.decode():
-                img = frame.to_ndarray(format="rgb24")
-                tb = float(self._input_stream.time_base)
-                timestamp_ms = (
-                    float(frame.pts) * tb * 1000.0
-                    if frame.pts is not None
-                    else self._frame_index * (1000.0 / (self._input_info or {}).get("fps", 30.0))
-                )
+        in_info = self._input_info or {}
+        tb = float(self._input_stream.time_base)
+        fallback_fps = in_info.get("fps", 30.0)
 
-                processed = callback(img, timestamp_ms, self._frame_index)
+        def to_item(frame: av.VideoFrame, seq: int):
+            img = frame.to_ndarray(format="rgb24")
+            timestamp_ms = (
+                float(frame.pts) * tb * 1000.0
+                if frame.pts is not None
+                else seq * (1000.0 / fallback_fps)
+            )
+            return img, timestamp_ms
 
-                # Ensure uint8 for encoding.
-                if processed.dtype != np.uint8:
-                    processed = np.clip(processed, 0, 255).astype(np.uint8)
+        # Three-stage pipeline: decode thread -> stabilize (this thread) ->
+        # encode thread. Both C stages release the GIL (PyAV / numpy /
+        # x264), so they overlap with the Python-heavy stabilize stage.
+        import queue
+        import threading
 
-                out_frame = av.VideoFrame.from_ndarray(processed, format="rgb24")
+        decode_q: "queue.Queue" = queue.Queue(maxsize=6)
+        encode_q: "queue.Queue" = queue.Queue(maxsize=6)
+        _DONE = object()
+
+        def decode_loop():
+            seq = 0
+            try:
+                for packet in self._input_container.demux(self._input_stream):
+                    if packet.dts is None:
+                        continue
+                    for frame in packet.decode():
+                        decode_q.put(to_item(frame, seq))
+                        seq += 1
+                # Flush the threaded decoder (trailing buffered frames).
+                for frame in self._input_stream.decode():
+                    decode_q.put(to_item(frame, seq))
+                    seq += 1
+            except Exception as exc:  # surfaced to the main loop
+                decode_q.put(exc)
+            finally:
+                decode_q.put(_DONE)
+
+        def encode_loop():
+            while True:
+                item = encode_q.get()
+                if item is _DONE or isinstance(item, BaseException):
+                    return
+                out_frame = av.VideoFrame.from_ndarray(item, format="rgb24")
                 for pkt in self._output_stream.encode(out_frame):
                     self._output_container.mux(pkt)
 
+        decoder = threading.Thread(target=decode_loop, name="pgf-decode", daemon=True)
+        encoder = threading.Thread(target=encode_loop, name="pgf-encode", daemon=True)
+        decoder.start()
+        encoder.start()
+
+        pipeline_error: BaseException | None = None
+        try:
+            while True:
+                item = decode_q.get()
+                if item is _DONE:
+                    break
+                if isinstance(item, Exception):
+                    pipeline_error = item
+                    break
+                img, timestamp_ms = item
+                processed = callback(img, timestamp_ms, self._frame_index)
+                # Ensure uint8 for encoding.
+                if processed.dtype != np.uint8:
+                    processed = np.clip(processed, 0, 255).astype(np.uint8)
+                encode_q.put(processed)
                 self._frame_index += 1
+        except BaseException as exc:
+            pipeline_error = exc
+            raise
+        finally:
+            # Always release the encoder, even on stabilize errors.
+            encode_q.put(pipeline_error if pipeline_error is not None else _DONE)
+            encoder.join(timeout=120.0)
+            decoder.join(timeout=120.0)
+
+        if pipeline_error is not None:
+            raise pipeline_error
 
         log.info("Processed %d frames", self._frame_index)
+
+    def copy_audio(self) -> None:
+        """Mux audio packets into the streams added by ``prepare_audio``.
+
+        Call after ``process_frames`` and before ``close``: the video demux
+        only consumes video-stream packets, so audio packets are still
+        unread when this runs. Direct stream copy is used when the output
+        container supports the input codec, with an AAC re-encode fallback.
+        """
+        if self._input_container is None or self._output_container is None:
+            raise VideoIOError("Both input and output must be opened first")
+        if not self._audio_pairs:
+            return
+
+        from pygyroflow.rendering.audio_resampler import mux_audio
+
+        mux_audio(self._input_container, self._output_container, self._audio_pairs)
+        self._audio_pairs = []
 
     def close(self) -> None:
         """Flush the encoder and close containers."""
