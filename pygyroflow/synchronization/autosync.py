@@ -84,6 +84,8 @@ class AutosyncProcess:
         search_range_ms: float = 500.0,
         sample_count: int | None = None,
         progress_callback: Callable[[float], None] | None = None,
+        quaternions: dict | None = None,
+        frame_readout_time_ms: float = 0.0,
     ) -> float | None:
         """Run the full automatic synchronization pipeline.
 
@@ -102,6 +104,13 @@ class AutosyncProcess:
             pairs for faster processing.  ``None`` = use all frames.
         progress_callback:
             ``Callable[[progress: float], None]`` with progress in [0, 1].
+        quaternions:
+            Gyro quaternion stream (timestamp_us -> Quat64).  When provided
+            together with ``offset_method=2``, the rolling-shutter-aware
+            per-point quaternion search runs instead of the 1-D magnitude
+            cross-correlation.
+        frame_readout_time_ms:
+            Sensor readout time in ms for the RS-aware search.
 
         Returns
         -------
@@ -116,22 +125,7 @@ class AutosyncProcess:
 
         # Optionally subsample frames
         work_frames = self._subsample_frames(frames, sample_count)
-        total = len(work_frames)
-
-        # --- Phase 1: feed frames ---
-        for i, (ts, gray) in enumerate(work_frames):
-            self._pose_estimator.feed_frame(i, ts, gray)
-            if progress_callback and i % 10 == 0:
-                progress_callback(0.3 * i / max(total, 1))
-
-        if progress_callback:
-            progress_callback(0.3)
-
-        # --- Phase 2: optical flow + pose estimation ---
-        self._pose_estimator.process_all()
-
-        if progress_callback:
-            progress_callback(0.6)
+        self._feed_and_estimate(work_frames, progress_callback)
 
         # --- Phase 3: offset search ---
         visual_rots = self._pose_estimator.get_visual_rotations()
@@ -141,6 +135,22 @@ class AutosyncProcess:
                 len(visual_rots),
             )
             return None
+
+        # Rolling-shutter-aware per-point search: uses the matched point
+        # pairs retained by the pose estimator plus the gyro quaternion
+        # stream. Falls back to the cross-correlation when unavailable.
+        if self._offset_method == 2 and quaternions:
+            rs_offset = self._rs_sync_offset(
+                frames, quaternions, frame_readout_time_ms, search_range_ms,
+            )
+            if rs_offset is not None:
+                if progress_callback:
+                    progress_callback(1.0)
+                return rs_offset
+            logger.warning(
+                "RS-aware sync produced no result; "
+                "falling back to cross-correlation"
+            )
 
         from pygyroflow.synchronization.find_offset import find_time_offset
 
@@ -161,9 +171,134 @@ class AutosyncProcess:
 
         return offset
 
+    def _rs_sync_offset(
+        self,
+        frames: Sequence[tuple[int, npt.NDArray[np.uint8]]],
+        quaternions: dict,
+        frame_readout_time_ms: float,
+        search_range_ms: float,
+    ) -> float | None:
+        """Run the rolling-shutter-aware offset search.
+
+        Builds ``RollingShutterSync`` tracks from the pose estimator's
+        retained point pairs and runs the coarse-to-fine per-point
+        quaternion error minimization. Returns the offset in the
+        ``visual = gyro + offset`` convention (sign-flipped from the
+        internal delay), or None when there is not enough data.
+        """
+        from pygyroflow.synchronization.find_offset.rs_sync import RollingShutterSync
+
+        ordered = sorted(
+            self._pose_estimator.get_frame_results().values(),
+            key=lambda f: f.frame_no,
+        )
+        height = float(frames[0][1].shape[0])
+
+        rs = RollingShutterSync(
+            quaternions,
+            frame_readout_time_ms=frame_readout_time_ms,
+            fps=self._fps,
+        )
+
+        added = 0
+        for a, b in zip(ordered, ordered[1:]):
+            if a.prev_points is None or a.curr_points is None:
+                continue
+            if len(a.prev_points) < 2:
+                continue
+            rs.add_track_from_frames(
+                a.timestamp_us,
+                b.timestamp_us,
+                a.prev_points,
+                a.curr_points,
+                height,
+                camera_matrix=self._pose_estimator_camera_matrix(),
+            )
+            added += 1
+
+        if added < 3:
+            logger.warning("RS sync: only %d usable tracks (need >= 3)", added)
+            return None
+
+        ts_all = [f.timestamp_us for f in ordered if f.timestamp_us > 0]
+        if len(ts_all) < 2:
+            return None
+
+        result = rs.full_sync(
+            initial_delay_ms=0.0,
+            from_ts_us=min(ts_all),
+            to_ts_us=max(ts_all),
+            coarse_step_ms=3.0,
+            search_radius_ms=search_range_ms / 2.0,
+        )
+        if result is None:
+            return None
+
+        _cost, delay_ms = result
+        # full_sync delay: gyro_ts = visual_ts + delay
+        # convention:       visual_ts = gyro_ts + offset  =>  offset = -delay
+        return -delay_ms
+
+    def _pose_estimator_camera_matrix(self) -> np.ndarray | None:
+        """Camera matrix set on the pose estimator (None if identity)."""
+        K = getattr(self._pose_estimator, "_camera_matrix", None)
+        if K is None:
+            return None
+        K = np.asarray(K, dtype=np.float64)
+        if np.allclose(K, np.eye(3)):
+            return None
+        return K
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _feed_and_estimate(
+        self,
+        work_frames,
+        progress_callback: Callable[[float], None] | None = None,
+    ) -> None:
+        """Feed frames into the pose estimator and run optical flow + pose.
+
+        Phases 1-2 of the pipeline, factored out so both the offset search
+        and IMU-orientation guessing can share one estimation pass.
+        """
+        total = len(work_frames)
+        for i, (ts, gray) in enumerate(work_frames):
+            self._pose_estimator.feed_frame(i, ts, gray)
+            if progress_callback and i % 10 == 0:
+                progress_callback(0.3 * i / max(total, 1))
+
+        if progress_callback:
+            progress_callback(0.3)
+
+        self._pose_estimator.process_all()
+
+        if progress_callback:
+            progress_callback(0.6)
+
+    def run_pose_only(
+        self,
+        frames,
+        progress_callback: Callable[[float], None] | None = None,
+    ):
+        """Run only the optical-flow + pose estimation phase.
+
+        Returns the pose estimator (with retained point tracks) for
+        downstream consumers like IMU-orientation guessing; no offset
+        search is performed.
+        """
+        if len(frames) < 2:
+            logger.warning("Need at least 2 frames for pose estimation")
+            return None
+        self._pose_estimator.clear()
+        work_frames = self._subsample_frames(frames, None)
+        self._feed_and_estimate(work_frames, progress_callback)
+        visual_rots = self._pose_estimator.get_visual_rotations()
+        if len(visual_rots) < 5:
+            logger.warning("Only %d visual rotation estimates", len(visual_rots))
+            return None
+        return self._pose_estimator
 
     @staticmethod
     def _subsample_frames(

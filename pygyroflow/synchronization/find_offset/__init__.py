@@ -3,7 +3,11 @@
 Three search strategies:
 
 * ``visual_features`` -- Cross-correlate rotation magnitudes (fast, simple)
-* ``rs_sync``         -- Rolling-shutter-aware search (stub, falls back)
+* ``rs_sync``         -- Rolling-shutter-aware search. The per-point
+  quaternion-error minimization lives in ``RollingShutterSync`` and is
+  driven by ``AutosyncProcess.run(quaternions=...)`` /
+  ``StabilizationManager.synchronize()``; the function exported here works
+  on pre-reduced rotation lists and falls back to magnitude correlation.
 
 The public entry point is ``find_time_offset()``, which dispatches by
 method index.
