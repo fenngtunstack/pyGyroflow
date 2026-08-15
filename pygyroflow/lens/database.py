@@ -149,6 +149,8 @@ class LensProfileDatabase:
 
         # Try to find a profiles.cbor.gz in common locations
         candidates = [
+            # bundled with the package (pygyroflow/resources/camera_presets)
+            os.path.join(os.path.dirname(__file__), "..", "resources", "camera_presets"),
             os.path.join(os.path.dirname(__file__), "..", "..", "resources", "camera_presets"),
             os.path.join(os.path.dirname(__file__), "..", "..", "camera_presets"),
             os.path.join(os.path.dirname(__file__), "..", "..", "lens_profiles"),
