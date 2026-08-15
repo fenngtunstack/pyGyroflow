@@ -219,30 +219,44 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        self.statusBar().showMessage(f"Exporting to: {path}")
-        try:
-            self.manager.render(self.manager.input_file.url, path)
-            self.statusBar().showMessage(f"Export complete: {path}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Error", f"Export failed:\n{exc}")
-            self.statusBar().showMessage("Export failed")
+        # Run the render on a worker thread — the previous synchronous call
+        # froze the whole UI for the duration of the export.
+        from pygyroflow.gui.render_worker import RenderWorker
+
+        self.statusBar().showMessage(f"Exporting to: {path}…")
+        self._render_worker = RenderWorker(
+            self.manager, self.manager.input_file.url, path
+        )
+        self._render_worker.finished_ok.connect(
+            lambda p: (self.statusBar().showMessage(f"Export complete: {p}"),
+                       QMessageBox.information(self, "Export", f"Export complete:\n{p}"))
+        )
+        self._render_worker.finished_err.connect(
+            lambda e: (self.statusBar().showMessage("Export failed"),
+                       QMessageBox.critical(self, "Export Error", f"Export failed:\n{e}"))
+        )
+        self._render_worker.start()
 
     def _auto_sync(self) -> None:
         if not self.manager.input_file.url:
             QMessageBox.information(self, "Auto Sync", "No video loaded.")
             return
 
-        # Auto Sync is not wired up: the previous code imported a non-existent
-        # ``AutoSync`` class (the real one is ``AutosyncProcess``, with a
-        # different API) and swallowed the resulting ImportError, so clicking
-        # the menu silently did nothing. Surface this honestly instead.
-        QMessageBox.information(
-            self,
-            "Auto Sync",
-            "Auto Sync is not yet implemented in the GUI. Use the CLI or the "
-            "synchronization module (find_offset_rs_sync / AutosyncProcess) directly.",
+        from pygyroflow.gui.render_worker import SyncWorker
+
+        self.statusBar().showMessage("Auto-sync running (optical flow)…")
+        self._sync_worker = SyncWorker(self.manager)
+        self._sync_worker.finished_ok.connect(
+            lambda off: self.statusBar().showMessage(
+                f"Auto-sync complete: offset {off:+.1f} ms"
+                if off is not None else "Auto-sync failed (no offset found)"
+            )
         )
-        self.statusBar().showMessage("Auto Sync: not implemented")
+        self._sync_worker.finished_err.connect(
+            lambda e: (self.statusBar().showMessage("Auto-sync failed"),
+                       log.warning("Auto-sync failed: %s", e))
+        )
+        self._sync_worker.start()
 
     def _load_lens(self) -> None:
         self.lens_browser.browse()
@@ -302,10 +316,46 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Failed to load profile: {exc}")
 
     def _on_frame_seek(self, frame: int) -> None:
-        """Handle timeline scrubber position change."""
+        """Timeline scrub: decode that frame and show the STABILIZED preview.
+
+        The old handler only printed the frame number to the status bar;
+        the preview widget was never fed.
+        """
+        url = self.manager.input_file.url
         fps = self.manager.params.fps
-        if fps > 0:
-            timestamp_ms = frame * 1000.0 / fps
-            self.statusBar().showMessage(
-                f"Frame {frame} @ {timestamp_ms:.1f} ms"
-            )
+        if not url or fps <= 0:
+            return
+        timestamp_ms = frame * 1000.0 / fps
+        self.statusBar().showMessage(f"Frame {frame} @ {timestamp_ms:.1f} ms")
+
+        try:
+            import av
+            import cv2
+
+            from pygyroflow.stabilization import cpu_undistort
+
+            with av.open(url) as container:
+                stream = container.streams.video[0]
+                stream.thread_type = "AUTO"
+                container.seek(int(timestamp_ms * 1000))
+                img = None
+                for packet in container.demux(stream):
+                    for f in packet.decode():
+                        img = f.to_ndarray(format="rgb24")
+                        break
+                    if img is not None:
+                        break
+            if img is None:
+                return
+
+            transform = self.manager.get_frame_transform(timestamp_ms, frame)
+            out = cpu_undistort(img, transform)
+
+            # Downscale for preview responsiveness
+            h, w = out.shape[:2]
+            scale = 960.0 / max(w, 1)
+            if scale < 1.0:
+                out = cv2.resize(out, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            self.video_widget.set_frame(out)
+        except Exception as exc:
+            log.warning("Preview failed at frame %d: %s", frame, exc)
