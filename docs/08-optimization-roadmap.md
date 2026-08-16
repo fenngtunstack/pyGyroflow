@@ -198,3 +198,28 @@ python -m pygyroflow ..\GX010045.MP4 -o out.mp4 --smoothness 0.5   # 真实视�
   - 音频 682/682 帧 AAC stream copy（修复前无声）
   - 自动同步 28.2s 完成，offset -254.7ms
 - **渲染性能**: 未优化（~0.69s/帧），P2 待做——本轮全部是正确性接线；cpu_undistort 的 RS 路径因逐像素矩阵 gather + 双趟映射略慢于旧版（中心矩阵单趟），P2 静态 map 预计算时一并解决
+
+
+## 2026-08-16（晚）用户报告坏区间排查：自动同步 + 镜头自动匹配两个根因
+
+**用户报告**: 成片第 8 秒起约 3 秒剧烈抖动未消除，后段仍有类似区间。
+
+**窗口化抖动定位**（`tests/verify_windows.py`，逐秒窗口中位抖动）:
+- DJI 8-22s 为剧烈运动段（|ω| 中位 33-66°/s，峰值 437°/s），成片在 11-14s/21s 明显差于官方导出
+- GoPro 成片全局中位抖动 2.74 vs 输入 2.94 —— 稳定基本没生效
+
+**根因一：自动同步给出错误偏移**。正式成片实际未跑 autosync（offset=0），而 `--autosync` 找到的 179ms 会把稳定彻底毁掉（medspeed 20-61°/s ≈ 未稳定）。逐帧轨迹重建代价函数发现：200 帧采样（every=3，133ms 基线）在快动段光流匹配失效，代价曲线全片平坦（46-55），"极小值"是噪声。**修复**：
+- `synchronize()` 默认 `sample_count=1000`（逐帧，DJI 代价函数出现真实极小：27.99 vs 邻域 31+，自动同步 179→7.9ms，真值 0）
+- `_rs_sync_offset` 加平坦警戒线：最优代价与 ±50/100ms 邻域中位差距 <3% 时拒绝返回（GoPro 正确拒绝）
+- `find_offset_visual_features` 加弱峰置信度门槛（corr<0.5 拒绝）
+
+**根因二：镜头库自动匹配从未生效**。`_try_auto_load_lens_profile` 的 brand guard 在 `load_all()` 之前遍历 profiles —— 进程首次运行时 DB 未加载、`known_brands` 为空集，任何品牌都被静默拒绝。GoPro 一直无畸变校正（lens "---"）。**修复**：把 `load_all()` 移到 brand guard 之前。GoPro 现在自动匹配 `HERO12 Black 4k 8:7 Wide`（库内唯一 8:7 HERO12 档案）。
+
+**终配置验证**（同编码 H264 sweep 序列，跨编码度量有 ±0.7 全局/±15 单窗口压缩噪声不可比）:
+- 双片均 offset=0（时间戳模型与上游逐位一致，任何非零偏移渲染更差：+10ms 快动段 9.4-20.6、-10ms 打地鼠、179ms 灾难）
+- smoothness 0.5→1.0：DJI 平静段 2.5-6.5→1.7-2.2，14s 窗 10.7→4.8，17s 5.7→1.8
+- 像素级验证：终片配方与 sweep G 配方逐位一致（max diff 0）
+
+**终片**: `final2_dji_gpu.mp4`（H264@16Mbps+音频，全局中位抖动 3.34 vs 原成片 3.74）、`final2_gopro_gpu.mp4`（2.69 vs 原 2.74、输入 2.94；6-14s 窗口 1.3-2.0 对输入 1.5-7.6）
+
+**已知限制**: GoPro 2-3s 窗口对任何偏移都难（-242: 4.5/4.7、0: 5.4/6.6、-120: 6.2/6.2，打地鼠模式），疑似机内 EIS 与 CORI 校正互扰，留待后续。DJI 4s 窗口同理（官方同窗口也差：7.3/6.0）。度量工具链沉淀：`tests/verify_windows.py`、`tests/diag_bad_windows.py`、`tests/sweep_bad_segment.py`、`tests/reverse_official.py`、`tests/phase_vs_official.py`、`tests/verify_sync_axis.py`。

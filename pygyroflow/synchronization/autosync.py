@@ -234,7 +234,28 @@ class AutosyncProcess:
         if result is None:
             return None
 
-        _cost, delay_ms = result
+        cost, delay_ms = result
+
+        # Contrast guard: a flat cost landscape means the tracks carry no
+        # usable sync signal (e.g. fast-motion optical-flow breakage); the
+        # "minimum" is then noise. Compare the winner against the cost at
+        # +/-100 ms and refuse to return an offset that is not
+        # distinguishable from its neighbourhood.
+        from_ts_s = min(ts_all) / 1e6
+        to_ts_s = max(ts_all) / 1e6
+        neighbours = [
+            rs._compute_cost(delay_ms / 1000.0 + d, from_ts_s, to_ts_s)
+            for d in (-0.1, -0.05, 0.05, 0.1)
+        ]
+        neighbour_med = sorted(neighbours)[len(neighbours) // 2]
+        if cost > 0.97 * neighbour_med:
+            logger.warning(
+                "RS sync: cost landscape is flat (best %.4f vs neighbour "
+                "median %.4f); offset not significant, rejecting",
+                cost, neighbour_med,
+            )
+            return None
+
         # full_sync delay: gyro_ts = visual_ts + delay
         # convention:       visual_ts = gyro_ts + offset  =>  offset = -delay
         return -delay_ms

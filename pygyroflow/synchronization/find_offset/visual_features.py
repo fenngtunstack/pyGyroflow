@@ -151,6 +151,18 @@ def find_offset_visual_features(
             best_corr = corr
             best_offset = offset
 
+    # Confidence guard: a weak peak means the visual rotation estimates
+    # carry little sync signal and the "best" offset is noise (observed on
+    # the GoPro pan clip: corr ~0.2 -> -242 ms, which destabilizes the
+    # render). 0.5 keeps only unambiguous peaks; upstream has no such
+    # guard, so this is a deliberate port deviation for safety.
+    if best_corr < 0.5:
+        logger.warning(
+            "Visual-feature offset search: peak correlation %.4f is too "
+            "weak; returning no offset", best_corr,
+        )
+        return None
+
     logger.debug(
         "Visual-feature offset search: best_offset=%.3f ms, corr=%.4f",
         best_offset, best_corr,

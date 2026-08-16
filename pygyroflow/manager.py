@@ -366,19 +366,27 @@ class StabilizationManager:
     def synchronize(
         self,
         input_path: str | None = None,
-        sample_count: int = 200,
+        sample_count: int = 1000,
         search_range_ms: float = 500.0,
         use_rs: bool = True,
         progress_callback: Any = None,
     ) -> float | None:
         """Auto-synchronize the gyro timeline to the video via optical flow.
 
-        Samples grayscale frames from the video (subsampled and downscaled
-        for speed), estimates camera rotation between consecutive frames,
-        and searches for the time offset that best matches the gyro data.
-        With ``use_rs`` (and quaternion data available) this runs the
-        rolling-shutter-aware per-point quaternion search; otherwise a 1-D
-        angular-velocity cross-correlation is used.
+        Samples grayscale frames from the video (downscaled for speed),
+        estimates camera rotation between consecutive frames, and searches
+        for the time offset that best matches the gyro data. With ``use_rs``
+        (and quaternion data available) this runs the rolling-shutter-aware
+        per-point quaternion search; otherwise a 1-D angular-velocity
+        cross-correlation is used.
+
+        ``sample_count`` defaults to 1000: the RS-aware cost needs
+        adjacent-frame optical-flow tracks. With the previous default of
+        200, tracks spanned 4-frame baselines (~133 ms); during fast
+        motion the correspondences break and the cost landscape flattens,
+        producing wrong offsets (DJI walking clip: +179 ms found where the
+        true offset is 0 - the landscape with per-frame tracks has a clean
+        minimum at 0).
 
         The result is stored on the gyro source (``gyro.set_offset``) and
         thereby takes effect in ``get_frame_transform`` lookups.
@@ -983,14 +991,18 @@ class StabilizationManager:
         words = source.split()
         if len(words) < 2:
             return
-        brand = words[0].lower()
-        known_brands = {prof.camera_brand.strip().lower() for _k, prof in self.lens_db.profiles if prof.camera_brand}
-        if brand not in known_brands:
-            return
 
+        # Load the database BEFORE consulting it: the brand guard used to
+        # run first, iterating an empty (not yet loaded) profiles list and
+        # silently rejecting every source -- GoPro never auto-matched a
+        # lens profile.
         if not self.lens_db.loaded:
             self.lens_db.load_all()
         if not len(self.lens_db):
+            return
+        brand = words[0].lower()
+        known_brands = {prof.camera_brand.strip().lower() for _k, prof in self.lens_db.profiles if prof.camera_brand}
+        if brand not in known_brands:
             return
 
         w, h = self.params.size
