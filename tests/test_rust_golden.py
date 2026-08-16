@@ -115,13 +115,7 @@ class TestRustPythonIMUIntegration:
 
     @pytest.mark.parametrize("integrator_name", [
         "simple_gyro", "simple_gyro_accel", "mahony", "madgwick",
-        pytest.param("complementary", marks=pytest.mark.xfail(
-            strict=True,
-            reason="Python ComplementaryIntegrator is a mirror of the old "
-            "hand-written simplified golden-gen version (8 lines), NOT the "
-            "Rust msgyro-imu-integration paper V1/V2 algorithm (600 lines). "
-            "max_err~0.71. Needs a full rewrite of the Python port to align.",
-        )),
+        "complementary",
         "vqf",
     ])
     def test_imu_integration_matches_rust(self, integrator_name, imu_list, imu_data):
