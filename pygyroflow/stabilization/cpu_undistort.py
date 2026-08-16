@@ -320,7 +320,13 @@ def cpu_undistort(
             fallback = ys
         est = np.where(trial_valid, est, fallback)
         idx_map = np.clip(est, 0, matrix_count - 1).astype(np.int64)
+
         m = matrices[idx_map]  # (H, W, 14) per-pixel matrix rows
+        # (Row-band / run-length segmentation was tried here: evaluating
+        # per-run with a scalar matrix to avoid the ~80 MB gather. It is
+        # SLOWER in pure Python — per-call numpy overhead dominates when
+        # rows split into many short runs. The vectorized per-pixel
+        # gather is the optimum for this implementation.)
     else:
         m = matrices[0]
 
