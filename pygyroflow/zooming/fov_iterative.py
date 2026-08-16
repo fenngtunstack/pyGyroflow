@@ -151,13 +151,13 @@ def _undistort_points_simple(
     combined_quat = correction * org_c.inverse() * org_c
     rot_matrix = combined_quat.to_rotation_matrix()
 
-    # Camera intrinsics
+    # Camera intrinsics (scaled from calibration to video resolution like
+    # FrameTransform._get_lens_data_at_timestamp)
     fx = params.camera_matrix[0, 0]
     fy = params.camera_matrix[1, 1]
     cx = params.camera_matrix[0, 2]
     cy = params.camera_matrix[1, 2]
 
-    # Scale intrinsics to video resolution if needed
     calib_w = params.calib_width if params.calib_width > 0 else params.width
     calib_h = params.calib_height if params.calib_height > 0 else params.height
     if calib_w > 0 and calib_h > 0:
@@ -168,30 +168,85 @@ def _undistort_points_simple(
         cx *= ratio_x
         cy *= ratio_y
 
-    w = float(params.width)
-    h = float(params.height)
+    # Full lens undistortion (upstream fov_iterative drives
+    # undistort_points_with_rolling_shutter -> undistort_points, which runs
+    # the distortion model's inverse — the old pinhole-only projection
+    # miscomputed the polygon on fisheye lenses).
+    import ctypes as _ctypes
+    import numpy as _np
 
-    result = []
-    for px, py in points:
-        # Pixel to normalized camera coords
-        xn = (px - cx) / fx
-        yn = (py - cy) / fy
+    from pygyroflow.stabilization.distortion_models import from_name as _dm_from_name
+    from pygyroflow.types.kernel_params import KernelParams as _KP
 
-        # Apply rotation
-        vec = rot_matrix @ np.array([xn, yn, 1.0])
-        if vec[2] <= 0.0:
-            # Behind camera
+    kp = _KP()
+    kp.width = params.width
+    kp.height = params.height
+    kp.output_width = params.width
+    kp.output_height = params.height
+    kp.f = (_ctypes.c_float * 2)(float(fx), float(fy))
+    kp.c = (_ctypes.c_float * 2)(float(cx), float(cy))
+    k_floats = [float(x) for x in params.distortion_coeffs][:12]
+    k_floats += [0.0] * (12 - len(k_floats))
+    kp.k1 = (_ctypes.c_float * 4)(*k_floats[0:4])
+    kp.k2 = (_ctypes.c_float * 4)(*k_floats[4:8])
+    kp.k3 = (_ctypes.c_float * 4)(*k_floats[8:12])
+    kp.input_horizontal_stretch = params.input_horizontal_stretch
+    kp.input_vertical_stretch = params.input_vertical_stretch
+    kp.light_refraction_coefficient = params.light_refraction_coefficient
+
+    model = _dm_from_name(params.distortion_model_name)
+
+    pxs = _np.array([p[0] for p in points], dtype=_np.float64)
+    pys = _np.array([p[1] for p in points], dtype=_np.float64)
+    pw_x = (pxs - cx) / fx
+    pw_y = (pys - cy) / fy
+
+    ux, uy = model.undistort_points(pw_x, pw_y, kp)
+    ok = ~( _np.isnan(ux) | _np.isnan(uy) )
+
+    # Light refraction on the undistorted point (upstream applies it after
+    # undistort_point in undistort_points)
+    lrc = params.light_refraction_coefficient
+    if lrc != 1.0 and lrc > 0.0:
+        r = _np.sqrt(ux * ux + uy * uy)
+        with _np.errstate(divide="ignore", invalid="ignore"):
+            sin_theta_d = (r / _np.sqrt(1.0 + r * r)) / lrc
+            r_d = sin_theta_d / _np.sqrt(_np.maximum(1.0 - sin_theta_d * sin_theta_d, 1e-12))
+            factor = _np.where(r > 0.0, r_d / r, 1.0)
+        ux = ux * factor
+        uy = uy * factor
+
+    # Rolling shutter: per-point rotation at the point's row time (mirrors
+    # at_timestamp_for_points; the correction stream composes with the org
+    # lookup at each point's exposure time).
+    frt = abs(params.frame_readout_time)
+    result: list[tuple[float, float]] = []
+    for idx in range(len(points)):
+        if not ok[idx]:
             result.append((-1e6, -1e6))
             continue
+        if frt > 0.0 and params.quaternions:
+            if params.frame_readout_direction.is_horizontal():
+                row = pxs[idx]
+                rs_dim = params.width
+            else:
+                row = pys[idx]
+                rs_dim = params.height
+            row_time = timestamp_ms - frt / 2.0 + (frt / rs_dim) * row if rs_dim > 0 else timestamp_ms
+            org_row = _quat_at_timestamp(params.quaternions, row_time * 1000.0, params._fov_org_keys)
+            q = combined_quat * org_row
+            r_m = q.to_rotation_matrix()
+        else:
+            r_m = rot_matrix
 
-        xn_r = vec[0] / vec[2]
-        yn_r = vec[1] / vec[2]
-
-        # Back to pixel coords
-        out_x = xn_r * fx + cx
-        out_y = yn_r * fy + cy
-
-        result.append((float(out_x), float(out_y)))
+        vec = r_m @ _np.array([ux[idx], uy[idx], 1.0])
+        if vec[2] <= 0.0:
+            result.append((-1e6, -1e6))
+            continue
+        # Upstream projects through new_k * r; with fov = 1.0 and equal
+        # input/output dims (zooming runs before fovs exist), new_k == K.
+        result.append((float(vec[0] / vec[2] * fx + cx),
+                       float(vec[1] / vec[2] * fy + cy)))
 
     return result
 
