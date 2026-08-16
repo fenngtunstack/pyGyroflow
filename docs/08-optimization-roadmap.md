@@ -143,6 +143,7 @@ python -m pygyroflow ..\GX010045.MP4 -o out.mp4 --smoothness 0.5   # 真实视�
 | 2026-08-16 | **P3-1 VQF 对齐达成（消 xfail）** | 逐阶段 Rust 参照（vqf_debug harness dump bias/quat3d/acc_i/quat6d）定位两个真 bug: ① `filter_step` 收到的是切片副本——IIR 状态更新全部静默丢失，滤波器退化为无记忆（影响所有 VQF 输出）; ② 包装器把全零磁测降级为 6D（mag=None），Rust 恒走 9D（Some(zeros)）——零磁测仍改变 VQF 类内部状态。双修后 **VQF 与 Rust golden 机器精度一致（max_err 1.1e-15，原 0.338）**，xfail 移除——**5/6 积分器全部对齐**（仅剩 complementary 论文版重写）。真实素材复验: DJI（VQF 为默认积分器）帧级 med\|ω\| 压缩 2.97×→**3.27×**。测试 233 passed |
 | 2026-08-16 | **P3-2 complementary 论文版重写达成（消最后一个 xfail）** | 按 Rust complementary.rs（Valenti et al. 论文）完整移植 V1+V2（IIR 加计滤波、重力自动标定、自适应增益/稳定期加速、settle 斜坡），wrapper 驱动 V2 且输入变换/零加计微调逐行对齐。**与 Rust golden 机器精度一致（max_err 2.2e-16，原 0.71）**，xfail 移除——**6/6 积分器全部对齐独立 Rust 参照**。自生成 golden 按新语义重生。测试 234 passed，xfail 清零 |
 | 2026-08-16 | **P3-4 fov_iterative 接入完整畸变模型** | FOV 多边形计算改为上游 undistort_points_with_rolling_shutter 全管线: 归一化 → 畸变模型 undistort_points（向量化）→ 光折射 → 逐点 RS 行时间旋转 → new_k 投影。原针孔投影在鱼眼镜头上错算稳定多边形。首版 RS 分支漏 org_c⁻¹ 消去（绝对姿态重复应用致 fov 塌缩到 0.56 过裁），修正三因子合成后 fovs=0.90、渲染指标回到基线（med-jitter 0.82×）且用真实鱼眼几何、无黑边、音频完整。测试 234 passed |
+| 2026-08-16 | **RS 分带实验（负结果记录）** | 尝试游程分带替代逐像素矩阵 gather（避开 80MB gather）: 正确但在纯 Python 更慢（760/386 vs 380ms/帧，逐调用 numpy 开销在行碎片化时占主导），回退并代码内注释记录。P2 性能项至此收敛：进一步提速需编译内核 |
 
 ### 真实视频效果验证与 frame_transform 关键修复（2026-08-14）
 
