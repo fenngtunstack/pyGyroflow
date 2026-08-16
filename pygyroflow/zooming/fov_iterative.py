@@ -234,7 +234,9 @@ def _undistort_points_simple(
                 rs_dim = params.height
             row_time = timestamp_ms - frt / 2.0 + (frt / rs_dim) * row if rs_dim > 0 else timestamp_ms
             org_row = _quat_at_timestamp(params.quaternions, row_time * 1000.0, params._fov_org_keys)
-            q = combined_quat * org_row
+            # Same three-factor composition as FrameTransform: C * org_c^-1 * org_row
+            # (org_c cancels to correction only when row_time == center time).
+            q = combined_quat * org_c.inverse() * org_row
             r_m = q.to_rotation_matrix()
         else:
             r_m = rot_matrix
