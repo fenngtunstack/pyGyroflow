@@ -321,14 +321,14 @@ class FrameTransform:
         image_rotation = np.array(Rotation.from_euler("z", rot_rad).as_matrix(), dtype=np.float64)
 
         # --- 6. Quaternion lookups at frame center ---
-        # Align video timestamp to quaternion timestamp space:
-        # Quaternions may start at a non-zero offset (e.g. GoPro IMU absolute time).
-        # The first quaternion key corresponds to the start of the video.
-        quat_offset_us = 0.0
-        if params.quaternions:
-            quat_keys = sorted(params.quaternions.keys())
-            if quat_keys:
-                quat_offset_us = float(quat_keys[0])
+        # Upstream GyroSource::quat_at_timestamp maps the video timestamp
+        # DIRECTLY onto the quaternion key space (us), only clamping to
+        # [first_key, last_key] — no first-key offset is added. The previous
+        # `+ quat_keys[0]` shift misaligned every lookup by the stream's
+        # lead-in (-5.414 ms on the DJI clip): a constant time error whose
+        # residual is delta * domega/dt, ~3 deg/s of yaw jitter at walking
+        # frequencies — exactly the excess measured against the official
+        # export. Removed to match upstream.
 
         # Pre-sort keys ONCE per at_timestamp call — the rolling-shutter path
         # calls _quat_at_timestamp once per output row (up to 1080), and each
@@ -343,7 +343,7 @@ class FrameTransform:
             so offsets set by synchronization actually shift the lookup.
             """
             corrected = ts_ms - GyroSource.offset_at_timestamp(params.sync_offsets_adjusted, ts_ms)
-            return _quat_at_timestamp(quats, corrected * 1000.0 + quat_offset_us, keys)
+            return _quat_at_timestamp(quats, corrected * 1000.0, keys)
 
         org_quat_center = lookup_quat(params.quaternions, timestamp_ms, org_keys).inverse()
         smoothed_quat_center = lookup_quat(params.smoothed_quaternions, timestamp_ms)

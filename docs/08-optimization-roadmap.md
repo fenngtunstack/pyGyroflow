@@ -223,3 +223,37 @@ python -m pygyroflow ..\GX010045.MP4 -o out.mp4 --smoothness 0.5   # 真实视�
 **终片**: `final2_dji_gpu.mp4`（H264@16Mbps+音频，全局中位抖动 3.34 vs 原成片 3.74）、`final2_gopro_gpu.mp4`（2.69 vs 原 2.74、输入 2.94；6-14s 窗口 1.3-2.0 对输入 1.5-7.6）
 
 **已知限制**: GoPro 2-3s 窗口对任何偏移都难（-242: 4.5/4.7、0: 5.4/6.6、-120: 6.2/6.2，打地鼠模式），疑似机内 EIS 与 CORI 校正互扰，留待后续。DJI 4s 窗口同理（官方同窗口也差：7.3/6.0）。度量工具链沉淀：`tests/verify_windows.py`、`tests/diag_bad_windows.py`、`tests/sweep_bad_segment.py`、`tests/reverse_official.py`、`tests/phase_vs_official.py`、`tests/verify_sync_axis.py`。
+
+
+## 2026-08-16（深夜）DJI 8s 后抖动：5.4ms 查找错位——真凶与终极对齐
+
+**用户报告**: 修复同步/镜头后，DJI 成片从第 8 秒起仍明显抖动，不可接受。
+
+**排查路径**（全部排除后才找到真凶）:
+1. 逐轴分解：超额抖动 95% 在 YAW 轴（我们 5.6°/s vs 官方 2.65）；残余-角速度互相关时序扫描平坦 → 非同步问题
+2. 平滑参数空间穷尽（smoothness 0.2/0.5/1.0、τ2=7ms、τ_max=5s、双大 τ）：均无法达标
+3. 与上游逐行比对第二遍 distance 平滑：一致
+4. **完美零相位高斯平滑路径注入**：仍抖 2.4px → bug 在 warp 应用链，与平滑无关
+5. CPU≡GPU、x264≡x265、RS 开/关、缩放开/关：均只占小头
+6. 发现官方 Gyroflow 1.6.3 安装（settings.json）→ 导出真实配置：**Plain 3D τ=2.04s + 缩放窗 4s + 包络跟随 + maxZoom 130%**
+7. 官方 CLI `--export-project 3` 导出处理后数据，解码（base91→zlib→cbor）得官方校正四元数与 fovs
+8. **交叉注入闭环**: 官方渲染器+我们的校正 = 0.064-0.154px（丝滑！）→ 我们的平滑完美，bug 在渲染链
+9. 数值比对 warp 公式（矩阵合成/畸变/fov/时间戳）：全部 0.000000px 一致
+
+**真凶**: `frame_transform.py` 的 `quat_offset_us = quat_keys[0]`。DJI 四元数流 keys 起于 -5414µs（(n+1)/n 时长补齐的前摇），该"对齐"把每一次四元数查找（org 中心、smoothed 中心、全部 RS 行）整体提前 5.414ms。上游 `quat_at_timestamp` **直接** `round(ts×1000).clamp(first,last)`，不加任何偏移。恒定时移 δ 的残余 = δ·dω/dt：步行频率 dω/dt≈565°/s² × 5.414ms ≈ **3.06°/s，与实测超额 yaw 抖动 2.95°/s 精确吻合**。修复 = 删除该偏移。
+
+**修复后（官方同款配置 Plain 2.04）**，像素抖动（相位相关，480w）:
+
+| 窗口 | 修复前 | 修复后 | 官方导出 | 输入 |
+|---|---|---|---|---|
+| 12s | 2.44 | **0.069** | 0.125 | 6.85 |
+| 21s | 3.07 | **0.151** | 0.260 | 8.22 |
+| 全段 | 1.5–3.1 | **0.06–0.21** | 0.06–0.26 | 3.5–8.2 |
+
+**与官方完全同级，多数窗口更优（35 倍改善）。** GoPro 输入本身平移抖动仅 0.13px（平稳摇镜），成片 0.14px 无损。
+
+**终片**: `final3_dji.mp4`、`final3_gopro.mp4`（H264@16Mbps+音频，Plain 2.04+缩放窗4）。
+
+**注意**: 官方 CLI 的 `--export-project` 会顺带重渲染覆盖 stabilized.mp4——本次分析中用户 5 月的官方导出被同版本同配置（settings.json 证实 Plain 2.04）重渲染覆盖，质量等价（两类度量均 ~0.1-0.2px/0.6px 级）。
+
+**方法论沉淀**: `tests/decode_gyroflow_project.py`（base91+cbor 解码）、`tests/swap_correction_project.py`（反向编码+官方渲染闭环）、`tests/pixel_jitter.py`（相位相关感知度量）、`tests/per_axis_residual.py`（逐轴分解）。教训：公式级"与上游一致"不等于行为一致——本次 bug 恰在唯一没对照上游的查找函数里；交叉注入（官方数据进我们管线 / 我们数据进官方管线）才是定位分歧的手术刀。
