@@ -122,16 +122,7 @@ class TestRustPythonIMUIntegration:
             "Rust msgyro-imu-integration paper V1/V2 algorithm (600 lines). "
             "max_err~0.71. Needs a full rewrite of the Python port to align.",
         )),
-        pytest.param("vqf", marks=pytest.mark.xfail(
-            strict=True,
-            reason="Python vs Rust VQF: pure-Z (heading) difference of "
-            "~24.3 deg at t0 growing to ~29.5 deg at end. Diagnosis (2026-08-15): "
-            "NOT the mag path (both yield delta=0 on zero mag; the 9D dispatch "
-            "changes little). Consistent with a z-gyro bias difference of "
-            "~0.017 rad/s in the covariance-weighted forward/backward bias "
-            "merge — needs a line-by-line diff of the bias merge + "
-            "rest-detection state that feeds it.",
-        )),
+        "vqf",
     ])
     def test_imu_integration_matches_rust(self, integrator_name, imu_list, imu_data):
         from pygyroflow.imu_integration import (

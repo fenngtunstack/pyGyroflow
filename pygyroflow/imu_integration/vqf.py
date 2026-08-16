@@ -222,10 +222,16 @@ def filter_initial_state(x0: float, b: list[float], a: list[float]) -> list[floa
     return [x0 * (1.0 - b[0]), x0 * (b[2] - a[1])]
 
 
-def filter_step(x: float, b: list[float], a: list[float], state: list[float]) -> float:
-    y = b[0]*x + state[0]
-    state[0] = b[1]*x - a[0]*y + state[1]
-    state[1] = b[2]*x - a[1]*y
+def filter_step(x: float, b: list[float], a: list[float], state: list[float], off: int = 0) -> float:
+    """One IIR step updating ``state`` IN PLACE at ``state[off:off+2]``.
+
+    The offset variant matters: passing ``state[off:off+2]`` as a slice
+    would hand filter_step a COPY and silently drop every state update
+    (the bug that made the whole VQF filter stateless in Python).
+    """
+    y = b[0]*x + state[off]
+    state[off] = b[1]*x - a[0]*y + state[off+1]
+    state[off+1] = b[2]*x - a[1]*y
     return y
 
 
@@ -259,7 +265,7 @@ def filter_vec(
         return
 
     for i in range(n):
-        out[i] = filter_step(x[i], b, a, state[2*i:2*i+2])
+        out[i] = filter_step(x[i], b, a, state, 2*i)
 
 
 def matrix3_set_to_scaled_identity(scale: float) -> list[float]:
@@ -1041,19 +1047,20 @@ class VQFIntegrator(GyroIntegrator):
             acc.extend([-a[1], a[0], a[2]])
             mag.extend([-m[1], m[0], m[2]])
 
-        # Check if we have usable magnetometer data (any non-zero sample)
-        has_mag = any(mag[3*i] != 0.0 or mag[3*i+1] != 0.0 or mag[3*i+2] != 0.0
-                      for i in range(num_samples))
-
         params = VQFParams(
             tau_acc=40.0,
             tau_mag=40.0,
         )
 
+        # ALWAYS pass mag through (zeros when absent), exactly like the
+        # Rust wrapper: offline_vqf runs the 9D path with Some(&zeros).
+        # Downgrading all-zero mag to the 6D path diverges from the
+        # reference - zero-mag updates still change the VQF class state
+        # (mag_dist / rest detection interplay).
         quat_flat = offline_vqf(
             gyr=gyr,
             acc=acc,
-            mag=mag if has_mag else None,
+            mag=mag,
             n=num_samples,
             ts=sample_time,
             params=params,
