@@ -472,6 +472,14 @@ class FrameTransform:
         kernel_params.source_rect = (ctypes.c_int32 * 4)(0, 0, params.width, params.height)
         kernel_params.output_rect = (ctypes.c_int32 * 4)(0, 0, params.output_width, params.output_height)
 
+        # Safe-area rect must cover the full frame: the shader's
+        # draw_safe_area dims pixels OUTSIDE this rect by 0.5x (preview
+        # overlay). The (0,0,0,0) default left only pixel (0,0) "safe",
+        # halving every other pixel of the GPU output.
+        kernel_params.safe_area_rect = (
+            ctypes.c_float * 4
+        )(0.0, 0.0, float(params.output_width), float(params.output_height))
+
         return FrameTransform(
             matrices=matrices,
             kernel_params=kernel_params,

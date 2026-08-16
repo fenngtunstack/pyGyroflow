@@ -144,6 +144,10 @@ python -m pygyroflow ..\GX010045.MP4 -o out.mp4 --smoothness 0.5   # 真实视�
 | 2026-08-16 | **P3-2 complementary 论文版重写达成（消最后一个 xfail）** | 按 Rust complementary.rs（Valenti et al. 论文）完整移植 V1+V2（IIR 加计滤波、重力自动标定、自适应增益/稳定期加速、settle 斜坡），wrapper 驱动 V2 且输入变换/零加计微调逐行对齐。**与 Rust golden 机器精度一致（max_err 2.2e-16，原 0.71）**，xfail 移除——**6/6 积分器全部对齐独立 Rust 参照**。自生成 golden 按新语义重生。测试 234 passed，xfail 清零 |
 | 2026-08-16 | **P3-4 fov_iterative 接入完整畸变模型** | FOV 多边形计算改为上游 undistort_points_with_rolling_shutter 全管线: 归一化 → 畸变模型 undistort_points（向量化）→ 光折射 → 逐点 RS 行时间旋转 → new_k 投影。原针孔投影在鱼眼镜头上错算稳定多边形。首版 RS 分支漏 org_c⁻¹ 消去（绝对姿态重复应用致 fov 塌缩到 0.56 过裁），修正三因子合成后 fovs=0.90、渲染指标回到基线（med-jitter 0.82×）且用真实鱼眼几何、无黑边、音频完整。测试 234 passed |
 | 2026-08-16 | **RS 分带实验（负结果记录）** | 尝试游程分带替代逐像素矩阵 gather（避开 80MB gather）: 正确但在纯 Python 更慢（760/386 vs 380ms/帧，逐调用 numpy 开销在行碎片化时占主导），回退并代码内注释记录。P2 性能项至此收敛：进一步提速需编译内核 |
+| 2026-08-16 | **P3-3 GPU 真机验证完成（Intel UHD 630 / Vulkan）** | 用户确认本机有 UHD 630，安装 wgpu 0.32 后真机调试:
+  ① 管线此前"全零输出"在真机上表现为**强度减半**（127 vs 255）——逐阶段隔离（单点/梯度/交替像素探针 + 隔离 shader 复算）定位第四个根因: **`safe_area_rect` 默认 (0,0,0,0)，而 shader 的 `draw_safe_area` 对区外像素 ×0.5**（预览调光功能），只有 (0,0) 精确、其余全半——与症状完全吻合; 修复: frame_transform 设全帧安全区。
+  ② 顺带给 WGSL override 加 `@id(100..103)`（spec 常量绑定）。
+  **结果**: identity 逐位一致（max diff 0）、鱼眼 ≤2 灰度、真实 GoPro RS 变换 ≤8/255；**GPU 6.5×/帧（78 vs 505ms）、端到端渲染 2.4×（3.52 vs 1.48 fps）**，音频完整，质量与 CPU 渲染等价。测试重写为真机断言（2 个新测试，xfail 移除）→ **236 passed**。GPU 保持 opt-in（--gpu） |
 
 ### 真实视频效果验证与 frame_transform 关键修复（2026-08-14）
 
