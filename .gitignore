@@ -21,3 +21,4 @@ target/
 .idea/
 .vscode/
 *.swp
+docs/gzh-*.md
