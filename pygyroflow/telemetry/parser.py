@@ -1,8 +1,8 @@
 """Telemetry parser -- extracts gyro data from video files.
 
-Pure-Python parser for GoPro GPMF and DJI protobuf telemetry formats.
-(A PyO3 bridge crate ``telemetry_parser_bridge`` once existed but was an
-empty scaffold and has been removed; this parser is the sole path.)
+Pure-Python parser for GoPro GPMF, DJI protobuf and Sony RTMD telemetry
+formats. (A PyO3 bridge crate ``telemetry_parser_bridge`` once existed but
+was an empty scaffold and has been removed; this parser is the sole path.)
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def parse_telemetry_file(
         raise TelemetryParseError(f"File not found: {path}")
 
     ext = os.path.splitext(path)[1].lower()
-    if ext in (".mp4", ".mov"):
+    if ext in (".mp4", ".mov", ".insv"):
         return _parse_embedded(path, sample_index, video_size, fps)
 
     raise TelemetryParseError(f"Unsupported file format: {ext}")
@@ -77,6 +77,15 @@ def _parse_embedded(
     if _detect_dji(data):
         return _parse_dji(data, fps, video_size)
 
+    # Detect Sony: RTMD metadata track ('meta' handler + samples starting
+    # with 00 1C, or the Sony XML manufacturer tag)
+    if _detect_sony(data):
+        return _parse_sony(data, fps, video_size)
+
+    # Detect Insta360: extra-info trailer magic at the end of the file
+    if _detect_insta360(data):
+        return _parse_insta360(data, fps, video_size)
+
     log.warning("Unrecognized telemetry format in %s", path)
     return FileMetadata(detected_source="Unknown")
 
@@ -93,6 +102,31 @@ def _detect_gopro(data: bytes) -> bool:
 def _detect_dji(data: bytes) -> bool:
     """Detect DJI metadata stream by looking for 'djmd' codec tag."""
     return data.find(b"djmd") >= 0 or (data.find(b"dvtm") >= 0 and data.find(b"DJI") >= 0)
+
+
+def _detect_sony(data: bytes) -> bool:
+    """Detect Sony RTMD telemetry.
+
+    Mirrors upstream telemetry-parser's Sony::detect: either the XML
+    manufacturer tag, or an MP4 metadata track whose samples begin with
+    00 1C (the RTMD length prefix).
+    """
+    if data.find(b'manufacturer="Sony"') >= 0:
+        return True
+    samples = _mp4_find_data_track_samples(data, "rtmd")
+    return bool(samples) and all(
+        size > 0x1C and data[offset : offset + 2] == b"\x00\x1c"
+        for offset, size in samples[:4]
+    )
+
+
+_INSTA360_MAGIC = b"8db42d694ccc418790edff439fe026bf"
+_INSTA360_HEADER_SIZE = 32 + 4 + 4 + 32  # padding(32) + size(4) + version(4) + magic(32)
+
+
+def _detect_insta360(data: bytes) -> bool:
+    """Detect Insta360 extra-info trailer (magic at end of file)."""
+    return data[-len(_INSTA360_MAGIC):] == _INSTA360_MAGIC
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +153,30 @@ def _read_mp4_box(data: bytes, pos: int, end: int):
     return fourcc, pos, header_size, size
 
 
+def _mp4_find_timed_data_track_samples(
+    data: bytes, target_codec: str
+) -> list[tuple[int, int, float]]:
+    """Like :func:`_mp4_find_data_track_samples` but also returns each
+    sample's duration in milliseconds (from the track's stts run-length
+    table and mdhd timescale).
+
+    Returns list of (offset, size, duration_ms).
+    """
+    result = _mp4_find_data_track_samples_with_durations(data, target_codec)
+    if result is None:
+        return []
+    samples, durations_ms = result
+    if not durations_ms:
+        durations_ms = [0.0] * len(samples)
+    # Pad/trim to sample count (defensive; lengths should match)
+    if len(durations_ms) < len(samples):
+        durations_ms = durations_ms + [0.0] * (len(samples) - len(durations_ms))
+    return [
+        (off, size, dur)
+        for (off, size), dur in zip(samples, durations_ms)
+    ]
+
+
 def _mp4_find_data_track_samples(
     data: bytes, target_codec: str
 ) -> list[tuple[int, int]]:
@@ -129,6 +187,20 @@ def _mp4_find_data_track_samples(
     for chunk offsets and stsz for sample sizes.
 
     Returns list of (offset, size) pairs for each sample.
+    """
+    result = _mp4_find_data_track_samples_with_durations(data, target_codec)
+    if result is None:
+        return []
+    return result[0]
+
+
+def _mp4_find_data_track_samples_with_durations(
+    data: bytes, target_codec: str
+) -> tuple[list[tuple[int, int]], list[float]] | None:
+    """Find data track samples plus per-sample durations in ms.
+
+    Returns (samples, durations_ms) for the first track matching
+    *target_codec*, or None when no track matches.
     """
     end = len(data)
 
@@ -146,7 +218,7 @@ def _mp4_find_data_track_samples(
             break
         pos += bs
     if moov_start is None:
-        return []
+        return None
 
     # Walk trak boxes inside moov
     pos = moov_start
@@ -162,21 +234,19 @@ def _mp4_find_data_track_samples(
                 return result
 
         pos += bs
-    return []
+    return None
 
 
 def _mp4_parse_trak(
     data: bytes, trak_start: int, trak_end: int, target_codec: str
-) -> list[tuple[int, int]] | None:
+) -> tuple[list[tuple[int, int]], list[float]] | None:
     """Parse a single trak box looking for *target_codec*.
 
-    Returns list of (offset, size) sample pairs, or None if this track
-    doesn't match.
+    Returns (samples, durations_ms) for the matching track, or None if this
+    track doesn't match. Sample durations come from the stts run-length
+    table scaled by the mdhd timescale (empty when stts is absent).
     """
-    hdlr_type = None
-    stsd_codec = None
-    chunk_offsets = []
-    sample_sizes = []
+    timescale = None
 
     pos = trak_start
     while pos < trak_end:
@@ -194,17 +264,18 @@ def _mp4_parse_trak(
                     break
                 m_fourcc, _, m_hs, m_bs = mdia_box
 
-                if m_fourcc == "hdlr":
-                    # hdlr: version(4) + flags(4) + handler_type(4)
-                    off = mdia_pos + m_hs + 8
-                    if off + 4 <= mdia_pos + m_bs:
-                        hdlr_type = data[off:off + 4].decode("ascii", errors="replace")
+                if m_fourcc == "mdhd":
+                    # version(1)+flags(3) [+ ctime(4|8) + mtime(4|8)] +
+                    # timescale(4) + duration(4)
+                    off = mdia_pos + m_hs
+                    ver = data[off + 4] if off + 8 <= mdia_pos + m_bs else 0
+                    ts_off = off + (20 if ver == 1 else 12)
+                    if ts_off + 4 <= mdia_pos + m_bs:
+                        timescale = struct.unpack(
+                            ">I", data[ts_off:ts_off + 4]
+                        )[0]
 
                 elif m_fourcc == "minf":
-                    _mp4_parse_stbl(
-                        data, mdia_pos + m_hs, mdia_pos + m_bs,
-                        target_codec,
-                    )
                     # We need to capture the results, so call inline
                     minf_pos = mdia_pos + m_hs
                     minf_end = mdia_pos + m_bs
@@ -218,6 +289,7 @@ def _mp4_parse_trak(
                             _r = _mp4_parse_stbl(
                                 data, minf_pos + mi_hs, minf_pos + mi_bs,
                                 target_codec,
+                                timescale=timescale or 1000,
                             )
                             if _r is not None:
                                 return _r
@@ -231,13 +303,24 @@ def _mp4_parse_trak(
 
 
 def _mp4_parse_stbl(
-    data: bytes, stbl_start: int, stbl_end: int, target_codec: str
-) -> list[tuple[int, int]] | None:
-    """Parse stbl box to find sample offsets and sizes for *target_codec*."""
+    data: bytes,
+    stbl_start: int,
+    stbl_end: int,
+    target_codec: str,
+    timescale: int = 1000,
+) -> tuple[list[tuple[int, int]], list[float]] | None:
+    """Parse stbl box to find sample offsets and sizes for *target_codec*.
+
+    Returns (samples, durations_ms): the (offset, size) pairs plus each
+    sample's duration in milliseconds expanded from the stts run-length
+    table (empty list when stts is absent). None when the codec doesn't
+    match.
+    """
     stsd_codec = None
     chunk_offsets: list[int] = []
     sample_sizes: list[int] = []
     stsc_entries: list[tuple[int, int, int]] = []  # (first_chunk, samples_per_chunk, sample_desc_idx)
+    stts_deltas: list[int] = []  # per-sample delta in track ticks
 
     pos = stbl_start
     while pos < stbl_end:
@@ -298,15 +381,29 @@ def _mp4_parse_stbl(
                         sdi = struct.unpack(">I", data[sc_pos + 8:sc_pos + 12])[0]
                         stsc_entries.append((first_chunk, spc, sdi))
 
+        elif fourcc == "stts":
+            # Run-length (sample_count, sample_delta) pairs in track ticks
+            if box_payload + 8 <= box_end:
+                entry_count = struct.unpack(">I", data[box_payload + 4:box_payload + 8])[0]
+                for i in range(entry_count):
+                    tt_pos = box_payload + 8 + i * 8
+                    if tt_pos + 8 <= box_end:
+                        count, delta = struct.unpack(">II", data[tt_pos:tt_pos + 8])
+                        stts_deltas.extend([delta] * count)
+
         pos += bs
 
     # Check if this is the right codec
     if stsd_codec != target_codec:
         return None
 
+    durations_ms = [
+        d / timescale * 1000.0 for d in stts_deltas
+    ] if timescale > 0 else []
+
     # Build sample (offset, size) list using stsc to map chunks to samples
     if not chunk_offsets:
-        return []
+        return [], durations_ms
 
     # If stsc is trivial (1 sample per chunk), use direct mapping
     if not stsc_entries or (
@@ -323,7 +420,7 @@ def _mp4_parse_stbl(
             except StopIteration:
                 sz = 0
             result.append((off, sz))
-        return result
+        return result, durations_ms
 
     # General stsc handling: expand chunk -> sample mapping
     samples = []
@@ -343,7 +440,7 @@ def _mp4_parse_stbl(
             samples.append((chunk_off, sz))
             chunk_off += sz
 
-    return samples if samples else None
+    return (samples, durations_ms) if samples else None
 
 
 # ---------------------------------------------------------------------------
@@ -402,24 +499,53 @@ def _parse_gopro(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) 
 
     metadata = FileMetadata(detected_source="GoPro")
 
-    # Find gpmd track samples via MP4 box parsing
-    samples = _mp4_find_data_track_samples(data, "gpmd")
-    if not samples:
+    # Find gpmd track samples via MP4 box parsing (with stts durations)
+    timed_samples = _mp4_find_timed_data_track_samples(data, "gpmd")
+    if not timed_samples:
         log.warning("No gpmd track found in GoPro file")
         return metadata
 
-    raw_imu: list[TimeIMU] = []
     stream_info: dict[str, dict] = {}  # stream name -> {orin, orio, mtrx}
+    camera_tags: dict = {}  # EISA/EISE/VFOV/ZFOV/PRJT (first occurrence wins)
     model: str | None = None
     quats: dict[int, Quat64] = {}
     frame_ms = 1000.0 / fps if fps > 0 else 0.0
     frame_idx = 0
 
-    for offset, size in samples:
+    # Raw IMU timestamps follow upstream telemetry-parser's
+    # util::normalized_imu + GoPro::get_avg_sample_duration: GoPro gyro/accel
+    # readings are laid on a UNIFORM grid t_i = i * avg_diff across the whole
+    # file, where avg_diff prefers the GYRO stream's first/last STMP span and
+    # otherwise falls back to the MP4 sample-table total duration / reading
+    # count. STMP absolute values are never used as per-packet bases: older
+    # files (Hero5/6) carry no STMP at all, and every packet would otherwise
+    # collapse onto the first ~1 s of the timeline.
+    rows: list[tuple] = []  # (gyro_row, accl_row), entries np arrays or None
+    total_duration_ms = 0.0
+    total_gyro_count = 0
+    last_gyro_packet_count = 0
+    stmp_first_us: int | None = None
+    stmp_last_us: int | None = None
+
+    for offset, size, duration_ms in timed_samples:
         if offset + size > len(data):
             continue
         gpmf_chunk = data[offset:offset + size]
-        model = _parse_gpmf_chunk(gpmf_chunk, fps, raw_imu, stream_info) or model
+        pkt_model, gyro_rows, accl_rows, pkt_gyro_count, pkt_stmp_us = (
+            _parse_gpmf_chunk(gpmf_chunk, stream_info, camera_tags)
+        )
+        model = pkt_model or model
+        rows.extend(zip(gyro_rows, accl_rows))
+        total_duration_ms += duration_ms
+
+        if pkt_gyro_count > 0:
+            total_gyro_count += pkt_gyro_count
+            last_gyro_packet_count = pkt_gyro_count
+        if pkt_stmp_us:
+            if stmp_first_us is None:
+                stmp_first_us = pkt_stmp_us
+            stmp_last_us = pkt_stmp_us
+
         cori, iori = _parse_gpmf_orientation_chunk(gpmf_chunk)
         # Upstream: only emit when both streams are present and equal length
         if cori and len(cori) == len(iori):
@@ -429,12 +555,57 @@ def _parse_gopro(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) 
                 quats[ts_us] = Quat64.from_quaternion(np.array([w, x, y, z]))
                 frame_idx += 1
 
+    # Modern GoPros (verified Hero8/10) write the camera-identification DEVC
+    # (VFOV/EISA/EISE/ZFOV/PRJT) at the very end of mdat, AFTER the last
+    # sample-table entry. Recover it with a bounded tail scan — camera tags
+    # only; any IMU rows found there are discarded (the sample table, not
+    # the tail, defines the telemetry stream).
+    if not camera_tags and timed_samples:
+        tail_start = timed_samples[-1][0] + timed_samples[-1][1]
+        tail = data[tail_start : tail_start + 65536]
+        p = 0
+        while p < len(tail) - _GPMF_HEADER_SIZE:
+            i = tail.find(b"DEVC", p)
+            if i < 0 or i + _GPMF_HEADER_SIZE > len(tail):
+                break
+            klv = _gpmf_read_klv(tail, i, len(tail))
+            if klv is None:
+                break
+            devc_end = min(klv[6], len(tail))
+            _parse_gpmf_chunk(tail[i:devc_end], None, camera_tags)
+            if camera_tags:
+                break
+            p = klv[6]
+
+    raw_imu: list[TimeIMU] = []
+    if rows:
+        if (
+            stmp_first_us is not None
+            and stmp_last_us is not None
+            and stmp_last_us > stmp_first_us
+            and total_gyro_count > 0
+        ):
+            denom = max(1, total_gyro_count - last_gyro_packet_count)
+            avg_diff_ms = (stmp_last_us - stmp_first_us) / 1000.0 / denom
+        elif total_gyro_count > 0 and total_duration_ms > 0:
+            avg_diff_ms = total_duration_ms / total_gyro_count
+        elif total_gyro_count > 0:
+            avg_diff_ms = 5.0  # no timing at all: assume ~200 Hz IMU
+        else:
+            avg_diff_ms = 0.0
+        for i, (gyro, accl) in enumerate(rows):
+            raw_imu.append(TimeIMU(timestamp_ms=i * avg_diff_ms, gyro=gyro, accl=accl))
+        log.info(
+            "GoPro: %d raw IMU readings on uniform grid, avg step %.3f ms "
+            "(span %.1f ms, %d gpmd packets)",
+            len(rows), avg_diff_ms, len(rows) * avg_diff_ms, len(timed_samples),
+        )
+    metadata.raw_imu = raw_imu
+
     if quats:
         metadata.quaternions = quats
         log.info("GoPro: extracted %d CORI*IORI quaternions", len(quats))
 
-    metadata.raw_imu = raw_imu
-    metadata.imu_orientation = _gopro_derive_orientation(stream_info, model)
     metadata.frame_rate = fps if fps > 0 else None
     metadata.has_accurate_timestamps = True
 
@@ -466,6 +637,15 @@ def _parse_gopro(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) 
                 pass
     if model:
         metadata.detected_source = f"GoPro {model}"
+
+    if camera_tags:
+        metadata.additional_data["camera_tags"] = {"Default": camera_tags}
+
+    # Orientation derivation must run after the model fallbacks: the
+    # model-specific routes (HERO6 -> "ZyX", HERO7 Silver -> "YXz") are the
+    # only source of orientation for files whose streams carry no
+    # ORIN/ORIO/MTRX tags.
+    metadata.imu_orientation = _gopro_derive_orientation(stream_info, model)
 
     return metadata
 
@@ -613,25 +793,33 @@ def _gopro_derive_orientation(stream_info: dict[str, dict], model: str | None) -
 
 def _parse_gpmf_chunk(
     gpmf_data: bytes,
-    fps: float,
-    raw_imu: list,
     stream_info: dict[str, dict] | None = None,
-) -> str | None:
+    camera_tags: dict | None = None,
+) -> tuple[str | None, list, list, int, int]:
     """Parse one gpmd track sample (contains one or more DEVC blocks).
 
-    Extracts ACCL and GYRO streams from each DEVC/STRM, computes
-    timestamps from STMP and sample counts, and appends TimeIMU entries
-    to *raw_imu*.
+    Extracts ACCL and GYRO streams from each DEVC/STRM and returns physical-
+    unit rows for the whole packet:
+
+    Returns (model, gyro_rows, accl_rows, gyro_count, last_stamp_us).
+    Timestamps are NOT assigned here — upstream telemetry-parser lays GoPro
+    IMU readings on a uniform whole-file grid (see _parse_gopro), so per-
+    packet STMP values are only reported for the grid-step estimate.
+
+    DEVC-level camera tags (EISA/EISE/VFOV/ZFOV/PRJT) are collected into
+    *camera_tags* (first occurrence wins) for lens-profile auto-loading.
     """
     import numpy as np
-
-    from pygyroflow.types.time_types import TimeIMU
 
     RAD_TO_DEG = 180.0 / 3.141592653589793
 
     pos = 0
     end = len(gpmf_data)
     model: str | None = None
+    gyro_rows: list = []
+    accl_rows: list = []
+    chunk_gyro_count = 0
+    last_stamp_us = 0
 
     while pos < end - _GPMF_HEADER_SIZE:
         klv = _gpmf_read_klv(gpmf_data, pos, end)
@@ -647,7 +835,6 @@ def _parse_gpmf_chunk(
         # Per-DEVC accumulators
         accl_samples = None
         accl_scale = 1.0
-        accl_stamp_us = 0
         accl_count = 0
         accl_struct_size = 6
 
@@ -668,6 +855,16 @@ def _parse_gpmf_chunk(
             if c_fourcc == "DMNL" or c_fourcc == "MINF":
                 # model name (for orientation fallbacks)
                 model = gpmf_data[child[4] : child[4] + child[5]].decode("ascii", errors="replace").rstrip("\x00")
+            elif c_fourcc in ("EISA", "EISE", "VFOV", "ZFOV", "PRJT") and camera_tags is not None:
+                # Camera/lens identification tags (upstream reads them from
+                # GroupId::Default for CameraIdentifier::from_telemetry_parser)
+                val: object = None
+                if c_type == ord("c"):
+                    val = gpmf_data[child[4] : child[4] + child[5]].decode("ascii", errors="replace").rstrip("\x00")
+                elif c_type == ord("f") and child[5] >= 4:
+                    val = struct.unpack(">f", gpmf_data[child[4] : child[4] + 4])[0]
+                if val is not None:
+                    camera_tags.setdefault(c_fourcc, val)
             elif c_fourcc == "STRM" and c_type == 0:
                 # Parse STRM contents for ACCL/GYRO (+ orientation tags)
                 _parse_gpmf_strm(
@@ -675,36 +872,25 @@ def _parse_gpmf_chunk(
                     child[4],  # payload_start of STRM
                     RAD_TO_DEG,
                     # Mutable accumulators via closure
-                    accl_ref := [accl_samples, accl_scale, accl_stamp_us, accl_count, accl_struct_size],
+                    accl_ref := [accl_samples, accl_scale, 0, accl_count, accl_struct_size],
                     gyro_ref := [gyro_samples, gyro_scale, gyro_stamp_us, gyro_count, gyro_struct_size],
                     stream_info,
                 )
                 # Read back updated values
-                accl_samples, accl_scale, accl_stamp_us, accl_count, accl_struct_size = accl_ref
+                accl_samples, accl_scale, _accl_stamp, accl_count, accl_struct_size = accl_ref
                 gyro_samples, gyro_scale, gyro_stamp_us, gyro_count, gyro_struct_size = gyro_ref
+                if gyro_stamp_us:
+                    last_stamp_us = gyro_stamp_us
 
             dpos = c_np
 
-        # Build TimeIMU entries
+        # Emit physical-unit rows for this DEVC
         if accl_count == 0 and gyro_count == 0:
             pos = next_pos
             continue
 
         n_samples = max(accl_count, gyro_count)
-
-        # GoPro IMU sample rate is typically ~200Hz.
-        # Each DEVC block spans approximately 1 second with n_samples samples.
-        # So sample_interval = 1_000_000 / n_samples microseconds.
-        if n_samples > 1:
-            sample_interval_us = 1_000_000.0 / n_samples
-        else:
-            sample_interval_us = 5_000.0  # 5ms default
-
-        base_stamp_us = accl_stamp_us if accl_stamp_us else gyro_stamp_us
-
         for i in range(n_samples):
-            ts_ms = (base_stamp_us + i * sample_interval_us) / 1000.0
-
             gyro = None
             if gyro_samples is not None and i < gyro_count:
                 n_axes = gyro_struct_size // 2
@@ -725,11 +911,13 @@ def _parse_gpmf_chunk(
                     dtype=np.float64,
                 )
 
-            raw_imu.append(TimeIMU(timestamp_ms=ts_ms, gyro=gyro, accl=accl))
+            gyro_rows.append(gyro)
+            accl_rows.append(accl)
 
+        chunk_gyro_count += gyro_count
         pos = next_pos
 
-    return model
+    return model, gyro_rows, accl_rows, chunk_gyro_count, last_stamp_us
 
 
 def _parse_gpmf_strm(
@@ -1053,6 +1241,525 @@ def _parse_dji(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) ->
         log.info("DJI: extracted %d quaternion samples", len(quats))
     else:
         log.warning("DJI: no quaternion data extracted")
+
+    return metadata
+
+
+# ---------------------------------------------------------------------------
+# Sony RTMD parser
+# ---------------------------------------------------------------------------
+
+def _sony_read_f16(raw: bytes) -> float:
+    """Decode Sony's decimal-float 16 (NOT IEEE 754 half).
+
+    Upstream rtmd_tags read_f16: 4-bit exponent (sign-extended when >= 8)
+    with a 12-bit mantissa scaled by 10^exp — used by the lens tags
+    (focal length etc.). Returned in the tag's own unit (mm *before* the
+    x1000 applied by upstream; see _parse_sony).
+    """
+    (num,) = struct.unpack(">h", raw[:2])
+    exp = (num >> 12) & 0x0F
+    if exp >= 8:
+        exp = -((~exp & 0x7) + 1)
+    return (num & 0x0FFF) * 10.0**exp
+
+
+def _sony_orientation(payload: bytes) -> str | None:
+    """Decode the 3-nibble IMU orientation (upstream rtmd_tags read_orientation).
+
+    e.g. 0x152 -> 'Yzx' (RX100 VII), 0x420 -> 'XYZ' (A7S III), 0x241 -> 'xZY' (RX0 II).
+    """
+    chars = "XxYyZz"
+    (num,) = struct.unpack(">H", payload[:2])
+    try:
+        return "".join(chars[num & 0xF] + chars[(num >> 4) & 0xF] + chars[(num >> 8) & 0xF])
+    except IndexError:
+        return None
+
+
+def _sony_normalize_orientation(v: str) -> str:
+    """Sony's normalize_imu_orientation: swap X/Y, invert Z case."""
+    chars = list(v)
+    chars[0], chars[1] = chars[1], chars[0]
+    chars[2] = chars[2].swapcase()
+    return "".join(chars)
+
+
+def _sony_walk_tlv(buf: bytes, pos: int, end: int, tags: dict[int, bytes]) -> None:
+    """Flatten one Sony RTMD TLV block into *tags* (later entries win).
+
+    Layout per upstream Sony::parse_metadata: u16 tag + u16 len + payload;
+    tag 0x060e is a 16-byte UUID (skip); 0x8300 is a nested container.
+    """
+    while pos + 4 <= end:
+        tag, length = struct.unpack(">HH", buf[pos : pos + 4])
+        if tag == 0x060e:
+            pos += 2 + 14
+            continue
+        if tag in (0, 0xFFFF):
+            break
+        payload_start = pos + 4
+        if payload_start + length > end:
+            break
+        payload = buf[payload_start : payload_start + length]
+        tags[tag] = payload
+        if tag == 0x8300:
+            _sony_walk_tlv(payload, 0, len(payload), tags)
+        pos = payload_start + length
+
+
+def _parse_sony(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -> FileMetadata:
+    """Parse Sony RTMD telemetry from a raw MP4 file.
+
+    Mirrors upstream telemetry-parser sony/mod.rs + util.rs
+    normalized_imu_interpolated:
+    - gyro (0xe43b) / accel (0xe44b) blocks: [i32 count][i32 len=6][count x 3 i16]
+    - values: raw / scale (0xe439/0xe449); accel additionally x9.80665
+      (upstream inserts Unit "g" for the accelerometer group)
+    - raw rows keep stream axis order (orientation "XYZ"); the decoded
+      stream orientation (0xe43a, normalized) is returned via
+      FileMetadata.imu_orientation for GyroSource to apply
+    - timestamps: uniform grid i * total_duration / reading_count
+    """
+    import numpy as np
+
+    from pygyroflow.types.time_types import TimeIMU
+
+    metadata = FileMetadata(detected_source="Sony")
+
+    timed_samples = _mp4_find_timed_data_track_samples(data, "rtmd")
+    if not timed_samples:
+        log.warning("No rtmd track found in Sony file")
+        return metadata
+
+    # Model from the optional XML urn:x-canon manufacturer block
+    model: str | None = None
+    lens_name: str | None = None
+    xml_pos = data.find(b'manufacturer="Sony"')
+    if xml_pos >= 0:
+        window = data[xml_pos : xml_pos + 1024]
+        m = _find_between(window, b'modelName="', b'"')
+        if m:
+            model = m.decode("ascii", errors="replace")
+        m = _find_between(window, b'Lens modelName="', b'"')
+        if m:
+            lens_name = m.decode("ascii", errors="replace")
+
+    G_TO_MS2 = 9.80665
+    rows: list[tuple] = []
+    total_duration_ms = 0.0
+    total_gyro_count = 0
+    orientation: str | None = None
+    focal_length: float | None = None
+    readout_ms: float | None = None
+
+    for sample_idx, (offset, size, duration_ms) in enumerate(timed_samples):
+        chunk = data[offset : offset + size]
+        if len(chunk) <= 0x1C or chunk[:2] != b"\x00\x1c":
+            continue
+        tags: dict[int, bytes] = {}
+        _sony_walk_tlv(chunk, 0x1C, len(chunk), tags)
+
+        if sample_idx == 0:
+            if 0x8005 in tags and len(tags[0x8005]) >= 2:
+                focal_length = _sony_read_f16(tags[0x8005]) * 1000.0
+            if 0xe43a in tags:
+                raw_orient = _sony_orientation(tags[0xe43a])
+                if raw_orient:
+                    orientation = _sony_normalize_orientation(raw_orient)
+            if 0xe40e in tags and len(tags[0xe40e]) >= 4:
+                rt = struct.unpack(">i", tags[0xe40e][:4])[0] / 1000.0
+                if abs(rt) > 0.1:
+                    readout_ms = rt
+
+        gyro_vals = None
+        gyro_count = 0
+        g = tags.get(0xE43B)
+        if g is not None and len(g) >= 8:
+            count, length = struct.unpack(">ii", g[:8])
+            if count > 0 and length == 6 and len(g) >= 8 + count * 6:
+                scale = struct.unpack(">f", tags[0xE439][:4])[0] if 0xE439 in tags and len(tags[0xE439]) >= 4 else 1.0
+                raw = np.frombuffer(g[8 : 8 + count * 6], dtype=">i2").astype(np.float64)
+                gyro_vals = raw.reshape(count, 3) / (scale if scale else 1.0)
+                gyro_count = count
+
+        accl_vals = None
+        accl_count = 0
+        a = tags.get(0xE44B)
+        if a is not None and len(a) >= 8:
+            count, length = struct.unpack(">ii", a[:8])
+            if count > 0 and length == 6 and len(a) >= 8 + count * 6:
+                scale = struct.unpack(">f", tags[0xE449][:4])[0] if 0xE449 in tags and len(tags[0xE449]) >= 4 else 1.0
+                raw = np.frombuffer(a[8 : 8 + count * 6], dtype=">i2").astype(np.float64)
+                accl_vals = raw.reshape(count, 3) / (scale if scale else 1.0) * G_TO_MS2
+                accl_count = count
+
+        n = max(gyro_count, accl_count)
+        for i in range(n):
+            rows.append((
+                gyro_vals[i] if gyro_vals is not None and i < gyro_count else None,
+                accl_vals[i] if accl_vals is not None and i < accl_count else None,
+            ))
+        total_duration_ms += duration_ms
+        total_gyro_count += gyro_count
+
+    raw_imu: list[TimeIMU] = []
+    if rows and total_gyro_count > 0 and total_duration_ms > 0:
+        avg_diff_ms = total_duration_ms / total_gyro_count
+        for i, (gyro, accl) in enumerate(rows):
+            raw_imu.append(TimeIMU(timestamp_ms=i * avg_diff_ms, gyro=gyro, accl=accl))
+        log.info(
+            "Sony: %d raw IMU readings, avg step %.4f ms (span %.1f ms, %d rtmd packets)",
+            len(rows), avg_diff_ms, len(rows) * avg_diff_ms, len(timed_samples),
+        )
+
+    metadata.raw_imu = raw_imu
+    metadata.imu_orientation = orientation
+    metadata.frame_readout_time = readout_ms
+    metadata.frame_rate = fps if fps > 0 else None
+    metadata.has_accurate_timestamps = True
+    if model:
+        metadata.detected_source = f"Sony {model}"
+
+    # Camera identifier inputs (focal length drives the Sony lens-profile
+    # autoload identifier "xx.xx mm")
+    lens_tags: dict = {}
+    if focal_length:
+        lens_tags["FocalLength"] = focal_length
+    if lens_name:
+        lens_tags["DisplayName"] = lens_name
+    if lens_tags:
+        metadata.additional_data["camera_tags"] = {"Lens": lens_tags}
+
+    return metadata
+
+
+def _find_between(haystack: bytes, start: bytes, end: bytes) -> bytes | None:
+    """Return the bytes between *start* and *end* (first occurrence)."""
+    i = haystack.find(start)
+    if i < 0:
+        return None
+    j = haystack.find(end, i + len(start))
+    if j < 0:
+        return None
+    return haystack[i + len(start) : j]
+
+
+# ---------------------------------------------------------------------------
+# Insta360 extra-info parser
+# ---------------------------------------------------------------------------
+
+def _pb_read_f64_field(data: bytes, target_field: int) -> float:
+    """Read a 64-bit double field (wire type 1) by field number."""
+    pos = 0
+    while pos < len(data):
+        tag, npos = _read_varint(data, pos)
+        if tag == 0:
+            break
+        field_num = tag >> 3
+        wire_type = tag & 7
+        if wire_type == 0:
+            _, npos = _read_varint(data, npos)
+        elif wire_type == 1:
+            if field_num == target_field and npos + 8 <= len(data):
+                return struct.unpack("<d", data[npos:npos + 8])[0]
+            npos += 8
+        elif wire_type == 2:
+            length, npos = _read_varint(data, npos)
+            npos += length
+        elif wire_type == 5:
+            npos += 4
+        else:
+            break
+        pos = npos
+    return 0.0
+
+
+def _pb_read_string_field(data: bytes, target_field: int) -> str:
+    """Read a string field (wire type 2) by field number."""
+    chunk = _pb_extract_field(data, target_field)
+    if chunk is None:
+        return ""
+    return chunk.decode("utf-8", errors="replace")
+
+
+def _insta360_collect_records(data: bytes) -> list[tuple[int, int, bytes]]:
+    """Collect (record_id, format, payload) from the trailing extra-info blob.
+
+    Mirrors upstream Insta360::parse_file: records are found either through
+    an Offsets index record (modern files) or by walking backwards from the
+    72-byte header (legacy layout). Each record is [payload][format u8]
+    [id u8][size u32 LE].
+    """
+    hdr = data[-_INSTA360_HEADER_SIZE:]
+    extra_size = struct.unpack("<I", hdr[32:36])[0]
+    extra_start = len(data) - extra_size
+
+    records: list[tuple[int, int, bytes]] = []
+
+    # Fast path: Offsets index (first_id byte just before the header)
+    trailer = len(data) - (_INSTA360_HEADER_SIZE + 6)
+    if trailer >= 0 and data[trailer + 1] == 0:  # record id == Offsets
+        (tbl_size,) = struct.unpack("<I", data[trailer + 2 : trailer + 6])
+        tbl_start = trailer - tbl_size
+        if tbl_start >= 0:
+            tbl = data[tbl_start:trailer]
+            entries: dict[int, tuple[int, int]] = {}
+            p = 0
+            while p + 10 <= len(tbl):
+                rid, rfmt = tbl[p], tbl[p + 1]
+                rsize, roff = struct.unpack("<II", tbl[p + 2 : p + 10])
+                if rid > 0:
+                    entries[rid] = (roff, rsize)
+                p += 10
+            for rid, (roff, rsize) in entries.items():
+                base = extra_start + roff
+                if base < 0 or base + rsize + 6 > len(data):
+                    continue
+                payload = data[base : base + rsize]
+                rfmt = data[base + rsize]
+                id2 = data[base + rsize + 1]
+                (size2,) = struct.unpack("<I", data[base + rsize + 2 : base + rsize + 6])
+                if size2 == rsize and id2 == rid:
+                    records.append((rid, rfmt, payload))
+            if records:
+                return records
+
+    # Legacy fallback: walk records backwards
+    offset = _INSTA360_HEADER_SIZE + 6
+    while offset < extra_size:
+        pos = len(data) - offset
+        if pos + 6 > len(data):
+            break
+        rfmt = data[pos]
+        rid = data[pos + 1]
+        (rsize,) = struct.unpack("<I", data[pos + 2 : pos + 6])
+        payload_start = pos - rsize
+        if payload_start < 0:
+            break
+        records.append((rid, rfmt, data[payload_start:pos]))
+        offset += rsize + 6
+    return records
+
+
+def _parse_insta360(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -> FileMetadata:
+    """Parse Insta360 extra-info telemetry (gyro/accel + inline lens profile).
+
+    Port of upstream telemetry-parser insta360/{mod,record,extra_info}.rs:
+    - trailing 72-byte header + record chain (Offsets index or backward walk)
+    - Metadata record (protobuf): camera model, ranges, first-frame timestamp,
+      rolling-shutter time, offset_v3 (lens intrinsics)
+    - Gyro record: [u64 ts][6 x (u16|f64)] = acc xyz + gyro xyz per sample;
+      raw files scale by 32768/range, non-raw gyro is rad/s and accel in g
+    - timestamps: t -= first_frame_timestamp/1000; raw: t /= 1000;
+      t -= gyro_timestamp/1000 (kept in seconds, matching upstream's
+      TimeVector3 consumption which multiplies by 1000 for ms)
+    """
+    import numpy as np
+
+    from pygyroflow.types.time_types import TimeIMU
+
+    metadata = FileMetadata(detected_source="Insta360")
+
+    records = _insta360_collect_records(data)
+    if not records:
+        log.warning("Insta360: no extra-info records found")
+        return metadata
+
+    # ---- Metadata record (id 1, protobuf) ----
+    model: str | None = None
+    is_raw_gyro = False
+    gyro_range = 0.0
+    acc_range = 0.0
+    first_frame_ts = 0.0
+    rolling_shutter_ms = None
+    gyro_timestamp = 0.0
+    dimension = None
+    crop_info = None
+    offset_v3: list[float] = []
+
+    for rid, _fmt, payload in records:
+        if rid != 1:
+            continue
+        model = _pb_read_string_field(payload, 2) or None  # camera_type
+        is_raw_gyro = _pb_read_varint_field(payload, 62) != 0
+        cfg = _pb_extract_field(payload, 65)  # GyroConfigInfo
+        if cfg is not None:
+            acc_range = float(_pb_read_varint_field(cfg, 1))
+            gyro_range = float(_pb_read_varint_field(cfg, 2))
+        first_frame_ts = float(_pb_read_varint_field(payload, 24))  # i64
+        rst = _pb_read_f64_field(payload, 25)  # rolling_shutter_time
+        if abs(rst) > 0.0:
+            rolling_shutter_ms = rst
+        if _pb_read_varint_field(payload, 29) != 0:  # is_has_gyro_timestamp
+            gyro_timestamp = _pb_read_f64_field(payload, 28)
+        dim = _pb_extract_field(payload, 19)  # Vector2 dimension
+        if dim is not None:
+            dimension = (
+                _pb_read_varint_field(dim, 1),
+                _pb_read_varint_field(dim, 2),
+            )
+        crop = _pb_extract_field(payload, 27)  # WindowCropInfo
+        if crop is not None:
+            crop_info = (
+                _pb_read_varint_field(crop, 1),
+                _pb_read_varint_field(crop, 2),
+                _pb_read_varint_field(crop, 3),
+                _pb_read_varint_field(crop, 4),
+            )
+        off_v3_str = _pb_read_string_field(payload, 54)
+        if off_v3_str:
+            try:
+                offset_v3 = [float(v) for v in off_v3_str.split("_")]
+            except ValueError:
+                offset_v3 = []
+        break
+
+    # ---- IMU orientation (upstream model table) ----
+    has_offset_v3 = len(offset_v3) >= 20
+    if has_offset_v3:
+        imu_orientation = {
+            "Insta360 GO 2": "XYZ", "Insta360 GO 3": "XYZ",
+            "Insta360 GO 3S": "yXZ", "Insta360 GO Ultra": "YxZ",
+            "Insta360 OneR": "Xyz", "Insta360 OneRS": "Xyz",
+            "Insta360 X4": "yzX", "Insta360 X5": "yzX",
+        }.get(model or "", "Xyz")
+    else:
+        imu_orientation = {
+            "Insta360 Go": "xyZ", "Insta360 GO 2": "yXZ",
+            "Insta360 OneR": "yXZ", "Insta360 OneRS": "yxz",
+            "Insta360 ONE X2": "xZy",
+        }.get(model or "", "yXZ")
+
+    # ---- Gyro record (id 3) ----
+    RAD_TO_DEG = 180.0 / 3.141592653589793
+    G_TO_MS2 = 9.80665
+    gyro_scale = 32768.0 / (gyro_range if gyro_range > 0 else 2000.0)
+    accl_scale = 32768.0 / (acc_range if acc_range > 0 else 16.0)
+    fft = first_frame_ts / 1000.0
+    gt = gyro_timestamp / 1000.0
+
+    raw_imu: list[TimeIMU] = []
+    for rid, _fmt, payload in records:
+        if rid != 3:
+            continue
+        item_size = 8 + 6 * (2 if is_raw_gyro else 8)
+        # Tolerate a trailing partial item: real files exist with a stray
+        # byte after the last sample (upstream's strict loop errors out on
+        # them and silently drops ALL telemetry via .ok()).
+        n = len(payload) // item_size
+        for i in range(n):
+            base = i * item_size
+            (ts,) = struct.unpack("<Q", payload[base : base + 8])
+            t = ts / 1000.0
+            d = base + 8
+            if not is_raw_gyro:
+                vals = struct.unpack("<6d", payload[d : d + 48])
+                acc = np.array(vals[0:3], dtype=np.float64) * G_TO_MS2
+                gyro = np.array(vals[3:6], dtype=np.float64) * RAD_TO_DEG
+            else:
+                vals = struct.unpack("<6H", payload[d : d + 12])
+                acc = (np.array(vals[0:3], dtype=np.float64) - 32768.0) / accl_scale * G_TO_MS2
+                gyro = (np.array(vals[3:6], dtype=np.float64) - 32768.0) / gyro_scale
+
+            # Timestamp model from upstream process_map (result in seconds;
+            # GyroSource consumes ms, hence * 1000 below)
+            t -= fft
+            if is_raw_gyro:
+                t /= 1000.0
+            t -= gt
+            raw_imu.append(TimeIMU(timestamp_ms=t * 1000.0, gyro=gyro, accl=acc))
+
+        log.info(
+            "Insta360: %d gyro samples (%s format, ranges %s/%s)",
+            n, "raw" if is_raw_gyro else "double", gyro_range, acc_range,
+        )
+
+    metadata.raw_imu = raw_imu
+    metadata.imu_orientation = imu_orientation
+    metadata.frame_readout_time = rolling_shutter_ms
+    metadata.frame_rate = fps if fps > 0 else None
+    metadata.has_accurate_timestamps = True
+    if model:
+        metadata.detected_source = model if model.startswith("Insta360") else f"Insta360 {model}"
+
+    # ---- Inline lens profile from offset_v3 (upstream insert_lens_profile) ----
+    if dimension and crop_info and len(offset_v3) >= 21:
+        (w, h) = dimension
+        (src_w, src_h, dst_w, dst_h) = crop_info
+        (_num, xi, fx, fy, cx, cy, yaw, pitch, roll,
+         _tx, _ty, _tz, k1, k2, k3, p1, p2,
+         lens_width, lens_height, _lens_type, _flag) = offset_v3[:21]
+
+        bare_model = (model or "").replace("Insta360 ", "")
+        cx_fix = 2.0 if bare_model in ("X4", "X5") else 1.0
+        c_ratio = (w / lens_width * cx_fix, h / lens_height)
+        f_ratio = (dst_w / w, dst_h / h)
+
+        def _out_size(width: int, height: int) -> tuple[int, int]:
+            aspect = int(width / height * 100)
+            if aspect in (133, 100):
+                return width, round(width / 1.7777777777777)
+            return width, height
+
+        ow, oh = _out_size(w, h)
+        metadata.lens_profile = {
+            "calibrated_by": "Insta360",
+            "camera_brand": "Insta360",
+            "camera_model": bare_model,
+            "calib_dimension": {"w": w, "h": h},
+            "orig_dimension": {"w": w, "h": h},
+            "output_dimension": {"w": ow, "h": oh},
+            "frame_readout_time": rolling_shutter_ms,
+            "official": True,
+            "asymmetrical": True,
+            "fisheye_params": {
+                "camera_matrix": [
+                    [fx / f_ratio[0], 0.0, cx * c_ratio[0]],
+                    [0.0, fy / f_ratio[1], cy * c_ratio[1]],
+                    [0.0, 0.0, 1.0],
+                ],
+                "distortion_coeffs": [k1, k2, k3, p1, p2, xi],
+            },
+            "distortion_model": "insta360",
+            "sync_settings": {
+                "initial_offset": 0,
+                "initial_offset_inv": False,
+                "search_size": 0.3,
+                "max_sync_points": 5,
+                "every_nth_frame": 1,
+                "time_per_syncpoint": 0.5,
+                "do_autosync": False,
+            },
+            "calibrator_version": "---",
+        }
+
+        # Rotate IMU vectors by the mounting angles from offset_v3
+        if abs(pitch) > 0.0 or abs(roll) > 0.0 or abs(yaw) > 0.0:
+            DEG2RAD = 3.141592653589793 / 180.0
+            ry, rp, rr = yaw * DEG2RAD, pitch * DEG2RAD, roll * DEG2RAD
+            sry, cry = np.sin(ry), np.cos(ry)
+            srp, crp = np.sin(rp), np.cos(rp)
+            srr, crr = np.sin(rr), np.cos(rr)
+            mat = np.array([
+                [crr * crp, crr * srp * sry - srr * cry, crr * srp * cry + srr * sry],
+                [srr * crp, srr * srp * sry + cry * cry * 0 + crr * cry, srr * srp * cry - crr * sry],
+                [-srp, crp * sry, crp * cry],
+            ])
+            # upstream row 2 middle term: sy*sp*sr + cy*cr
+            mat[1][1] = srr * srp * sry + crr * cry
+            for x in raw_imu:
+                if x.gyro is not None:
+                    x.gyro = mat @ x.gyro
+                if x.accl is not None:
+                    x.accl = mat @ x.accl
+
+    if raw_imu:
+        ts = [x.timestamp_ms for x in raw_imu]
+        log.info(
+            "Insta360: %d raw IMU readings, span %.1f ms, readout %s ms",
+            len(raw_imu), ts[-1] - ts[0] if len(ts) > 1 else 0.0, rolling_shutter_ms,
+        )
 
     return metadata
 

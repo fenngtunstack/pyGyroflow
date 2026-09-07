@@ -300,57 +300,88 @@ def build_synthetic_gopro_mp4(gyro_xyz: list[tuple[int, int, int]],
                               accl_xyz: list[tuple[int, int, int]],
                               scale: int = 100,
                               stamp_us: int = 0,
-                              orio: str | None = None) -> bytes:
+                              orio: str | None = None,
+                              n_packets: int = 1,
+                              stts_delta_ms: float | None = None) -> bytes:
     """Build a minimal mp4 containing only a gpmd data track.
 
     The telemetry parser reads boxes manually (no ffmpeg), so only the
     moov/trak/mdia/minf/stbl hierarchy plus the raw sample payloads at the
     offsets advertised by stco/stsz are required.
+
+    ``n_packets`` > 1 repeats the DEVC payload as consecutive samples;
+    ``stts_delta_ms`` adds an stts box giving each sample that duration
+    (mirroring real GoPro files: one gpmd sample per ~1 s with Hero5/6
+    carrying no STMP inside the payload).
     """
     gyro_payload = struct.pack(f">{len(gyro_xyz) * 3}h", *[v for s in gyro_xyz for v in s])
     accl_payload = struct.pack(f">{len(accl_xyz) * 3}h", *[v for s in accl_xyz for v in s])
 
-    strm_parts = [
-        _gpmf_klv("STNM", ord("c"), b"Angular velocity\0\0"),
-        _gpmf_klv("ORIN", ord("c"), b"ZXY\0"),
-    ]
-    if orio:
-        pad = b"\0" * (-len(orio) % 4)
-        strm_parts.append(_gpmf_klv("ORIO", ord("c"), orio.encode() + pad))
-    strm_parts += [
-        _gpmf_klv("SIUN", ord("c"), b"rad/s\0\0"),
-        _gpmf_klv("STMP", ord("J"), struct.pack(">q", stamp_us)),
-        _gpmf_klv("SCAL", ord("s"), struct.pack(">h", scale)),
-        _gpmf_klv("GYRO", ord("s"), gyro_payload, struct_size=6, repeat=len(gyro_xyz)),
-        _gpmf_klv("ACCL", ord("s"), accl_payload, struct_size=6, repeat=len(accl_xyz)),
-    ]
-    strm = b"".join(strm_parts)
-    devc = _gpmf_klv("DEVC", 0, _gpmf_klv("STRM", 0, strm) + b"DVC1\0\0\0")
+    def build_devc(stamp_us_value: int | None) -> bytes:
+        strm_parts = [
+            _gpmf_klv("STNM", ord("c"), b"Angular velocity\0\0"),
+            _gpmf_klv("ORIN", ord("c"), b"ZXY\0"),
+        ]
+        if orio:
+            pad = b"\0" * (-len(orio) % 4)
+            strm_parts.append(_gpmf_klv("ORIO", ord("c"), orio.encode() + pad))
+        strm_parts += [
+            _gpmf_klv("SIUN", ord("c"), b"rad/s\0\0"),
+        ]
+        if stamp_us_value is not None:
+            strm_parts.append(_gpmf_klv("STMP", ord("J"), struct.pack(">q", stamp_us_value)))
+        strm_parts += [
+            _gpmf_klv("SCAL", ord("s"), struct.pack(">h", scale)),
+            _gpmf_klv("GYRO", ord("s"), gyro_payload, struct_size=6, repeat=len(gyro_xyz)),
+            _gpmf_klv("ACCL", ord("s"), accl_payload, struct_size=6, repeat=len(accl_xyz)),
+        ]
+        strm = b"".join(strm_parts)
+        return _gpmf_klv("DEVC", 0, _gpmf_klv("STRM", 0, strm) + b"DVC1\0\0\0")
 
-    # stbl advertising one sample of size len(devc); sample placed after moov.
+    if isinstance(stamp_us, (list, tuple)):
+        packets = [build_devc(s) for s in stamp_us]
+        n_packets = len(packets)
+    else:
+        devc = build_devc(stamp_us)
+        packets = [devc] * n_packets
+    payload = b"".join(packets)
+
+    # stbl advertising n_packets samples of size len(devc); samples placed
+    # after moov.
     sample_offset_placeholder = 0  # patched below
 
     def make_moov(sample_offset: int, sample_size: int) -> bytes:
         stsd_payload = struct.pack(">II", 0, 1) + struct.pack(">I", 16) + b"gpmd" + b"\x00" * 8
         stsd = _mp4_box("stsd", stsd_payload)
-        stco = _mp4_box("stco", struct.pack(">II", 0, 1) + struct.pack(">I", sample_offset))
-        stsz = _mp4_box("stsz", struct.pack(">III", 0, 0, 1) + struct.pack(">I", sample_size))
+        stco_payload = struct.pack(">II", 0, n_packets)
+        for i in range(n_packets):
+            stco_payload += struct.pack(">I", sample_offset + i * sample_size)
+        stco = _mp4_box("stco", stco_payload)
+        stsz_payload = struct.pack(">III", 0, 0, n_packets) + struct.pack(">I", sample_size) * n_packets
+        stsz = _mp4_box("stsz", stsz_payload)
         stsc = _mp4_box("stsc", struct.pack(">II", 0, 1) + struct.pack(">III", 1, 1, 1))
-        stbl = _mp4_box("stbl", stsd + stco + stsz + stsc)
+        boxes = stsd + stco + stsz + stsc
+        if stts_delta_ms is not None:
+            # timescale 1000 ticks/s -> delta in ms == delta in ticks
+            stts = _mp4_box("stts", struct.pack(">II", 0, 1) + struct.pack(">II", n_packets, int(stts_delta_ms)))
+            boxes += stts
+        stbl = _mp4_box("stbl", boxes)
         minf = _mp4_box("minf", stbl)
         hdlr = _mp4_box("hdlr", b"\x00" * 8 + b"gpmd" + b"\x00" * 12)
-        mdhd = _mp4_box("mdhd", struct.pack(">IIII", 0, 0, 1000, 30))
+        # mdhd v0: version+flags(4) + creation(4) + modification(4) +
+        # timescale(4) + duration(4)
+        mdhd = _mp4_box("mdhd", struct.pack(">IIIII", 0, 0, 0, 1000, 30))
         mdia = _mp4_box("mdia", mdhd + hdlr + minf)
         tkhd = _mp4_box("tkhd", b"\x00" * 84)
         trak = _mp4_box("trak", tkhd + mdia)
         mvhd = _mp4_box("mvhd", b"\x00" * 96)
         return _mp4_box("moov", mvhd + trak)
 
-    moov = make_moov(sample_offset_placeholder, len(devc))
+    moov = make_moov(sample_offset_placeholder, len(packets[0]))
     sample_offset = len(moov)
-    moov = make_moov(sample_offset, len(devc))
+    moov = make_moov(sample_offset, len(packets[0]))
     assert len(moov) == sample_offset  # size stable (no offset-dependent length)
-    return moov + devc
+    return moov + payload
 
 
 class TestSyntheticGpmfParsing:
@@ -420,6 +451,116 @@ class TestSyntheticGpmfParsing:
         path.write_bytes(data)
         md = parse_telemetry_file(str(path), fps=30.0)
         assert md.imu_orientation == "ZYX"
+
+    def test_no_stmp_multipacket_spans_whole_timeline(self, tmp_path):
+        """Hero5/6 regression: no STMP in packets + many packets.
+
+        Real Hero6 files (e.g. the 34 s 4k clip) carry one gpmd packet per
+        second WITHOUT any STMP tag. The parser must lay the readings on a
+        uniform grid covering the whole track duration (stts-derived), not
+        collapse every packet onto the first second (timestamp overwrite).
+        """
+        from pygyroflow.telemetry import parse_telemetry_file
+
+        gyro = [(100 * (i % 5) - 200, 300, -50) for i in range(200)]
+        data = build_synthetic_gopro_mp4(
+            gyro, gyro, scale=100, stamp_us=None,
+            n_packets=3, stts_delta_ms=1001.0,
+        )
+        path = tmp_path / "hero6_nostmp.mp4"
+        path.write_bytes(data)
+        md = parse_telemetry_file(str(path), fps=29.97)
+
+        assert len(md.raw_imu) == 600  # 3 packets x 200 readings
+        ts = [r.timestamp_ms for r in md.raw_imu]
+        # Uniform grid over the full 3*1001 ms, not collapsed to <=1 s
+        assert ts[-1] == pytest.approx(5.005 * (600 - 1), abs=1.0)  # 3003/600=5.005ms step
+        assert ts[-1] > 2000.0
+        steps = set(round(b - a, 6) for a, b in zip(ts[:-1], ts[1:]))
+        assert len(steps) == 1  # strictly uniform
+        # data survived: readings of packet 2/3 are present with real values
+        assert md.raw_imu[400].gyro is not None
+        assert md.raw_imu[599].gyro is not None
+
+    def test_stmp_span_derives_grid_step(self, tmp_path):
+        """Hero8-style files (per-packet STMP) derive the step from STMP span.
+
+        Upstream GoPro::get_avg_sample_duration: step = (last STMP - first
+        STMP) / (total readings - last packet's readings). Two packets 1000 ms
+        apart with 200 readings each -> step 1000/200 = 5.0 ms, no stts
+        needed.
+        """
+        from pygyroflow.telemetry import parse_telemetry_file
+
+        gyro = [(100 * (i % 5) - 200, 300, -50) for i in range(200)]
+        data = build_synthetic_gopro_mp4(
+            gyro, gyro, scale=100, stamp_us=[10_000, 1_010_000],
+        )
+        path = tmp_path / "hero8_stmp.mp4"
+        path.write_bytes(data)
+        md = parse_telemetry_file(str(path), fps=30.0)
+        ts = [r.timestamp_ms for r in md.raw_imu]
+        assert len(ts) == 400
+        assert ts[1] - ts[0] == pytest.approx(5.0, abs=0.001)
+        assert ts[-1] == pytest.approx(5.0 * 399, abs=0.1)
+
+    def test_camera_tags_extracted_for_identifier(self, tmp_path):
+        """DEVC-level EISA/VFOV tags feed CameraIdentifier (lens autoload)."""
+        from pygyroflow.telemetry.parser import _parse_gpmf_chunk
+
+        strm = _gpmf_klv("STNM", ord("c"), b"Angular velocity\0\0") + \
+            _gpmf_klv("SCAL", ord("s"), struct.pack(">h", 100)) + \
+            _gpmf_klv("GYRO", ord("s"), struct.pack(">6h", 1, 2, 3, 4, 5, 6), struct_size=6, repeat=2)
+        devc = _gpmf_klv("DEVC", 0,
+                         _gpmf_klv("VFOV", ord("c"), b"W\0\0\0") +
+                         _gpmf_klv("EISA", ord("c"), b"N\0\0\0") +
+                         _gpmf_klv("ZFOV", ord("f"), struct.pack(">f", 100.0)) +
+                         _gpmf_klv("STRM", 0, strm))
+        tags = {}
+        model, g_rows, a_rows, g_count, stamp = _parse_gpmf_chunk(devc, None, tags)
+        assert tags == {"VFOV": "W", "EISA": "N", "ZFOV": pytest.approx(100.0)}
+        assert g_count == 2 and len(g_rows) == 2
+
+        # end-to-end: CameraIdentifier built from these tags hits the DB id
+        from pygyroflow.camera.identifier import CameraIdentifier
+        ident = CameraIdentifier.from_metadata(
+            brand="GoPro", model="HERO6 Black",
+            video_width=2704, video_height=2028, fps=29.97,
+            samples=[{"tag_map": {"Default": tags}}],
+        )
+        assert ident.additional == "NO-EIS"
+        assert ident.lens_info == "Wide"
+        assert ident.identifier == "gopro-hero6black-wide-2704x2028@29970-no-eis"
+        assert ident.get_identifier_for_autoload() == ident.identifier
+
+    def test_untimed_file_falls_back_to_200hz_grid(self, tmp_path):
+        """No STMP and no stts: assume ~200 Hz rather than all-zero times."""
+        from pygyroflow.telemetry import parse_telemetry_file
+
+        gyro = [(100 * (i % 5) - 200, 300, -50) for i in range(20)]
+        data = build_synthetic_gopro_mp4(gyro, gyro, scale=100, stamp_us=None)
+        path = tmp_path / "untimed.mp4"
+        path.write_bytes(data)
+        md = parse_telemetry_file(str(path), fps=30.0)
+        ts = [r.timestamp_ms for r in md.raw_imu]
+        assert len(ts) == 20
+        assert ts[1] - ts[0] == pytest.approx(5.0, abs=0.001)
+
+    @pytest.mark.skipif(
+        not __import__("os").path.isfile("/home/ft/workspace/testvideos/gpmf-11-hero8.mp4"),
+        reason="local Hero8 sample not available",
+    )
+    def test_real_hero8_tail_camera_tags(self):
+        """Real Hero8 file: camera DEVC after the last sample-table entry
+        still yields VFOV/EISA tags and a non-empty lens autoload."""
+        from pygyroflow.manager import StabilizationManager
+
+        mgr = StabilizationManager()
+        mgr.load_video("/home/ft/workspace/testvideos/gpmf-11-hero8.mp4")
+        tags = (mgr.gyro.file_metadata.additional_data or {}).get("camera_tags") or {}
+        inner = tags.get("Default") or tags
+        assert inner.get("VFOV") == "W"
+        assert mgr.lens.calib_dimension.get("w", 0) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -892,3 +1033,302 @@ class TestAutoSync:
         )
         # The offset must actually be stored on the gyro source
         assert len(mgr.gyro.get_offsets()) == 1
+
+
+def _sony_tlv(tag: int, payload: bytes) -> bytes:
+    return struct.pack(">HH", tag, len(payload)) + payload
+
+
+def build_synthetic_sony_mp4(gyro_raw, accl_raw, gyro_scale=65.5, accl_scale=8192.0,
+                             orient_u16=0x420, n_packets=1, stts_delta_ms=100.0) -> bytes:
+    """Build a minimal mp4 with one 'rtmd' track mimicking Sony RTMD."""
+    def make_payload() -> bytes:
+        gyro = struct.pack(">ii", len(gyro_raw), 6) + struct.pack(
+            f">{len(gyro_raw)*3}h", *[v for s in gyro_raw for v in s])
+        accl = struct.pack(">ii", len(accl_raw), 6) + struct.pack(
+            f">{len(accl_raw)*3}h", *[v for s in accl_raw for v in s])
+        tlv = b"".join([
+            _sony_tlv(0xE439, struct.pack(">f", gyro_scale)),
+            _sony_tlv(0xE43A, struct.pack(">H", orient_u16)),
+            _sony_tlv(0xE43B, gyro),
+            _sony_tlv(0xE449, struct.pack(">f", accl_scale)),
+            _sony_tlv(0xE44B, accl),
+            _sony_tlv(0xE40E, struct.pack(">i", 14297)),
+        ])
+        return b"\x00\x1c" + b"\x00" * 0x1A + tlv
+
+    payload = make_payload() * n_packets
+    sample_size = len(payload) // n_packets
+
+    def make_moov(sample_offset: int) -> bytes:
+        stsd_payload = struct.pack(">II", 0, 1) + struct.pack(">I", 16) + b"rtmd" + b"\x00" * 8
+        stsd = _mp4_box("stsd", stsd_payload)
+        stco = _mp4_box("stco", struct.pack(">II", 0, n_packets) +
+                        b"".join(struct.pack(">I", sample_offset + i * sample_size) for i in range(n_packets)))
+        stsz = _mp4_box("stsz", struct.pack(">III", 0, 0, n_packets) + struct.pack(">I", sample_size) * n_packets)
+        stsc = _mp4_box("stsc", struct.pack(">II", 0, 1) + struct.pack(">III", 1, 1, 1))
+        stts = _mp4_box("stts", struct.pack(">II", 0, 1) + struct.pack(">II", n_packets, int(stts_delta_ms)))
+        stbl = _mp4_box("stbl", stsd + stco + stsz + stsc + stts)
+        minf = _mp4_box("minf", stbl)
+        hdlr = _mp4_box("hdlr", b"\x00" * 8 + b"rtmd" + b"\x00" * 12)
+        mdhd = _mp4_box("mdhd", struct.pack(">IIIII", 0, 0, 0, 1000, 30))
+        mdia = _mp4_box("mdia", mdhd + hdlr + minf)
+        tkhd = _mp4_box("tkhd", b"\x00" * 84)
+        trak = _mp4_box("trak", tkhd + mdia)
+        mvhd = _mp4_box("mvhd", b"\x00" * 96)
+        return _mp4_box("moov", mvhd + trak)
+
+    moov = make_moov(0)
+    moov = make_moov(len(moov))
+    return moov + payload
+
+
+class TestSonyRtmdParsing:
+    def test_parse_sony_synthetic(self, tmp_path):
+        from pygyroflow.telemetry import parse_telemetry_file
+        from pygyroflow.telemetry.parser import _sony_read_f16, _sony_orientation
+
+        # Sony decimal f16: 14.0 mm = mantissa 14, exp -3 -> 0xD00E
+        assert _sony_read_f16(struct.pack(">H", 0xD00E)) == pytest.approx(0.014, rel=1e-6)
+        # orientations per upstream comments
+        assert _sony_orientation(struct.pack(">H", 0x152)) == "Yzx"
+        assert _sony_orientation(struct.pack(">H", 0x420)) == "XYZ"
+        assert _sony_orientation(struct.pack(">H", 0x241)) == "xZY"
+
+        gyro = [(655, -482, -650), (646, -473, -700), (643, -477, -730)]
+        accl = [(0x7F00, 0x1000, -0x0040)] * 3
+        data = build_synthetic_sony_mp4(gyro, accl, n_packets=2, stts_delta_ms=100.0)
+        path = tmp_path / "sony.mp4"
+        path.write_bytes(data)
+
+        md = parse_telemetry_file(str(path), fps=30.0)
+        assert md.detected_source == "Sony"
+        assert len(md.raw_imu) == 6  # 2 packets x 3 readings
+        # uniform grid: 200 ms total / 6 readings
+        ts = [r.timestamp_ms for r in md.raw_imu]
+        assert ts[1] - ts[0] == pytest.approx(200.0 / 6.0, abs=1e-6)
+        # values: raw / scale; accel additionally x 9.80665 (unit "g")
+        first = md.raw_imu[0]
+        assert first.gyro[0] == pytest.approx(655 / 65.5, rel=1e-6)
+        assert first.gyro[1] == pytest.approx(-482 / 65.5, rel=1e-6)
+        assert first.accl[0] == pytest.approx(0x7F00 / 8192.0 * 9.80665, rel=1e-6)
+        # orientation: 0x420 = "XYZ" -> normalized swap-XY + invert-Z = "YXz"
+        assert md.imu_orientation == "YXz"
+        assert md.frame_readout_time == pytest.approx(14.297, abs=1e-3)
+
+    @pytest.mark.skipif(
+        not __import__("os").path.isfile("/home/ft/workspace/PreReserach/msGyroFlow/sony-ois-only.MP4"),
+        reason="local Sony sample not available",
+    )
+    def test_real_sony_rx100m7(self):
+        from pygyroflow.telemetry import parse_telemetry_file
+
+        md = parse_telemetry_file(
+            "/home/ft/workspace/PreReserach/msGyroFlow/sony-ois-only.MP4",
+            fps=29.97, video_size=(3840, 2160),
+        )
+        assert md.detected_source == "Sony DSC-RX100M7"
+        assert md.imu_orientation == "zYX"  # 0x152 -> "Yzx" -> normalized
+        assert md.frame_readout_time == pytest.approx(14.297, abs=0.01)
+        ts = [r.timestamp_ms for r in md.raw_imu]
+        assert len(ts) > 20000
+        assert ts[-1] == pytest.approx(11511.5, abs=5.0)  # full 11.5 s span
+        # readable gyro magnitudes (deg/s), not garbage
+        mags = np.array([np.linalg.norm(r.gyro) for r in md.raw_imu[:200] if r.gyro is not None])
+        assert 0.01 < np.median(mags) < 500.0
+
+
+def _insta_varint(v: int) -> bytes:
+    out = b""
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out += bytes([b | 0x80])
+        else:
+            return out + bytes([b])
+
+
+def _insta_pb_str(field: int, s: str) -> bytes:
+    b = s.encode()
+    return _insta_varint((field << 3) | 2) + _insta_varint(len(b)) + b
+
+
+def _insta_pb_varint(field: int, v: int) -> bytes:
+    return _insta_varint((field << 3) | 0) + _insta_varint(v)
+
+
+def _insta_pb_f64(field: int, v: float) -> bytes:
+    return _insta_varint((field << 3) | 1) + struct.pack("<d", v)
+
+
+def _insta_pb_msg(field: int, payload: bytes) -> bytes:
+    return _insta_varint((field << 3) | 2) + _insta_varint(len(payload)) + payload
+
+
+_INSTA_MAGIC = b"8db42d694ccc418790edff439fe026bf"
+_INSTA_HDR = 72
+
+
+def _insta_record(rid: int, fmt: int, payload: bytes) -> bytes:
+    return payload + bytes([fmt, rid]) + struct.pack("<I", len(payload))
+
+
+def build_synthetic_insta360_file(
+    raw_gyro: bool = True,
+    with_offsets_index: bool = True,
+    model: str = "Insta360 OneR",
+) -> bytes:
+    """Build a minimal file with an Insta360 extra-info trailer.
+
+    Mirrors the layout upstream telemetry-parser's insta360 module parses:
+    [prefix][records...][offsets-index record][72-byte header]. extra_size
+    in the header includes the header itself (extra_start = size -
+    extra_size must land on the first record).
+    """
+    if raw_gyro:
+        fft = 1_700_000_123_456_789  # us
+        items = b""
+        for i in range(50):
+            items += struct.pack("<Q", fft + (i + 1) * 5000)
+            items += struct.pack("<6H", 32768 + 2048, 32768, 32768 - 2048,
+                                 32768 + 3277, 32768 - 1640, 32768 + 819)
+    else:
+        fft = 1_700_000_123_456_789_000  # ns for non-raw files
+        items = b""
+        for i in range(20):
+            items += struct.pack("<Q", fft + (i + 1) * 5_000_000)
+            # acc in g, gyro in rad/s (100/-50/25 deg/s)
+            items += struct.pack("<6d", 0.1, 0.0, -0.1,
+                                 1.7453292519943295, -0.8726646259971648, 0.4363323129985824)
+
+    off_v3 = "_".join(str(v) for v in [1, 0.5, 1500, 1500, 1024, 1024, 10, 20, 30,
+                                       0, 0, 0, 0.01, -0.02, 0.005, 1e-05, -1e-05,
+                                       3008, 3008, 0, 0])
+    meta = b""
+    meta += _insta_pb_str(2, model)
+    if raw_gyro:
+        meta += _insta_pb_msg(19, _insta_pb_varint(1, 2048) + _insta_pb_varint(2, 2048))
+        meta += _insta_pb_msg(27, _insta_pb_varint(1, 2048) + _insta_pb_varint(2, 2048)
+                              + _insta_pb_varint(3, 2048) + _insta_pb_varint(4, 2048))
+        meta += _insta_pb_str(54, off_v3)
+    meta += _insta_pb_varint(24, fft)
+    meta += _insta_pb_f64(25, 15.5 if raw_gyro else 12.0)
+    meta += _insta_pb_varint(62, 1 if raw_gyro else 0)
+    if raw_gyro:
+        meta += _insta_pb_msg(65, _insta_pb_varint(1, 16) + _insta_pb_varint(2, 2000))
+
+    meta_rec = _insta_record(1, 0, meta)
+    gyro_rec = _insta_record(3, 0, items)
+    payloads = meta_rec + gyro_rec
+
+    extra = payloads
+    if with_offsets_index:
+        tbl = bytes([1, 0]) + struct.pack("<II", len(meta), 0)
+        tbl += bytes([3, 0]) + struct.pack("<II", len(items), len(meta_rec))
+        extra = payloads + _insta_record(0, 0, tbl)
+
+    header = b"\x00" * 32 + struct.pack("<II", len(extra) + _INSTA_HDR, 1) + _INSTA_MAGIC
+    prefix = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + b"\x00" * 64
+    return prefix + extra + header
+
+
+class TestInsta360Parsing:
+    """Cross-validated against upstream telemetry-parser (Rust) on the same
+    synthetic files: values below are upstream's insta_dump output, not ours."""
+
+    def test_raw_gyro_with_offsets_index(self, tmp_path):
+        from pygyroflow.telemetry import parse_telemetry_file
+
+        path = tmp_path / "sample.insv"
+        path.write_bytes(build_synthetic_insta360_file(raw_gyro=True, with_offsets_index=True))
+        md = parse_telemetry_file(str(path), fps=30.0)
+
+        assert md.detected_source == "Insta360 OneR"
+        assert md.imu_orientation == "Xyz"  # offset_v3 present -> OneR table
+        assert md.frame_readout_time == pytest.approx(15.5)
+        assert len(md.raw_imu) == 50
+
+        first = md.raw_imu[0]
+        # upstream: IMU 5.000000 225.830989 6.533593 -38.482198 4.268593 4.430821 -12.429308
+        assert first.timestamp_ms == pytest.approx(5.0, abs=1e-6)
+        assert first.gyro == pytest.approx([225.830989, 6.533593, -38.482198], abs=1e-5)
+        assert first.accl == pytest.approx([4.268593, 4.430821, -12.429308], abs=1e-5)
+        assert md.raw_imu[49].timestamp_ms == pytest.approx(250.0, abs=1e-6)
+
+        lp = md.lens_profile
+        assert lp is not None
+        assert lp["distortion_model"] == "insta360"
+        assert lp["calib_dimension"] == {"w": 2048, "h": 2048}
+        assert lp["fisheye_params"]["camera_matrix"][0] == pytest.approx(
+            [1500.0, 0.0, 697.1914893617021], abs=1e-6)
+        assert lp["fisheye_params"]["distortion_coeffs"] == pytest.approx(
+            [0.01, -0.02, 0.005, 1e-05, -1e-05, 0.5], abs=1e-12)
+        assert lp["asymmetrical"] is True
+
+    def test_nonraw_gyro_legacy_walk(self, tmp_path):
+        from pygyroflow.telemetry import parse_telemetry_file
+
+        path = tmp_path / "legacy.insv"
+        path.write_bytes(build_synthetic_insta360_file(raw_gyro=False, with_offsets_index=False,
+                                                       model="Insta360 ONE X2"))
+        md = parse_telemetry_file(str(path), fps=30.0)
+
+        assert md.detected_source == "Insta360 ONE X2"
+        assert md.imu_orientation == "xZy"  # no offset_v3 -> ONE X2 legacy table
+        assert md.frame_readout_time == pytest.approx(12.0)
+        assert len(md.raw_imu) == 20
+
+        first = md.raw_imu[0]
+        # upstream: IMU 5000000.000000 100.000000 -50.000000 25.000000 0.980665 0 -0.980665
+        # (non-raw timestamps are ns-sourced; upstream's model keeps x1000 scaling)
+        assert first.timestamp_ms == pytest.approx(5_000_000.0, abs=1e-3)
+        assert first.gyro == pytest.approx([100.0, -50.0, 25.0], abs=1e-6)
+        assert first.accl == pytest.approx([0.980665, 0.0, -0.980665], abs=1e-6)
+        assert md.lens_profile is None  # no offset_v3 -> no inline lens
+
+    @pytest.mark.skipif(
+        not __import__("os").path.isfile("/home/ft/workspace/testvideos/insta360-oner-preview.insv"),
+        reason="local Insta360 sample not available",
+    )
+    def test_real_insv_oner_preview(self):
+        """Real OneR .insv from the insvtools fixtures (736x368 preview, no
+        offset_v3). Upstream telemetry-parser DROPS ALL telemetry on this
+        file (strict loop errors on a 1-byte gyro-record tail, swallowed by
+        .ok()); our tolerant floor-division recovers 1178 samples."""
+        from pygyroflow.telemetry import parse_telemetry_file
+
+        md = parse_telemetry_file(
+            "/home/ft/workspace/testvideos/insta360-oner-preview.insv",
+            fps=29.97, video_size=(736, 368),
+        )
+        assert md.detected_source == "Insta360 OneR"
+        assert md.imu_orientation == "yXZ"  # legacy table (no offset_v3)
+        assert md.frame_readout_time == pytest.approx(22.278, abs=0.01)
+        assert len(md.raw_imu) == 1178
+        import numpy as np
+        amag = np.median([np.linalg.norm(r.accl) for r in md.raw_imu if r.accl is not None])
+        assert amag == pytest.approx(9.80665, rel=0.02)  # static gravity
+        ts = [r.timestamp_ms for r in md.raw_imu]
+        assert ts[0] == pytest.approx(-135.0, abs=5.0)  # gyro precedes video
+
+    def test_inline_lens_profile_loads_into_manager(self, tmp_path):
+        from pygyroflow.telemetry import parse_telemetry_file
+        from pygyroflow.manager import StabilizationManager
+
+        path = tmp_path / "lens.insv"
+        path.write_bytes(build_synthetic_insta360_file(raw_gyro=True, with_offsets_index=True))
+        md = parse_telemetry_file(str(path), fps=30.0)
+
+        mgr = StabilizationManager()
+        mgr._load_lens_from_metadata(md.lens_profile, str(path))
+        assert mgr.lens.calib_dimension["w"] == 2048
+        assert mgr.lens.distortion_model == "insta360"
+        assert mgr.lens.asymmetrical is True
+        # GyroSource-level integration: quaternions computable from the raw IMU
+        from pygyroflow.gyro_source import GyroSource
+        src = GyroSource()
+        src.init_from_params(250.0)
+        src.load_from_telemetry(md)
+        assert len(src.quaternions) > 10
+        assert src.imu_transforms.imu_orientation == "Xyz"

@@ -279,16 +279,12 @@ def _extract_gopro(obj: CameraIdentifier, samples: list[dict[str, Any]]) -> None
 
 
 def _format_focal_length_mm(value: float) -> str:
-    """Format focal length like Rust's {:.2} for f32.
+    """Format focal length like Rust's {:.2}: always two decimals.
 
-    Rust's {:.2} uses *precision*=2, which for floats means 2 significant
-    digits after the decimal for the formatted representation. For whole
-    numbers like 24.0 it prints "24". We match that behaviour.
+    Rust's format!("{:.2}", 24.0f32) prints "24.00" (and Python's :.2f
+    matches); the lens database identifiers use exactly that ("14.00mm").
     """
-    if value == int(value):
-        return f"{int(value)}"
-    # Use up to 2 decimal places, stripping trailing zeros
-    return f"{value:.2f}".rstrip("0").rstrip(".")
+    return f"{value:.2f}"
 
 
 def _extract_sony(obj: CameraIdentifier, samples: list[dict[str, Any]]) -> None:

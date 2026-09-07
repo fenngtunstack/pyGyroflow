@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from argparse import BooleanOptionalAction
 
 log = logging.getLogger(__name__)
 
@@ -70,8 +71,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--autosync",
-        action="store_true",
-        help="Auto-sync gyro to video via optical flow before stabilizing",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Auto-sync gyro to video via optical flow before stabilizing "
+             "(default: on; guards reject low-confidence results and fall "
+             "back to zero offset. Use --no-autosync to skip)",
     )
     parser.add_argument(
         "-v", "--verbose",

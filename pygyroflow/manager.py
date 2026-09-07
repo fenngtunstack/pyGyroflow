@@ -973,17 +973,26 @@ class StabilizationManager:
     def _try_auto_load_lens_profile(self) -> None:
         """Auto-load a lens profile matching the detected camera model.
 
-        Uses the telemetry's detected_source ("GoPro HERO12 Black",
-        "DJI Osmo Nano", ...) and the video aspect ratio: the database
-        search ranks same-aspect calibrations first, mirroring Gyroflow's
-        automatic profile suggestion. Skipped when telemetry already
-        provided a lens profile (e.g. DJI's embedded one).
+        Mirrors upstream's two-step autoload (controller.rs):
+        1. Build a CameraIdentifier from the telemetry's camera tags
+           (GoPro EISA/VFOV, Sony lens info, Insta360 FOV) + resolution +
+           fps, and look the profile up by its exact database identifier
+           (e.g. "gopro-hero6black-wide-2704x2028@29970-no-eis").
+        2. Fall back to a database search re-ranked by calibration-size
+           equality, fps closeness and default-FOV preference — the text
+           search itself only ranks by aspect ratio + alphabeticals, which
+           picks arbitrary fps/resolution variants on tagless files
+           (Hero5/6 write no EISA/VFOV tags).
+
+        Skipped when telemetry already provided a lens profile (e.g. DJI's
+        embedded one).
         """
         # A telemetry-provided lens (non-zero calib dimension) wins.
         if self.lens.calib_dimension.get("w", 0) > 0:
             return
 
-        source = getattr(self.gyro.file_metadata, "detected_source", None) if self.gyro.file_metadata else None
+        md = self.gyro.file_metadata
+        source = getattr(md, "detected_source", None) if md else None
         if not source:
             return
         # Guard against placeholder sources: a bare "Unknown" would
@@ -1006,14 +1015,62 @@ class StabilizationManager:
             return
 
         w, h = self.params.size
-        aspect = (w / h) if w > 0 and h > 0 else None
+        fps = self.params.fps
 
+        # Step 1: exact identifier lookup from telemetry camera tags
+        camera_tags = (md.additional_data or {}).get("camera_tags") if md else None
+        if camera_tags:
+            from pygyroflow.camera.identifier import CameraIdentifier
+
+            ident = CameraIdentifier.from_metadata(
+                brand=words[0],
+                model=" ".join(words[1:]),
+                video_width=w,
+                video_height=h,
+                fps=fps,
+                samples=[{"tag_map": camera_tags}],
+            )
+            for candidate_id in (ident.get_identifier_for_autoload(), ident.identifier):
+                if not candidate_id:
+                    continue
+                profile = self.lens_db.find(candidate_id)
+                if profile is not None and profile.calib_dimension.get("w", 0) > 0:
+                    log.info(
+                        "Auto lens: exact identifier '%s' -> '%s'",
+                        candidate_id, profile.get_display_name(),
+                    )
+                    try:
+                        self.load_lens_profile_by_object(profile)
+                        self._apply_lens_readout_time()
+                        return
+                    except Exception as exc:
+                        log.warning("Auto lens load failed: %s", exc)
+
+            # Near miss (e.g. zoom lens calibrated at 14.60 mm while the
+            # camera reports 14): same brand-model-resolution-fps, nearest
+            # focal length.
+            profile = self._find_identifier_near_miss(ident, w, h, fps)
+            if profile is not None:
+                log.info(
+                    "Auto lens: near-identifier match for '%s' -> '%s'",
+                    ident.identifier, profile.get_display_name(),
+                )
+                try:
+                    self.load_lens_profile_by_object(profile)
+                    self._apply_lens_readout_time()
+                    return
+                except Exception as exc:
+                    log.warning("Auto lens load failed: %s", exc)
+
+        # Step 2: aspect-ratio filtered search, re-ranked for the actual
+        # resolution / frame rate / default FOV.
+        aspect = (w / h) if w > 0 and h > 0 else None
         results = self.lens_db.search(source, aspect_ratio=aspect, limit=50)
         if not results:
             log.info("Auto lens: no match for '%s'", source)
             return
 
-        best = results[0]
+        best = min(results, key=lambda p: self._lens_match_penalty(p, w, h, fps))
         log.info(
             "Auto lens: matched '%s' for '%s' (calib %sx%s)",
             best.get_display_name(), source,
@@ -1021,8 +1078,98 @@ class StabilizationManager:
         )
         try:
             self.load_lens_profile_by_object(best)
+            self._apply_lens_readout_time()
         except Exception as exc:
             log.warning("Auto lens load failed: %s", exc)
+
+    def _find_identifier_near_miss(
+        self, ident: Any, w: int, h: int, fps: float
+    ) -> LensProfile | None:
+        """Find a DB profile for the same brand-model-size-fps at the
+        nearest focal length.
+
+        Zoom lenses are calibrated at their true focal length (e.g. a
+        "14 mm" setting measures 14.60 mm), so the exact identifier built
+        from the camera-reported focal length can miss while a perfectly
+        good calibration exists. Hash- or name-based lens_info tokens are
+        skipped (no focal number to compare).
+        """
+        import re
+
+        fps_int = round(fps * 1000)
+        prefix = f"{ident.brand}-{ident.model}-".lower().replace(" ", "")
+        size_fps = f"-{w}x{h}@{fps_int}"
+        best: tuple[float, LensProfile] | None = None
+        try:
+            own_focal = float(ident.focal_length or 0.0)
+        except (TypeError, ValueError):
+            own_focal = 0.0
+        if own_focal <= 0.0:
+            return None
+
+        for key, prof in self.lens_db.profiles:
+            if not key or not key.lower().startswith(prefix) or not key.lower().endswith(size_fps):
+                continue
+            token = key[len(prefix): -len(size_fps)]
+            m = re.match(r"^(\d+(?:\.\d+)?)\s*mm$", token, re.IGNORECASE)
+            if not m:
+                continue
+            diff = abs(float(m.group(1)) - own_focal)
+            if best is None or diff < best[0]:
+                best = (diff, prof)
+        if best is not None and best[0] <= 1.0:  # within 1 mm
+            return best[1]
+        return None
+
+    @staticmethod
+    def _lens_match_penalty(profile: LensProfile, w: int, h: int, fps: float) -> tuple:
+        """Ranking key for lens auto-match among same-brand candidates.
+
+        Ordered by: aspect-ratio match (the search's own first criterion —
+        a 4:3 calibration must never win over an 8:7 one for 8:7 footage),
+        exact calibration size (then swapped), fps closeness, default-FOV
+        preference (Wide is GoPro's default; Linear/Super are opt-in
+        settings), NO-EIS over EIS variants (a clip we must stabilize most
+        likely has EIS off), then display name.
+        """
+        cw = profile.calib_dimension.get("w", 0)
+        ch = profile.calib_dimension.get("h", 0)
+        if w > 0 and h > 0 and cw > 0 and ch > 0:
+            aspect_rank = 0 if abs((cw / ch) - (w / h)) < 0.01 else 1
+        else:
+            aspect_rank = 1
+        if (cw, ch) == (w, h):
+            size_rank = 0
+        elif (ch, cw) == (w, h):
+            size_rank = 1
+        else:
+            size_rank = 2
+        prof_fps = profile.fps or 0.0
+        fps_diff = abs(prof_fps - fps) if prof_fps > 0 else 999.0
+        name = profile.get_display_name().lower()
+        fov_pref = {"wide": 0, "super": 1, "hyper": 2, "linear": 3, "narrow": 4, "medium": 5, "max": 6}
+        fov_rank = min(
+            (rank for token, rank in fov_pref.items() if token in name),
+            default=7,
+        )
+        eis_rank = 0 if "no-eis" in name else 1
+        return (aspect_rank, size_rank, fps_diff, fov_rank, eis_rank, name)
+
+    def _apply_lens_readout_time(self) -> None:
+        """Apply the loaded lens profile's rolling-shutter readout time.
+
+        Mirrors upstream lib.rs: after autoload, a lens-provided
+        frame_readout_time (e.g. GoPro 11.11 ms) overrides params so RS
+        correction engages even when the file itself carries no SROT tag.
+        """
+        from pygyroflow.types.enums import ReadoutDirection
+
+        fr = self.lens.frame_readout_time
+        if fr is not None and fr != 0.0:
+            self.params.frame_readout_time = abs(fr)
+            self.params.frame_readout_direction = (
+                ReadoutDirection.BottomToTop if fr < 0.0 else ReadoutDirection.TopToBottom
+            )
 
     def load_lens_profile_by_object(self, profile: LensProfile) -> None:
         """Adopt an already-loaded LensProfile (auto-match path)."""
