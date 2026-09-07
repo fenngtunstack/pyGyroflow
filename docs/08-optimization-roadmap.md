@@ -257,3 +257,46 @@ python -m pygyroflow ..\GX010045.MP4 -o out.mp4 --smoothness 0.5   # 真实视�
 **注意**: 官方 CLI 的 `--export-project` 会顺带重渲染覆盖 stabilized.mp4——本次分析中用户 5 月的官方导出被同版本同配置（settings.json 证实 Plain 2.04）重渲染覆盖，质量等价（两类度量均 ~0.1-0.2px/0.6px 级）。
 
 **方法论沉淀**: `tests/decode_gyroflow_project.py`（base91+cbor 解码）、`tests/swap_correction_project.py`（反向编码+官方渲染闭环）、`tests/pixel_jitter.py`（相位相关感知度量）、`tests/per_axis_residual.py`（逐轴分解）。教训：公式级"与上游一致"不等于行为一致——本次 bug 恰在唯一没对照上游的查找函数里；交叉注入（官方数据进我们管线 / 我们数据进官方管线）才是定位分歧的手术刀。
+
+
+## 2026-09-04 Hero6 CLI 防抖失效（用户报告）：遥测时间戳坍缩 + 镜头匹配，Sony 解析器补齐
+
+**用户报告**: `python -m pygyroflow.cli.main <GoPro_Hero_6.MP4>` 输出无防抖效果。
+
+**定位**（对照 extra-04-GoPro-Hero-6.MP4，34s 4k 4:3，官方工程/官方成片齐备）:
+- 裸 CLI 成片像素抖动 p90 5.78 vs 输入 5.86（没稳），官方 0.87
+- 根因一：**GPMF 无 STMP 时时间戳全部坍缩到第 1 秒**。Hero5/6 的 gpmd 包内没有 STMP 标签，`_parse_gpmf_chunk` 以 STMP 为时间基（缺省 0），33 个包叠写 0–995ms，33s 素材只剩最后 1s 的陀螺数据。日志里 `IMU duration 995.1 is different than video duration (34000.6)` 就是线索
+- 根因二：镜头自动匹配排序只有 宽高比+字母序，2704x2028@29.97 的视频匹配到 1440p@23.98fps 的档案；镜头档案的 `frame_readout_time`（11.11ms）也从未接线到 params（RS 校正恒关）
+
+**修复**（全部对照上游 telemetry-parser util.rs `normalized_imu` / gopro mod.rs `get_avg_sample_duration`）:
+1. GoPro 原始 IMU 时间戳改为**全文件均匀网格** `t_i = i × avg_diff`：avg_diff 优先取 GYRO 流 STMP 首末差/(读数-末包读数)，回退 MP4 stts 采样表总时长/读数数；stts/mdhd 解析加入 `_mp4_parse_stbl/_mp4_parse_trak`（DJI 路径复用，行为不变）
+2. `_gopro_derive_orientation` 移到 MINF 机型回退之后（HERO6 的 ZyX 回退此前拿不到机型）
+3. 镜头自动匹配三段式：①CameraIdentifier（EISA/VFOV 等标签→精确档案 ID 直查库）②近失回退（同机型+分辨率+帧率，焦距差 ≤1mm，针对变焦头标定值 14.60 vs 上报 14.00）③重排序回退（宽高比→标定尺寸→帧率→默认 FOV(Wide)→NO-EIS）。GoPro 相机标签 DEVC 写在采样表末尾之外（Hero8/10 实测），加了有界尾部扫描捞回（只取标签，不并入 IMU 数据）
+4. 镜头档案 `frame_readout_time` → params 接线（`_apply_lens_readout_time`，含 ReadoutDirection 枚举）
+5. **Sony RTMD 解析器补齐**（此前 Unknown）：rtmd 轨道 + TLV(0x8300 容器/0x060e UUID)、gyro/accel(0xe43b/0xe44b) raw/scale（accel ×9.80665）、orientation 三 nibble 解码 + Sony normalize（swap XY + 反转 Z）、read_f16（Sony 十进制 f16，非 IEEE）、frame_readout(0xe40e)、XML 型号名、焦距→identifier
+6. `CameraIdentifier` 首次接线到 manager；`_format_focal_length_mm` 修正为 Rust `{:.2}` 语义（恒两位小数，DB id 是 "14.00mm" 不是 "14mm"）
+
+**验证**:
+- 246 passed, 5 skipped（新增 12 个测试：无 STMP 多包、STMP-span、200Hz 回退、标签提取、Sony 合成+真实、镜头排序、readout 接线）
+- 解析矩阵（`tests/verify_multiplatform.py`）: GoPro Hero6/8(BLE)/10/12、DJI、Sony RX100M7/a7sIII 全部拿到全时长陀螺数据 + RS 读出时间 + 镜头匹配（RX100M7 库内无档案除外）+ 合理校正量（中位 0.1°–15°）
+- Hero6 4k 端到端（用户同款命令）：裸 CLI（修复前）中段 p90 5.74 vs 官方 0.87；修复后全片中位 |disp| 0.003px（修复前 0.166），但 p90 仍 5.4——逐窗口排查发现是**时间同步残差**：autosync 找到 41ms（官方工程 49ms），A/B 同窗渲染 offset 41 vs 0 的 p90 4.05 vs 7.24、max 12.7 vs 34.4，确认同步有效但 Hero6 的 1s 粒度 gpmd 均匀网格有 ~8-10ms 固有量化误差。CLI 已把 `--autosync` 改为默认开启（BooleanOptionalAction，可 --no-autosync 关闭）
+
+**多平台最终验证**（像素抖动 |disp|，相位相关 480w）:
+- GoPro Hero6 4k（用户报告文件，官方工程同源）：输入中位 2.76/p90 7.55 → 修复+autosync **0.55/2.84**；官方 0.34/2.77——同级，中段(10-25s) p90 1.80 反超官方 2.00
+- DJI Osmo Nano：输入 1.31/6.22 → **0.21/1.82**（优于此前手工调优终片 final3 的 0.30/3.57）
+- Sony RX100M7（新解析器首战）：输入(6.7s 窗) 3.58/18.47 → **0.83/4.85**；镜头库无该机档案（用默认内参），仍有 ~4x 改善
+- Sony a7sIII/a7IV：解析全时长 + identifier 精确命中镜头档案（a7sIII 14mm 直查、a7M4 近失回退）
+- Insta360：**已移植并三层验证**（extra-info trailer 解析：Offsets 索引/legacy 回退双路径、raw u16/f64 双陀螺格式、protobuf 元数据、offset_v3 内联镜头档案 + 安装角旋转）：
+  1. **合成文件 × 上游 Rust 交叉对照**（Google Drive 被墙拿不到 issue #249 样本）：临时 bin（/tmp/insta-dump，path 依赖本地 telemetry-parser crate）与 Python 移植版对同一合成文件输出**逐位一致**（时间戳/陀螺/加计 6 位小数、镜头矩阵、RS、轴向表），3 测试固化进 TestInsta360Parsing
+  2. **真实 .insv**（GitHub insvtools 仓库测试样片，OneR 736x368）：发现上游严格循环在 gyro 记录尾部残字节上整体崩掉（`?` 传播 + `.ok()` 吞错 → samples=None，官方 Gyroflow 用它同样拿不到陀螺）；移植版改为整除容错后 1178 样本全出，加计模长中位 9.786≈g 精确命中，真实文件 CLI 端到端渲染跑通
+  3. **混合容器端到端**（真实 GoPro 抖动视频 remux 15s + 其真实 200Hz 陀螺/加计以 Insta360 raw u16 格式封装，yXZ 轴预变换往返）：Insta360 全通路（解析→轴向→VQF→平滑→渲染）与原生 GoPro 通路校正四元数差 **0.0017°**；成片中位 2.79→0.56、p90 7.72→3.19（+41ms 同步，与原生同级 0.55/2.84）。教训：早期版本差 8°，根因是 hybrid 构造工具用"姿态差分→重积分"引入往返损耗（管线无责），改存原始传感器数据后归零
+
+**工程备忘**: 4K 输入的 cpu_undistort RS 路径单帧 ~2.4GB 且随帧增长，7GB 内存机器 4K 全片渲染会 OOM（2704x2028 可过、3840x2160 不行）——Sony 全片验证用 200 帧窗口完成；根治属 P2 内存优化
+
+**已知限制**:
+- Insta360 相机原厂完整 .insv（含 offset_v3 内联镜头）未测：真实样片（insvtools fixture）是无 offset_v3 的 OneR 预览流；混合容器验证了数据通路全链，相机原厂文件到位后跑 verify_multiplatform.py 补最后一环
+- autosync 在 450 帧短片段上锁定错误偏移（-254ms，真值 ~41ms）——守卫对短片段弱信号仍有缺口，全片（1019 帧）锁定正确
+- Sony 变焦头焦距上报口径不一（APS-C 模式减半、文件名与遥测不符），近失回退可能选到相邻焦距档案——与上游行为一致
+- GoPro 相机标签尾部扫描是超出上游的增强（上游受采样表约束读不到 Hero8/10 的 VFOV/EISA）；只提取标签、不改动 IMU 数据流
+- GoPro gpmd 末包之后仍有未入表的 DEVC 数据（含相机标签），IMU 网格以采样表为准（与上游一致）
+
