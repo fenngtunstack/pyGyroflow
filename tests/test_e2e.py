@@ -141,7 +141,7 @@ class TestCpuUndistort:
         kp = make_kernel_params()
         m = np.zeros((1, 14), dtype=np.float32)
         m[0, :9] = inv_k_matrix(40.0, 32.0, 24.0, shift_x=-0.5).ravel()
-        out = cpu_undistort(frame, transform_with(m, kp)).astype(np.float64)
+        out = cpu_undistort(frame, transform_with(m, kp), interpolation=0).astype(np.float64)  # analytic bilinear
 
         y, x = np.mgrid[0:48, 0:64]
         # inv_k_matrix(shift_x=s) makes the sampler read u = x - s

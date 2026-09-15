@@ -78,6 +78,13 @@ def main() -> None:
              "back to zero offset. Use --no-autosync to skip)",
     )
     parser.add_argument(
+        "--interpolation",
+        default="lanczos4",
+        choices=["bilinear", "bicubic", "lanczos4"],
+        help="Resampling interpolation (default lanczos4, matches upstream "
+             "Gyroflow; EWA variants fall back to Lanczos4)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -162,6 +169,7 @@ def main() -> None:
                     "bitrate": args.bitrate,
                     "use_gpu": args.gpu,
                     "audio": not args.no_audio,
+                    "interpolation": {"bilinear": 0, "bicubic": 1, "lanczos4": 2}[args.interpolation],
                 },
             )
             log.info("Done: %s", output)

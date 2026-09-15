@@ -240,7 +240,10 @@ def cpu_undistort(
     Args:
         frame: Input frame, shape (H, W, C), dtype uint8 or float32.
         transform: FrameTransform with matrices and kernel_params.
-        interpolation: Ignored; always uses bilinear.
+        interpolation: Upstream Gyroflow interpolation index —
+            0 = Bilinear, 1 = Bicubic, 2 = Lanczos4 (upstream default),
+            3-6 = EWA variants (no OpenCV equivalent, fall back to
+            Lanczos4).
 
     Returns:
         Stabilized output frame, shape (output_H, output_W, C).
@@ -379,10 +382,41 @@ def cpu_undistort(
     if channels == 1:
         border = border[0]
 
-    output = cv2.remap(
-        frame, map_x, map_y, cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=border,
-    )
+    interp_flags = {
+        0: cv2.INTER_LINEAR,
+        1: cv2.INTER_CUBIC,
+        2: cv2.INTER_LANCZOS4,
+        # EWA (3-6): OpenCV has no elliptical weighted average; Lanczos4
+        # is the closest available kernel.
+        3: cv2.INTER_LANCZOS4,
+        4: cv2.INTER_LANCZOS4,
+        5: cv2.INTER_LANCZOS4,
+        6: cv2.INTER_LANCZOS4,
+    }
+    interp_flag = interp_flags.get(int(interpolation), cv2.INTER_LANCZOS4)
+
+    if interp_flag == cv2.INTER_LINEAR:
+        output = cv2.remap(
+            frame, map_x, map_y, cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=border,
+        )
+    else:
+        # Wider kernels (Bicubic ±2 px, Lanczos4 ±8 px) would bleed the
+        # constant border colour into near-edge samples. Replicate the edge
+        # instead, then paint the invalid / out-of-frame pixels with the
+        # background colour afterwards — keeps the BORDER_CONSTANT
+        # semantics of the bilinear path without the fringe.
+        output = cv2.remap(
+            frame, map_x, map_y, interp_flag,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        oob = (src_x < 0) | (src_x >= in_w) | (src_y < 0) | (src_y >= in_h)
+        paint = ~valid | oob
+        if paint.any():
+            if channels == 1:
+                output[paint] = border
+            else:
+                output[paint] = np.array(border, dtype=output.dtype)
     if channels == 1 and output.ndim == 2:
         output = output[:, :, np.newaxis]
     return output

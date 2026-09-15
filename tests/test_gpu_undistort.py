@@ -79,7 +79,7 @@ class TestGpuUndistort:
             frame_readout_time=0.0,
         )
         transform = FrameTransform.at_timestamp(cp, timestamp_ms=100.0, frame=10)
-        cpu_out = cpu_undistort(frame, transform)
+        cpu_out = cpu_undistort(frame, transform, interpolation=0)  # GPU kernel = bilinear
 
         backend = WgpuBackend()
         kp = transform.kernel_params
@@ -122,7 +122,7 @@ class TestGpuUndistort:
             frame_readout_time=0.0,
         )
         transform = FrameTransform.at_timestamp(cp, timestamp_ms=100.0, frame=10)
-        cpu_out = cpu_undistort(frame, transform)
+        cpu_out = cpu_undistort(frame, transform, interpolation=0)  # GPU kernel = bilinear
 
         backend = WgpuBackend()
         kp = transform.kernel_params

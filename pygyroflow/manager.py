@@ -722,6 +722,9 @@ class StabilizationManager:
         codec = options.get("codec", "H.265/HEVC")
         bitrate = options.get("bitrate", 0)
         use_gpu = options.get("use_gpu", False)
+        # Upstream Gyroflow interpolation indices: 0 Bilinear / 1 Bicubic /
+        # 2 Lanczos4 (their default) / 3-6 EWA (fallback to Lanczos4 here).
+        interp_index = int(options.get("interpolation", 2))
 
         proc = FfmpegProcessor()
         info = proc.open_input(input_path)
@@ -795,7 +798,7 @@ class StabilizationManager:
                     distortion_model_wgsl=wgsl,
                 )
 
-            return cpu_undistort(frame_data, transform)
+            return cpu_undistort(frame_data, transform, interpolation=interp_index)
 
         proc.process_frames(stabilize_frame)
 
