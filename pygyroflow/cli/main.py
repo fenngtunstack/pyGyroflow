@@ -86,6 +86,12 @@ def main() -> None:
              "horizon level — most useful for FPV/drone footage",
     )
     parser.add_argument(
+        "--horizon-gravity",
+        action="store_true",
+        help="Horizon lock from accelerometer gravity vectors (needs IMU "
+             "accl data; falls back to quaternion mode without it)",
+    )
+    parser.add_argument(
         "--interpolation",
         default="lanczos4",
         choices=["bilinear", "bicubic", "lanczos4"],
@@ -152,6 +158,8 @@ def main() -> None:
                     lock_pitch=False,
                     pitch=0.0,
                 )
+                if args.horizon_gravity:
+                    mgr.gyro.set_use_gravity_vectors(True)
                 log.info("Horizon lock: %.0f%%", min(100.0, args.horizon_lock))
 
             # Auto-sync gyro timeline to video (optical flow based)

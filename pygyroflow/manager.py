@@ -322,11 +322,27 @@ class StabilizationManager:
         # gravity-vector mode needs an accelerometer series and stays an
         # opt-in enhancement.
         if self.smoothing.horizon_lock.lock_enabled:
+            grav = None
+            use_grav = False
+            if self.gyro.use_gravity_vectors:
+                accl = [imu for imu in self.gyro.raw_imu if imu.accl is not None]
+                if len(accl) >= 3:
+                    grav = {}
+                    for imu in accl:
+                        v = np.asarray(imu.accl, dtype=np.float64)
+                        n = np.linalg.norm(v)
+                        if n > 1e-6:
+                            # accelerometer at rest reads "up" (~+g); the
+                            # gravity mode compares against +Y in sensor frame
+                            grav[int(round(imu.timestamp_ms * 1000.0))] = v / n
+                    use_grav = len(grav) >= 3
+                    if not use_grav:
+                        grav = None
             self.smoothing.horizon_lock.lock(
                 smoothed,
                 org_quats=self.gyro.quaternions,
-                grav=None,
-                use_grav=False,
+                grav=grav,
+                use_grav=use_grav,
                 compute_params=cp,
             )
 

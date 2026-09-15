@@ -67,6 +67,9 @@ class GyroSource:
 
         self.use_gravity_vectors: bool = False
         self.horizon_lock_integration_method: int = 1
+        # Upstream GyroSource::use_gravity_vectors (default off): feed the
+        # accelerometer-derived gravity series into HorizonLock's gravity mode
+        self.use_gravity_vectors: bool = False
 
         self.max_angles: tuple[float, float, float] = (0.0, 0.0, 0.0)  # (pitch, yaw, roll) deg
 
@@ -327,6 +330,10 @@ class GyroSource:
     # ------------------------------------------------------------------
     # Offset management
     # ------------------------------------------------------------------
+
+    def set_use_gravity_vectors(self, v: bool) -> None:
+        """Enable gravity-vector horizon mode (needs accelerometer data)."""
+        self.use_gravity_vectors = bool(v)
 
     def set_offset(self, timestamp_us: int, offset_ms: float) -> None:
         """Set sync offset at a given timestamp."""
