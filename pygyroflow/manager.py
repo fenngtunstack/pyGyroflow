@@ -445,19 +445,58 @@ class StabilizationManager:
             "Auto-sync: analyzing %d frames (%dx%d, %.2fx scale)",
             len(frames), width, height, scale,
         )
-        offset = proc.run(
-            frames,
-            gyro_data,
-            search_range_ms=search_range_ms,
-            sample_count=None,  # already subsampled during extraction
-            progress_callback=progress_callback,
-            quaternions=dict(self.gyro.quaternions) if use_rs else None,
-            frame_readout_time_ms=self.params.frame_readout_time,
+
+        def _run(search_ms: float, prior_ms: float) -> float | None:
+            return proc.run(
+                frames,
+                gyro_data,
+                search_range_ms=search_ms,
+                sample_count=None,  # already subsampled during extraction
+                progress_callback=progress_callback,
+                quaternions=dict(self.gyro.quaternions) if use_rs else None,
+                frame_readout_time_ms=self.params.frame_readout_time,
+                initial_offset_ms=prior_ms,
+            )
+
+        # DJI prior: try a narrow window around +8 ms first — a small search
+        # space cannot accommodate the large flat-landscape mislocks — and
+        # fall back to the full window when the narrow pass yields nothing.
+        offset = None
+        prior = (
+            self._DJI_SYNC_PRIOR_MS
+            if (self.gyro.file_metadata.detected_source or "").startswith("DJI")
+            else None
         )
+        if prior is not None:
+            log.info("Auto-sync: DJI prior, narrow search +/-%.0f ms around %.0f ms",
+                     self._DJI_SYNC_PRIOR_WINDOW_MS / 2, prior)
+            offset = _run(self._DJI_SYNC_PRIOR_WINDOW_MS, prior)
+            if offset is not None and np.isfinite(offset):
+                # the RS fine refinement can wander outside the coarse grid;
+                # an escapee is a flat-landscape artifact, not signal — the
+                # measured prior (two independent DJI samples) is more
+                # trustworthy than a wandering refinement
+                if abs(offset - prior) > self._DJI_SYNC_PRIOR_WINDOW_MS / 2:
+                    log.warning(
+                        "Auto-sync: narrow refinement escaped the prior window "
+                        "(%.1f ms); clamping to the %.0f ms prior",
+                        offset, prior,
+                    )
+                    offset = prior
+            if offset is None or not np.isfinite(offset):
+                log.info("Auto-sync: narrow prior search failed; widening to +/-%.0f ms",
+                         search_range_ms / 2)
+                offset = None
+        if offset is None:
+            offset = _run(search_range_ms, 0.0)
 
         if offset is None or not np.isfinite(offset):
             log.warning("Auto-sync failed to find an offset")
-            return None
+            if prior is not None:
+                offset = prior  # better than 0: every measured DJI sample sits at +8
+                log.warning("Auto-sync: falling back to the DJI prior %.0f ms", prior)
+            else:
+                return None
 
         self.gyro.set_offset(0, float(offset))
         log.info("Auto-sync offset: %.2f ms", offset)
@@ -487,6 +526,12 @@ class StabilizationManager:
     _SYNC_POINT_SEARCH_MS = 120.0
     _SYNC_POINT_MIN_DRIFT_MS = 15.0
     _SYNC_POINT_MAX_RESIDUAL_MS = 10.0
+    # DJI cameras show a consistent ~+8 ms telemetry-vs-video offset
+    # (Osmo Nano autosync lock 7.92 ms, Avata offset sweep optimum +8 ms).
+    # A narrow window around the prior also guards against the FPV
+    # full-range mislocks (Avata full clip: 105 ms on a flat landscape).
+    _DJI_SYNC_PRIOR_MS = 8.0
+    _DJI_SYNC_PRIOR_WINDOW_MS = 40.0
 
     @staticmethod
     def _valid_sync_points(

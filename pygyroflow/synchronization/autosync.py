@@ -86,6 +86,7 @@ class AutosyncProcess:
         progress_callback: Callable[[float], None] | None = None,
         quaternions: dict | None = None,
         frame_readout_time_ms: float = 0.0,
+        initial_offset_ms: float = 0.0,
     ) -> float | None:
         """Run the full automatic synchronization pipeline.
 
@@ -142,6 +143,7 @@ class AutosyncProcess:
         if self._offset_method == 2 and quaternions:
             rs_offset = self._rs_sync_offset(
                 frames, quaternions, frame_readout_time_ms, search_range_ms,
+                initial_offset_ms=initial_offset_ms,
             )
             if rs_offset is not None:
                 if progress_callback:
@@ -159,6 +161,7 @@ class AutosyncProcess:
             gyro_data,
             method=self._offset_method,
             search_range_ms=search_range_ms,
+            initial_offset_ms=initial_offset_ms,
             progress_callback=lambda p: (
                 progress_callback(0.6 + 0.4 * p)
                 if progress_callback
@@ -177,6 +180,7 @@ class AutosyncProcess:
         quaternions: dict,
         frame_readout_time_ms: float,
         search_range_ms: float,
+        initial_offset_ms: float = 0.0,
     ) -> float | None:
         """Run the rolling-shutter-aware offset search.
 
@@ -225,7 +229,7 @@ class AutosyncProcess:
             return None
 
         result = rs.full_sync(
-            initial_delay_ms=0.0,
+            initial_delay_ms=-initial_offset_ms,  # delay = -offset convention
             from_ts_us=min(ts_all),
             to_ts_us=max(ts_all),
             coarse_step_ms=3.0,
