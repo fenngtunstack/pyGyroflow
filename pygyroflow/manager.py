@@ -12,6 +12,7 @@ Python's GIL provides sufficient synchronization for the intended use cases
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -408,7 +409,13 @@ class StabilizationManager:
             log.warning("No gyro quaternions; skipping auto-sync")
             return None
 
-        frames = self._extract_gray_frames(path, sample_count)
+        # Multi-point refinement needs >=10 frames per 1 s window. The frame
+        # cap is a MEMORY bound: 7 GB machines OOM when a long 4K decode and a
+        # ~3000-frame retained list stack on top of the loaded gyro data.
+        want = sample_count
+        if self.params.duration_ms >= 12_000:
+            want = int(max(sample_count, min(1500, self.params.duration_ms / 1000.0 * 10)))
+        frames = self._extract_gray_frames(path, want)
         if len(frames) < 10:
             log.warning("Only %d frames extracted; skipping auto-sync", len(frames))
             return None
@@ -454,7 +461,168 @@ class StabilizationManager:
 
         self.gyro.set_offset(0, float(offset))
         log.info("Auto-sync offset: %.2f ms", offset)
+
+        # Multi-point refinement (upstream auto_sync_points / max_sync_points):
+        # estimate the offset independently on rotation-rich 1 s windows and
+        # keep a piecewise-linear offset curve to absorb gyro/video clock drift.
+        points = self._refine_sync_points(
+            frames, gyro_data, float(offset),
+            quaternions=dict(self.gyro.quaternions) if use_rs else None,
+            frame_readout_time_ms=self.params.frame_readout_time,
+        )
+        if len(points) >= 2:
+            self.gyro.set_offsets(points)
+            vals = [points[k] for k in sorted(points)]
+            log.info(
+                "Auto-sync: %d sync points, %.1f..%.1f ms (span %.1f ms)",
+                len(points), vals[0], vals[-1], vals[-1] - vals[0],
+            )
         return float(offset)
+
+    # Multi-point sync refinement (upstream parity: max_sync_points=5,
+    # time_per_syncpoint=1 s, per-point offsets -> linear drift model).
+    _SYNC_POINT_COUNT = 5
+    _SYNC_POINT_WINDOW_MS = 500.0
+    _SYNC_POINT_MAX_DEVIATION_MS = 40.0
+    _SYNC_POINT_SEARCH_MS = 120.0
+    _SYNC_POINT_MIN_DRIFT_MS = 15.0
+    _SYNC_POINT_MAX_RESIDUAL_MS = 10.0
+
+    @staticmethod
+    def _valid_sync_points(
+        points: dict[int, float],
+        global_offset: float,
+        max_deviation_ms: float = 40.0,
+    ) -> dict[int, float]:
+        """Global point at t=0 plus inliers within max_deviation of it.
+
+        A per-point estimate that lands far from the global offset is an
+        estimator mislock, not drift — drop it.
+        """
+        valid = {0: global_offset}
+        for ts_us, off in sorted(points.items()):
+            if ts_us <= 0 or not math.isfinite(off):
+                continue
+            if abs(off - global_offset) <= max_deviation_ms:
+                valid[ts_us] = off
+            else:
+                log.info(
+                    "Auto-sync: dropping sync point at %.2fs "
+                    "(offset %.1f ms deviates > %.0f ms)",
+                    ts_us / 1e6, off, max_deviation_ms,
+                )
+        return valid
+
+    @staticmethod
+    def _drift_significant(
+        points: dict[int, float],
+        min_total_drift_ms: float = 15.0,
+        max_residual_ms: float = 10.0,
+    ) -> bool:
+        """True when the per-point offsets form a credible linear drift.
+
+        Multi-point offsets only beat a constant when the data shows
+        SYSTEMATIC drift: enough total slope AND small fit residuals.
+        Quantisation noise (GoPro gpmd ±8-10 ms) with one stray point
+        otherwise fakes a ramp that is worse than staying constant.
+        """
+        keys = sorted(points)
+        if len(keys) < 3:
+            return False
+        t = np.asarray(keys, dtype=np.float64)
+        v = np.asarray([points[k] for k in keys], dtype=np.float64)
+        if t[-1] <= t[0]:
+            return False
+        slope, intercept = np.polyfit(t, v, 1)
+        residuals = v - (slope * t + intercept)
+        total_drift = abs(slope) * (t[-1] - t[0])
+        return bool(
+            total_drift >= min_total_drift_ms
+            and np.abs(residuals).max() <= max_residual_ms
+        )
+
+    def _refine_sync_points(
+        self,
+        frames: list,
+        gyro_data: list,
+        global_offset: float,
+        quaternions: dict | None,
+        frame_readout_time_ms: float,
+    ) -> dict[int, float]:
+        """Estimate per-sync-point offsets on rotation-rich windows.
+
+        Returns the validated offset map (>=2 entries when multi-point
+        estimation succeeded and survived outlier rejection).
+        """
+        if self.params.duration_ms < 12_000 or len(frames) < 60:
+            return {}
+
+        from pygyroflow.synchronization import AutosyncProcess
+        from pygyroflow.synchronization.optimsync import OptimSync
+
+        try:
+            ts_ms = np.array([t / 1000.0 for t, _ in gyro_data], dtype=np.float64)
+            w = np.array([g for _, g in gyro_data], dtype=np.float64)
+            points_ms, _rank, _step = OptimSync(ts_ms, w).run(
+                target_sync_points=self._SYNC_POINT_COUNT,
+                trim_ranges_s=[(0.0, self.params.duration_ms / 1000.0)],
+            )
+        except Exception:
+            log.warning("Auto-sync: OptimSync point selection failed", exc_info=True)
+            return {}
+        if len(points_ms) < 2:
+            return {}
+
+        height, width = frames[0][1].shape[:2]
+        camera_matrix = self.lens.get_camera_matrix(size=(width, height))
+        win_us = int(self._SYNC_POINT_WINDOW_MS * 1000)
+        method = 2 if quaternions is not None else 1
+        candidates: dict[int, float] = {}
+
+        for p_ms in points_ms:
+            center_us = int(p_ms * 1000.0)
+            window = [f for f in frames if center_us - win_us <= f[0] <= center_us + win_us]
+            if len(window) < 10:
+                continue
+            try:
+                proc = AutosyncProcess(
+                    camera_matrix=camera_matrix,
+                    fps=self.params.fps,
+                    scaled_fps=self.params.get_scaled_fps(),
+                    of_method=2,
+                    pose_method=0,
+                    offset_method=method,
+                )
+                off = proc.run(
+                    window,
+                    gyro_data,
+                    search_range_ms=self._SYNC_POINT_SEARCH_MS,
+                    sample_count=None,
+                    quaternions=quaternions,
+                    frame_readout_time_ms=frame_readout_time_ms,
+                )
+            except Exception:
+                log.warning(
+                    "Auto-sync: sync-point estimation failed at %.2fs", p_ms, exc_info=True
+                )
+                continue
+            if off is not None and np.isfinite(off):
+                candidates[center_us] = float(off)
+
+        valid = self._valid_sync_points(
+            candidates, global_offset, self._SYNC_POINT_MAX_DEVIATION_MS
+        )
+        if len(valid) < 3:
+            return {}  # two points cannot distinguish drift from noise
+        if not self._drift_significant(
+            valid, self._SYNC_POINT_MIN_DRIFT_MS, self._SYNC_POINT_MAX_RESIDUAL_MS
+        ):
+            log.info(
+                "Auto-sync: per-point offsets show no credible drift; "
+                "keeping constant %.1f ms", global_offset,
+            )
+            return {}
+        return valid
 
     def _extract_gray_frames(
         self,

@@ -392,7 +392,9 @@ class GyroSource:
             time_delta = t1 - t0
             if time_delta == 0:
                 return offsets[t0]
-            fract = (timestamp_us - t0) / time_delta
+            # interpolate with the CLAMPED lookup time — the raw timestamp
+            # would extrapolate without bound past the last sync point
+            fract = (lookup_us - t0) / time_delta
             return offsets[t0] + (offsets[t1] - offsets[t0]) * fract
 
         return 0.0
