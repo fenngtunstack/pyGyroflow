@@ -300,3 +300,17 @@ python -m pygyroflow ..\GX010045.MP4 -o out.mp4 --smoothness 0.5   # 真实视�
 - GoPro 相机标签尾部扫描是超出上游的增强（上游受采样表约束读不到 Hero8/10 的 VFOV/EISA）；只提取标签、不改动 IMU 数据流
 - GoPro gpmd 末包之后仍有未入表的 DEVC 数据（含相机标签），IMU 网格以采样表为准（与上游一致）
 
+
+## 2026-09-14 DJI Avata 偏移扫描：+8ms 最优、DJI 一致偏移假设与度量口径陷阱
+
+**背景**: 配图用 DJI Avata（extra-01-DJI-Avata-4k60.MP4，3840x2160@59.94、143.8s）切段渲染，offset=0 时输出比输入还抖（中段 p90 模长域 11.76 vs 输入 9.12），一度误判为"提升有限"。
+
+**扫描**（tests/sweep_sync_offset.py，7 档 × 1080p 渲染；offset 在四元数查询时修正（`ts -= offset_at_video_timestamp`），一次 load+recompute 服务全部档位，每档只付一次渲染）:
+- input 9.12 | -40: 9.39 | -20: 20.71 | -8: 11.27 | 0: 11.76 | **+8: 6.93** | +20: 7.46 | +40: 10.27（中段 |disp| p90，模长域）
+- 最优 **+8ms**，与 Osmo Nano 的 autosync 锁定值 7.92ms 一致——**DJI 机型疑似存在一致的 ~8ms 遥测-视频偏移**（样本 2，待更多机型验证）
+- Avata 切段渲染方法：遥测/平滑来自整文件，视频喂 pts 保留的纯视频切片（`ffmpeg -ss 25.18 -to 31.5 -i src -map 0:v:0 -c copy -copyts`）——render 的 stabilize_frame 按真实 pts 查陀螺时间轴，正好落在正确窗口；注意 ffmpeg 无法把 djmd 数据流重封装进 mp4（demuxer 报 codec none，显式 `-tag` 也无效），只能切视频流
+
+**度量口径陷阱**: pixel_jitter/verify_multiplatform 的 p90 是**带符号分量混池**（dx、dy 直接混在一起取分位）——素材有恒向平移（云台 Pan）时 dx/dy 符号单边，混池 p90 可低估真实抖动 4 倍以上（同文件：分量混池 1.99 vs 模长域 9.12）。绝对值不可信，同向相对比较仍可用；修复待办：消费端统一改 `hypot(dx,dy)` 模长域（改动小，涉及 pixel_jitter 的三处调用方）
+
+**工具**: tests/make_compare_gif_multi.py（任意平台前后对比 GIF，自动选最抖 3s 窗或 `--window` 手动覆盖，产物 <10MB）；tests/sweep_sync_offset.py（同步偏移扫描）
+
