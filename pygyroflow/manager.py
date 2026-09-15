@@ -315,6 +315,20 @@ class StabilizationManager:
             org_quats=self.gyro.quaternions,
         )
 
+        # Upstream recompute_smoothness(algo, horizon_lock, params) applies
+        # the horizon lock to the SMOOTHED orientations before the correction
+        # quaternions are derived. Quaternion mode (use_grav=False); the
+        # gravity-vector mode needs an accelerometer series and stays an
+        # opt-in enhancement.
+        if self.smoothing.horizon_lock.lock_enabled:
+            self.smoothing.horizon_lock.lock(
+                smoothed,
+                org_quats=self.gyro.quaternions,
+                grav=None,
+                use_grav=False,
+                compute_params=cp,
+            )
+
         # Upstream gyro_source.rs recompute_smoothness(): after smoothing,
         # store the CORRECTION quaternion sm^-1 * org, not the smoothed
         # orientation itself. FrameTransform composes it with the org

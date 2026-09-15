@@ -78,6 +78,14 @@ def main() -> None:
              "back to zero offset. Use --no-autosync to skip)",
     )
     parser.add_argument(
+        "--horizon-lock",
+        type=float,
+        default=0.0,
+        metavar="PERCENT",
+        help="Horizon lock strength 0-100 (default 0=off); keeps the "
+             "horizon level — most useful for FPV/drone footage",
+    )
+    parser.add_argument(
         "--interpolation",
         default="lanczos4",
         choices=["bilinear", "bicubic", "lanczos4"],
@@ -137,6 +145,14 @@ def main() -> None:
 
             # Configure smoothing
             mgr.smoothing.current().set_parameter("smoothness", args.smoothness)
+            if args.horizon_lock > 0.0:
+                mgr.smoothing.horizon_lock.set_horizon(
+                    lock_percent=min(100.0, args.horizon_lock),
+                    roll=0.0,
+                    lock_pitch=False,
+                    pitch=0.0,
+                )
+                log.info("Horizon lock: %.0f%%", min(100.0, args.horizon_lock))
 
             # Auto-sync gyro timeline to video (optical flow based)
             if args.autosync:

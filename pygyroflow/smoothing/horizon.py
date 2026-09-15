@@ -56,7 +56,8 @@ def _lock_horizon_angle(
     if lock_pitch:
         pitch = pitch_correction
     else:
-        pitch = math.asin(-test_vec[2])
+        # clamp against float drift beyond [-1, 1] (asin domain)
+        pitch = math.asin(max(-1.0, min(1.0, -test_vec[2])))
 
     # Extract yaw: atan2(y, x)
     yaw = math.atan2(test_vec[1], test_vec[0])
