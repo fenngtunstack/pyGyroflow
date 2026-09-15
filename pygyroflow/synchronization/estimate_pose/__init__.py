@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 # 0 = FindEssentialMat, 1 = Almeida (not ported), 2 = EightPoint, 3 = Homography
 _METHOD_MAP = {
     0: "essential_matrix",
+    1: "almeida",
     2: "eight_point",
     3: "homography",
 }
@@ -41,6 +42,7 @@ def estimate_rotation(
     curr_pts: npt.NDArray[np.float32],
     camera_matrix: npt.NDArray[np.float64],
     method: int = 0,
+    size_wh: tuple[float, float] | None = None,
 ) -> np.ndarray | None:
     """Estimate the 3x3 rotation matrix between two frames.
 
@@ -59,6 +61,14 @@ def estimate_rotation(
     3x3 rotation matrix (ndarray, float64) or None on failure.
     """
     method_name = _METHOD_MAP.get(method, "essential_matrix")
+
+    if method_name == "almeida":
+        from .almeida import estimate_pose_almeida
+
+        if size_wh is None:
+            # principal point centred on typical sensors: w ~ 2*cx, h ~ 2*cy
+            size_wh = (2.0 * float(camera_matrix[0, 2]), 2.0 * float(camera_matrix[1, 2]))
+        return estimate_pose_almeida(prev_pts, curr_pts, camera_matrix, size_wh)
 
     if method_name == "eight_point":
         result = estimate_pose_eight_point(prev_pts, curr_pts, camera_matrix)
