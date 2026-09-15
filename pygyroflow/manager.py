@@ -102,9 +102,10 @@ class StabilizationManager:
         self.params.duration_ms = duration_ms
         self.params.size = video_size
 
-        # Short videos use Complementary filter for stability
-        if duration_ms < 10000.0:
-            self.gyro.integration_method = 1  # Complementary
+        # Note: no short-clip integrator demotion — a 9 s Hero6 clip A/B
+        # (offset fixed at the measured optimum) showed VQF at least as
+        # stable as Complementary (p90 5.72 vs 6.70, mid-p90 9.03 vs 9.05),
+        # and upstream Gyroflow always defaults to VQF.
 
         self.keyframes.clear()
 

@@ -37,7 +37,10 @@ class TestStabilizationManagerInitFromVideo:
         assert mgr.params.duration_ms == 10000.0
         assert mgr.params.size == (1920, 1080)
 
-    def test_short_video_uses_complementary(self):
+    def test_short_video_keeps_vqf(self):
+        # the <10s Complementary demotion was removed: a 9 s Hero6 A/B
+        # showed VQF at least as stable (p90 5.72 vs 6.70), matching
+        # upstream's always-VQF default
         mgr = StabilizationManager()
         mgr.init_from_video_data(
             duration_ms=5000.0,  # < 10s
@@ -45,7 +48,7 @@ class TestStabilizationManagerInitFromVideo:
             frame_count=150,
             video_size=(1920, 1080),
         )
-        assert mgr.gyro.integration_method == 1  # Complementary
+        assert mgr.gyro.integration_method == 2  # VQF (upstream default)
 
     def test_long_video_keeps_default(self):
         mgr = StabilizationManager()
