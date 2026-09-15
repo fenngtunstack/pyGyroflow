@@ -876,11 +876,13 @@ class StabilizationManager:
                 - bitrate: Bitrate in Mbps (0 = auto)
                 - audio: Copy audio streams to the output (default: True)
                 - use_gpu: Whether to use GPU acceleration (default: False).
-                  The GPU (wgpu) undistort path is verified on hardware
-                  (Intel UHD 630 / Vulkan): identity bit-exact vs CPU,
-                  ~6.5x faster per frame (78 vs 505 ms at 1280x1120),
-                  end-to-end render ~2.4x. CPU remains the default;
-                  opt in for speed.
+                  The GPU (wgpu) undistort path is numerically verified:
+                  identity bit-exact vs CPU bilinear (also under lavapipe).
+                  Speedup depends on the Vulkan implementation: real
+                  hardware (Intel UHD 630) measured ~6.5x per frame
+                  (78 vs 505 ms at 1280x1120), end-to-end ~2.4x; a
+                  lavapipe software Vulkan yields only ~2.2x. CPU remains
+                  the default; opt in for speed.
         """
         options = options or {}
 

@@ -8,8 +8,8 @@ pyGyroFlow 是 Gyroflow（Rust）核心防抖算法的 **Python 完整移植**�
 
 诚实约束（这些是已知事实，不要在文档/对外宣称里夸大）：
 - **数值一致性**：5 个 IMU 积分器与 Rust 移植版（`msgyro-imu-integration`）数值一致（max_err < 1e-14）；**VQF 暂无 Rust 对照**。golden 基准来自 Rust 移植版，**未与上游 Gyroflow 逐帧/逐像素验证**。
-- **GPU 路径**：wgpu undistort 的 uint8/RGB 路径**已知损坏**（pack/unpack 契约错误），默认关闭（`use_gpu=False`），仅作实验性 opt-in。
-- **STMap 导入损坏**：`stmap/exporter.py` 导入的 `_rotate_and_distort` 已被重构改名（`_vectorized_rotate_distort`），整个 `pygyroflow.stmap` 模块当前不可导入（smoke 测试 xfail 跟踪）。
+- **GPU 路径**：wgpu undistort 的 uint8/RGB 路径**已修复并验证**（cf41506）——identity 与非零鱼眼系数下与 CPU bilinear **逐位一致**（`test_gpu_undistort.py`，2026-09-15 复测 max diff=0）。默认仍 CPU（`use_gpu=False`），`--gpu` opt-in。加速比依赖 Vulkan 实现：本机 lavapipe 软件渲染实测 ~2.2x（1280x1120，465→207 ms/帧），代码注释中 ~6.5x 为真硬件（Intel UHD 630）数字，lavapipe 环境复现不了。
+- **STMap**：此前"导入损坏"的记录已过时——模块当前可导入、`STMapExporter` 可构造、smoke 测试全部通过（原 xfail 已消除）。功能级（实际导出 stmap 文件）验证仍薄。
 - **测试覆盖**：核心算法模块有测试；`synchronization`/`telemetry`/`calibration`/`cli`/`gui` 已加 smoke 测试，但功能测试仍薄。
 
 ## ⚠️ 工作区 inode 损坏（重要）
@@ -20,6 +20,12 @@ pyGyroFlow 是 Gyroflow（Rust）核心防抖算法的 **Python 完整移植**�
 - 测行数/跑 lint 必须用 `git show HEAD:<file> | wc -l`，不要直接 `wc -l`。
 - 在干净的 CI clone 里不会出现此问题（git checkout 出来的 inode 正常）。
 - 这是工作区文件系统层面的脏状态，不在版本控制内，git 仓库内容本身是干净的。
+
+**2026-09-15 升级：页缓存级内容腐化**。上述 stat 损坏在重 I/O 负载（全天 4K 渲染）后升级为跨文件、读法相关的内容不一致：
+- 同一文件 `grep`（整块读）、`sed`（行读）、Python `read()` 可给出**三种不同内容**；连 Python 解释器加载模块都会编译到丢行的坏版本（症状：幽灵 NameError / ImportError）。
+- dmesg 无 I/O 错误——是缓存页损坏，不是盘坏。此时**没有单一可靠的读法**，不要试图"找到对的读法继续打补丁"。
+- 自救（按有效性排序）：① `git fetch origin` 重新拉对象 + `git checkout origin/main -- <file>` 还原——网络重传字节是唯一可信基线；② `os.posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED)` 逐文件驱逐缓存页（部分有效）；③ 改文件后必须三读一致才算数（sed 逐行 + Python 整读 + `py_compile`），并删对应 `__pycache__`。
+- 警惕误建的近似文件名（如 `test_gpu_undisort.py` vs `test_gpu_undistort.py`）——pytest 会一起收集，同名测试类互相污染状态，产生"全量挂、单跑过"的假象。
 
 ## 目录约定
 
