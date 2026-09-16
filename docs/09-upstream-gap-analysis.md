@@ -395,6 +395,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | A-07 `splines.rs`（CatmullRom + BivariateSpline） | `8bfa9e1` | 上游 Rust 原样跑参照，17 用例 108 个数值逐位相等；顺带查出参照跨编译不可复现（1 ULP），生成脚本改用容差比较并把这条写进 fixture 的 `_provenance` |
 | D-08 焦距平滑（两个滤波器 + strength 映射 + fov 补偿 + FOV 缓存键） | `cb606bb` | **与上游 Rust 逐位一致**：上游 `focal_length.rs` 原样拷进临时 crate、只新写 `main()`，22 个用例全 `max_rel = 0.0`；生成脚本复现的驱动脚本与实跑逐字节相同，fixture 明确标注非自生成。接线在恒等陀螺下按 `矩阵[0,0] = fov/相机fx` 的比值断言补偿量本身 |
 | D-06（家族本身）`at_timestamp_for_points` + `undistort_points*` 七个函数 | `c7cbf1f` | 45 项测试。级联顺序用「把某一级的输出当下一级的输入、结果不变」断言（数字镜头、mesh），不重推畸变数学——那部分由 `test_distortion_models.py`/`test_distortion_cv2_parity.py` 覆盖。未收敛点的 `(-1000000,-1000000)` 哨兵用 `k1=-0.5`、归一化半径 1.0 触发（实测该点 10 次迭代不收敛），并断言只有失败的那个点进哨兵。变异检查：把 `_partial_correction` 换成恒等函数，`test_zero_correction_redistorts_the_point_back_where_it_started` 立刻失败 |
+| 补缺模型 `gopro6_superview`（此前静默回落成鱼眼） | `b718511` | 上游 `gopro6_superview.rs` 逐字节副本编译后跑出的 46 个参照值全部对上；容差按实测取（undistort 1.05e-7 / distort 1.14e-6 相对，来源是上游 f32、此处 f64），另有一条 2e-6 的聚合断言防漂移。两个探针钉住「看起来像 bug」的上游行为：`(100,900)` 需要 22 步而上游 12 步封顶（用「多项式被调用几次 == 12」断言，并断言返回值出自 fixture）；`(200,200)` 的原像在画面外约 -57 px（同时断言 undistort 能回来）。另断言两个 superview 在 1440 px 处结果不同（rel 1e-4）——把两者混为一个是这条缺陷的失效模式 |
 
 **实施中新发现的、原清单没有的缺陷**：
 
@@ -424,7 +425,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 
 **做 D-06 时新发现的缺陷**：
 
-- **`gopro6_superview` 这个畸变模型在本移植里根本不存在，却被两处代码当成存在**。上游有独立文件 `distortion_models/gopro6_superview.rs`（自带 `id() -> "gopro6_superview"`，多项式与 `gopro_superview` 不同，走 `1.0 - 0.48*|x|` 那一支）；本移植 `distortion_models/` 下没有它，`_MODEL_REGISTRY`（`distortion_models/__init__.py:57-67`）也没有这一项。而 `_MODEL_REGISTRY.get(name, OpenCVFisheyeModel)` 的兜底是**静默回落到 OpenCVFisheye**——一个完全不同的模型。可 `lens/profile.py` 自己认得这个名字：`_DISTORTION_MODEL_IDS` 里有 `"gopro6_superview": 7`（`profile.py:30`），`get_all_matching_profiles` 的标定尺寸重标定分支也专门把它和 `gopro_superview` 并列（`profile.py:558`）。所以带 `digital_lens: "gopro6_superview"` 的镜头档一路走到 `from_name` 就变成鱼眼模型，不报错、不出警告。这条是从 D-06 的数码镜头分支里牵出来的——`cpu_undistort.py` 的 0.91 修正按上游同时匹配 `"gopro_superview"` 与 `"gopro6_superview"`，但后者在这个移植里永远取不到。
+- **`gopro6_superview` 这个畸变模型在本移植里根本不存在，却被两处代码当成存在**。上游有独立文件 `distortion_models/gopro6_superview.rs`（自带 `id() -> "gopro6_superview"`，多项式与 `gopro_superview` 不同，走 `1.0 - 0.48*|x|` 那一支）；本移植 `distortion_models/` 下没有它，`_MODEL_REGISTRY`（`distortion_models/__init__.py:57-67`）也没有这一项。而 `_MODEL_REGISTRY.get(name, OpenCVFisheyeModel)` 的兜底是**静默回落到 OpenCVFisheye**——一个完全不同的模型。可 `lens/profile.py` 自己认得这个名字：`_DISTORTION_MODEL_IDS` 里有 `"gopro6_superview": 7`（`profile.py:30`），`get_all_matching_profiles` 的标定尺寸重标定分支也专门把它和 `gopro_superview` 并列（`profile.py:558`）。所以带 `digital_lens: "gopro6_superview"` 的镜头档一路走到 `from_name` 就变成鱼眼模型，不报错、不出警告。这条是从 D-06 的数码镜头分支里牵出来的——`cpu_undistort.py` 的 0.91 修正按上游同时匹配 `"gopro_superview"` 与 `"gopro6_superview"`，但后者在这个移植里永远取不到。**已补（`b718511`）**：`gopro6_superview.py` 逐行移植 + 注册 + 以上游 Rust 原样跑出的参照 fixture。这条也说明「兜底不报错」这个设计在上游和我们这里是一样的，缺模型时**没有任何信号**——`_DISTORTION_MODEL_IDS` 里那个 7 是不是该有独立值，尚无从确证，未动。
 
 **原清单中经复核被推翻的结论**：
 
