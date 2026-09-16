@@ -50,6 +50,7 @@ class FfmpegProcessor(VideoProcessor):
         self._input_stream: object | None = None
         self._output_stream: object | None = None
         self._input_info: dict | None = None
+        self._image_sequence = None
         self._frame_index: int = 0
         self._audio_pairs: list = []
 
@@ -61,8 +62,15 @@ class FfmpegProcessor(VideoProcessor):
     def input_info(self) -> dict | None:
         return self._input_info
 
-    def open_input(self, path: str) -> dict:
-        """Open an input video and return its metadata."""
+    def open_input(self, path: str, fps: float | None = None) -> dict:
+        """Open an input video (or image sequence) and return its metadata.
+
+        *path* may be an image sequence — a directory, a printf pattern like
+        ``shots/frame_%04d.exr``, or a single frame.  FFmpeg's image2 demuxer
+        takes those as a pattern plus ``start_number``/``framerate`` options,
+        so the sequence is resolved to that form here and *fps* supplies the
+        rate (sequences have none of their own).
+        """
         try:
             import av  # type: ignore[import-untyped]
         except ImportError as exc:
@@ -70,8 +78,24 @@ class FfmpegProcessor(VideoProcessor):
                 "PyAV is required for video I/O. Install with: pip install av"
             ) from exc
 
+        from pygyroflow.rendering.image_sequence import (
+            format_options,
+            looks_like_image_sequence,
+            resolve_image_sequence,
+        )
+
+        sequence = resolve_image_sequence(path) if looks_like_image_sequence(path) else None
+        self._image_sequence = sequence
+
         try:
-            self._input_container = av.open(path)
+            if sequence is not None:
+                self._input_container = av.open(
+                    sequence.pattern,
+                    format="image2" if sequence.is_sequence else None,
+                    options=format_options(sequence, fps),
+                )
+            else:
+                self._input_container = av.open(path)
         except av.error.InvalidDataError as exc:
             raise VideoIOError(f"Cannot open video file: {path}") from exc
 
@@ -98,15 +122,18 @@ class FfmpegProcessor(VideoProcessor):
         elif self._input_container.duration is not None:
             duration_ms = float(self._input_container.duration) / 1000.0
 
+        frame_count = self._input_stream.frames or 0
+        if sequence is not None:
+            # image2 reports no frame count; the files on disk are the truth.
+            frame_count = sequence.frame_count
+            if duration_ms <= 0 and fps > 0:
+                duration_ms = frame_count / fps * 1000.0
+
         info = {
             "width": self._input_stream.width,
             "height": self._input_stream.height,
             "fps": fps,
-            "frames": (
-                self._input_stream.frames
-                if self._input_stream.frames
-                else 0
-            ),
+            "frames": frame_count,
             "duration": duration_ms,
             "codec": (
                 self._input_stream.codec_context.name

@@ -150,13 +150,13 @@ pygyroflow/
 ├── zooming/                  # Layer 2: 3 文件, 695 行
 ├── synchronization/          # Layer 3: 16 文件, 2292 行
 ├── gpu/                      # Layer 3: 5 文件 + shaders, 539 行
-├── rendering/                # Layer 3: 5 文件, 647 行
+├── rendering/                # Layer 3: 6 文件, 1107 行
 ├── telemetry/                # Layer 3: 3 文件, 209 行
 ├── camera/                   # Layer 4: 2 文件, 454 行
 ├── calibration/              # Layer 4: 2 文件, 611 行
 ├── stmap/                    # Layer 4: 2 文件, 522 行
 ├── gui/                      # Layer 5: 7 文件, 963 行
-├── cli/                      # Layer 5: 2 文件, 141 行
-├── manager.py                # 协调器, 606 行
+├── cli/                      # Layer 5: 2 文件, 246 行
+├── manager.py                # 协调器, 1571 行
 └── ...                       # 其他辅助模块
 ```

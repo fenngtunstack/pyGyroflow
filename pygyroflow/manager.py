@@ -109,29 +109,38 @@ class StabilizationManager:
 
         self.keyframes.clear()
 
-    def load_video(self, path: str) -> dict:
-        """Load a video file and extract telemetry.
+    def load_video(self, path: str, fps: float | None = None) -> dict:
+        """Load a video (or image sequence) and extract telemetry.
 
-        Opens the video, reads metadata, extracts gyro data,
-        and auto-detects lens profile if possible.
+        Opens the input, reads metadata, extracts gyro data, and auto-detects
+        a lens profile if possible.
 
         Args:
-            path: Path to the video file.
+            path: Video file, or an image sequence (directory, printf pattern
+                such as ``shots/frame_%04d.exr``, or a single frame).
+            fps: Frame rate to assume for an image sequence.  Sequences carry
+                no rate of their own; without this FFmpeg assumes 25 fps and
+                the gyro timeline runs at the wrong speed.  Ignored for video.
 
         Returns:
-            Dict with video metadata (width, height, fps, duration_ms, frame_count).
+            Dict with video metadata (width, height, fps, duration_ms,
+            frame_count, image_sequence).
 
         Raises:
-            VideoIOError: If the video cannot be opened.
+            VideoIOError: If the input cannot be opened.
             TelemetryParseError: If telemetry parsing fails.
         """
         import os
 
-        if not os.path.isfile(path):
+        from pygyroflow.rendering.image_sequence import looks_like_image_sequence
+
+        if not os.path.isfile(path) and not looks_like_image_sequence(path):
+            # A directory or printf pattern is not a file; only image
+            # sequences get a second chance.
             raise VideoIOError(f"File not found: {path}")
 
         # Try to get video metadata via PyAV
-        video_info = self._get_video_info(path)
+        video_info = self._get_video_info(path, fps=fps)
 
         if video_info["width"] <= 0 or video_info["height"] <= 0 or video_info["duration_ms"] <= 0:
             raise VideoIOError(f"Invalid video metadata: {video_info}")
@@ -144,8 +153,23 @@ class StabilizationManager:
 
         self.init_from_video_data(duration_ms, fps, frame_count, (width, height))
 
-        # Load gyro data from telemetry
-        self.load_gyro_data(path, is_video=True, index=0)
+        sequence = video_info.get("image_sequence")
+        if sequence is not None:
+            self.input_file.image_sequence_fps = fps
+            self.input_file.image_sequence_start = sequence.start_number
+            log.info(
+                "Image sequence: %d frame(s) from %s starting at %d, %.2f fps",
+                sequence.frame_count, sequence.pattern,
+                sequence.start_number, fps,
+            )
+            if not sequence.is_sequence:
+                log.info("Single still image input — output will be a one-frame video")
+            # Frames carry no telemetry; a separate gyro source must be
+            # supplied by the caller (manager.load_gyro_data with a real
+            # telemetry file), otherwise only lens correction applies.
+        else:
+            # Load gyro data from telemetry
+            self.load_gyro_data(path, is_video=True, index=0)
 
         # Try to auto-load lens profile
         self._try_auto_load_lens_profile()
@@ -708,19 +732,46 @@ class StabilizationManager:
     ) -> list[tuple[int, Any]]:
         """Decode a subsampled, downscaled sequence of grayscale frames.
 
+        Accepts an image sequence as well as a video, so auto-sync works for
+        sequence input that pairs a separate gyro source.
+
         Returns [(timestamp_us, gray_u8), ...] with real container pts.
         """
         import av
         import cv2
 
+        from pygyroflow.rendering.image_sequence import (
+            FFMPEG_DEFAULT_FPS,
+            format_options,
+            looks_like_image_sequence,
+            resolve_image_sequence,
+        )
+
         frames: list[tuple[int, Any]] = []
 
-        container = av.open(path)
+        sequence = resolve_image_sequence(path) if looks_like_image_sequence(path) else None
+        seq_fps = self.input_file.image_sequence_fps or None
+        if sequence is not None and not seq_fps:
+            log.warning(
+                "Image sequence has no frame rate; assuming FFmpeg's default "
+                "%.0f fps for auto-sync", FFMPEG_DEFAULT_FPS,
+            )
+        container = (
+            av.open(
+                sequence.pattern,
+                format="image2" if sequence.is_sequence else None,
+                options=format_options(sequence, seq_fps),
+            )
+            if sequence is not None
+            else av.open(path)
+        )
         try:
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
             fps = float(stream.average_rate or 30.0)
             frame_count = stream.frames or int(fps * 60.0)
+            if sequence is not None:
+                frame_count = sequence.frame_count
             every = max(1, frame_count // max(1, sample_count))
 
             scale = min(1.0, max_width / max(1, stream.width))
@@ -973,7 +1024,12 @@ class StabilizationManager:
         interp_index = int(options.get("interpolation", 2))
 
         proc = FfmpegProcessor()
-        info = proc.open_input(input_path)
+        # Image sequences carry no frame rate: the one resolved at load time
+        # (--fps) must be repeated here or the frames would be re-timed.
+        info = proc.open_input(
+            input_path,
+            fps=getattr(self.input_file, "image_sequence_fps", 0.0) or None,
+        )
 
         width = info.get("width", self.params.size[0])
         height = info.get("height", self.params.size[1])
@@ -1447,15 +1503,40 @@ class StabilizationManager:
             self.lens.path_to_file = source_path
             self.lens.resolve_interpolations(self.lens_db)
 
-    def _get_video_info(self, path: str) -> dict:
-        """Extract video metadata using PyAV."""
+    def _get_video_info(self, path: str, fps: float | None = None) -> dict:
+        """Extract video metadata using PyAV.
+
+        *path* may be an image sequence (directory, printf pattern or single
+        frame).  Those carry no frame rate, so *fps* overrides the container's
+        — FFmpeg would otherwise assume 25 fps and put the gyro timeline at
+        the wrong speed.  The frame count comes from the files on disk, since
+        the image2 demuxer reports a duration but no frame count.
+        """
+        from pygyroflow.rendering.image_sequence import (
+            format_options,
+            looks_like_image_sequence,
+            resolve_image_sequence,
+        )
+
+        sequence = resolve_image_sequence(path) if looks_like_image_sequence(path) else None
         try:
             import av
 
-            container = av.open(path)
+            if sequence is not None:
+                container = av.open(
+                    sequence.pattern,
+                    format="image2" if sequence.is_sequence else None,
+                    options=format_options(sequence, fps),
+                )
+            else:
+                container = av.open(path)
             stream = container.streams.video[0]
 
-            fps = float(stream.average_rate)
+            container_fps = float(stream.average_rate)
+            # A caller-supplied rate only speaks for image sequences — a video
+            # container knows its own rate, and overriding it would put the
+            # gyro timeline at the wrong speed.
+            effective_fps = float(fps) if (fps and sequence is not None) else container_fps
             duration_s = float(stream.duration * stream.time_base) if stream.duration else 0.0
             if duration_s <= 0:
                 duration_s = float(container.duration) / 1_000_000 if container.duration else 0.0
@@ -1463,19 +1544,28 @@ class StabilizationManager:
             width = stream.codec_context.width
             height = stream.codec_context.height
             frame_count = stream.frames
-            if frame_count <= 0 and fps > 0 and duration_s > 0:
-                frame_count = int(duration_s * fps)
+            if sequence is not None:
+                # image2 reports frames=0 but knows the duration; the on-disk
+                # count is the authoritative one (and the only one available
+                # for a single still, where duration is None).
+                frame_count = sequence.frame_count
+                duration_s = frame_count / effective_fps if effective_fps > 0 else duration_s
+            elif frame_count <= 0 and container_fps > 0 and duration_s > 0:
+                frame_count = int(duration_s * container_fps)
 
             container.close()
 
             return {
                 "width": width,
                 "height": height,
-                "fps": fps,
+                "fps": effective_fps,
                 "duration_ms": duration_s * 1000.0,
                 "frame_count": frame_count,
+                "image_sequence": sequence,
             }
         except ImportError:
             raise VideoIOError("PyAV (av) is required for video loading")
+        except VideoIOError:
+            raise
         except Exception as exc:
             raise VideoIOError(f"Failed to open video {path}: {exc}")

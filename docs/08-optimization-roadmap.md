@@ -365,3 +365,35 @@ python -m pygyroflow ..\GX010045.MP4 -o out.mp4 --smoothness 0.5   # 真实视�
 - 目录源完整性未校验：被中断的 `git clone` 若留下非空残目录，会遮蔽内置快照（`git clone` 自身失败会清理目标目录，风险低但未加固）。
 - 内置快照版本 41 与上游当前 latest 相同（2026-07-28 发布）——本次同步机制上线时数据本就是最新的，收益体现在**下一次**上游更新。
 - 上游 `compatible_settings` 里的 `sync_settings` 合并在 Python 版 `get_all_matching_profiles` 中未实现（与本次改动无关，逐行核对时发现）。
+
+
+## 2026-09-16 EXR/PNG 序列输入（P4 清单第二项）
+
+**上游做法**（`src/controller.rs`）: 图像序列完全交给 FFmpeg 的 `image2` demuxer——路径就是 printf 模式串（`/shots/frame%04d.exr`），外加两个 avformat 选项 `start_number` 和 `framerate`（`image_sequence_start` / `image_sequence_fps`）。解码出来的就是普通视频帧，管线其余部分不动。
+
+**实测确认的前提**（先验证再动手）:
+- PyAV `/ffmpeg` 本机带 `exr` 解码器与编码器；`av.open("f_%04d.exr", format="image2", options={"framerate":"30","start_number":"1"})` 正常解码，原生 `gbrpf32le`，`to_ndarray("bgr24")` 转 uint8 数值正确（0.9961 → 254）
+- `image2` 的 `frames` 恒为 0，但 `duration`（以 time_base 计）是准的 → 帧数得自己数文件；单张静态图 `duration` 为 None
+- **`start_number` 写错会静默丢帧**：0 基序列给 `start_number=1` 会安静地少解出第 0 帧（实测 6 帧变 5 帧），整条时间轴对陀螺就错位——推断必须对着磁盘校验
+- **序列有洞会中途 I/O 报错**：`g001,g002,g003,g005,...` 在解到第 4 帧时 FFmpeg 直接抛错（不是在结尾截断）→ 与其渲染到一半崩，不如开文件前就说清楚
+- 不给 `framerate` 时 FFmpeg 默认 **25 fps**（静默）——30fps 素材会整体慢 17%
+
+**实现**:
+1. **`pygyroflow/rendering/image_sequence.py`**（新增）——把三种指法归一成模式串 + 选项：目录（取自然序首帧做模板）、单帧文件（尾部数字串给补零宽度与起始号）、已给的 printf 模式串（仍回磁盘校验补零宽度/起始号/连续性）。同时提供 `fps_to_rational`（上游 `rendering::fps_to_rational` 的逐行移植：小数部分 >0.1 的按 `/1001` 表达，29.97→`30000/1001`；否则取整）。
+2. **接线**：`manager._get_video_info(path, fps=)`（序列帧数取磁盘、时长 = 帧数/fps）、`manager.load_video(path, fps=)`（序列不做遥测解析，记 `input_file.image_sequence_fps/start`）、`FfmpegProcessor.open_input(path, fps=)`、`manager.render` 把序列 fps 透传、`manager._extract_gray_frames`（autosync 也能吃序列）。
+3. **CLI**：新增 `--fps FLOAT`（序列帧率，缺省时告警并说明 FFmpeg 会按 25fps）与 `--gyro FILE`（独立遥测源）。序列本身没有遥测，没有 `--gyro` 就只做镜头校正——CLI 的"无陀螺"告警里已点名这个开关。序列输出默认命名为 `<目录或模式前缀>_stabilized.mp4`。
+
+**验证**（372 passed, 5 skipped；新增 `tests/test_image_sequence.py` 45 项）:
+- 单元：三种指法解析、自然序（`p2_` 先于 `p10_`）、补零宽度不混并、0 基起始号、洞的报错信息点名缺失帧、`fps_to_rational` 的 NTSC 取值、输出命名
+- 集成（真解码）：目录/模式/单张/0 基/EXR 各跑通，帧数与磁盘一致；EXR 经 `gbrpf32le → bgr24` 后像素值对得上（背景 g=32）
+- 渲染：30 帧 PNG 序列 + 注入陀螺 → 输出 30 帧、64x48、30fps；有/无陀螺两版首帧像素不同（证明确实在做变换，不是直通）
+- **真实素材端到端**：从 `GX010045.MP4`（1280x1120@29.97）抽 60 帧缩放成 EXR 序列 + `--gyro GX010045.MP4`，CLI 跑通，输出 60 帧 320x180；autosync 在序列上也正常工作
+
+**已知限制**:
+- **陀螺源时间轴必须与序列首帧对齐**：切帧时只能从被取陀螺那段视频的开头开始，或把陀螺源裁到同起点。工具无法从数据判断，只能靠时长不符时的告警提示（`IMU duration X is different than video duration Y`）
+- 素材必须是连续编号；有洞直接拒绝（FFmpeg 自身也过不去）
+- 帧率必须外部给定：EXR/PNG 无内在帧率，不给就按 FFmpeg 的 25fps 走（已告警，不静默）
+- EXR 的 HDR 值经管线被压到 8bit（`to_ndarray("rgb24")`）；本管线全程 8bit，上游同样如此。真 HDR 通路不在本次范围
+- 只做序列**输入**；输出仍是视频（上游的 "EXR Sequence"/"PNG Sequence" 输出编码器未实现）
+- 短序列上 autosync 会复现既有弱点（60 帧锁到 -254ms，长片段才锁得准，见上文"已知限制"）——非本次引入
+

@@ -44,6 +44,21 @@ def main() -> None:
         help="Output codec (default: H.265/HEVC)",
     )
     parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Frame rate for image sequence input (EXR/PNG/...) — sequences "
+             "carry no rate of their own, and without this FFmpeg assumes "
+             "25 fps. Ignored for video input",
+    )
+    parser.add_argument(
+        "--gyro",
+        metavar="FILE",
+        help="Separate telemetry source (a video with embedded gyro, or a "
+             "gyro data file). Image sequences have no telemetry of their "
+             "own, so this is required for them to be stabilized",
+    )
+    parser.add_argument(
         "--bitrate",
         type=float,
         default=0,
@@ -115,6 +130,11 @@ def main() -> None:
     )
 
     from pygyroflow.manager import StabilizationManager
+    from pygyroflow.rendering.image_sequence import (
+        FFMPEG_DEFAULT_FPS,
+        looks_like_image_sequence,
+        sequence_output_stem,
+    )
 
     for path in args.input:
         log.info("Processing: %s", path)
@@ -122,13 +142,26 @@ def main() -> None:
         mgr = StabilizationManager()
 
         try:
-            # Load video
-            info = mgr.load_video(path)
+            # Load video (or image sequence)
+            if looks_like_image_sequence(path) and not args.fps:
+                log.warning(
+                    "Image sequence input without --fps: assuming FFmpeg's "
+                    "default %.0f fps. Gyro timing will be wrong if the "
+                    "footage was shot at another rate.", FFMPEG_DEFAULT_FPS,
+                )
+            info = mgr.load_video(path, fps=args.fps)
             log.info(
-                "Video: %dx%d @ %.2f fps, %.1f ms, %d frames",
+                "%s: %dx%d @ %.2f fps, %.1f ms, %d frames",
+                "Sequence" if info.get("image_sequence") else "Video",
                 info["width"], info["height"],
                 info["fps"], info["duration_ms"], info["frame_count"],
             )
+
+            # Optional separate telemetry source — an image sequence carries
+            # none, so this is the only way to stabilize one.
+            if args.gyro:
+                mgr.load_gyro_data(args.gyro, is_video=True)
+                log.info("Gyro loaded from separate source: %s", args.gyro)
 
             # Warn loudly if no gyro data was extracted — stabilization would
             # otherwise run on empty input and produce a "successful" but
@@ -137,7 +170,8 @@ def main() -> None:
             if not mgr.gyro.quaternions:
                 log.warning(
                     "No gyro/IMU data found in %s. Output will NOT be "
-                    "stabilized (only lens correction applies).", path,
+                    "stabilized (only lens correction applies). "
+                    "Use --gyro FILE for image sequences.", path,
                 )
 
             # Load lens profile
@@ -179,6 +213,8 @@ def main() -> None:
             # Determine output path
             if args.output:
                 output = args.output
+            elif info.get("image_sequence"):
+                output = sequence_output_stem(path) + "_stabilized.mp4"
             else:
                 base = path.rsplit(".", 1)
                 output = base[0] + "_stabilized." + (base[1] if len(base) > 1 else "mp4")
