@@ -77,6 +77,7 @@ class PoseEstimator:
         self._every_nth_frame: int = 1
         self._of_method: int = 2  # DIS
         self._pose_method: int = 0  # essential matrix
+        self._lpf: float = 0.0  # 0 = no filtering (upstream's default)
         self._detector: OpticalFlowDetector | None = None
 
     # ------------------------------------------------------------------
@@ -259,22 +260,127 @@ class PoseEstimator:
     # Result access
     # ------------------------------------------------------------------
 
-    def get_visual_rotations(self) -> list[tuple[int, np.ndarray]]:
+    def get_visual_rotations(
+        self, final_pass: bool = True
+    ) -> list[tuple[int, np.ndarray]]:
         """Return ``[(timestamp_us, angular_velocity_3), ...]`` for all
-        frames with a successful rotation estimate.
+        frames with a usable rotation estimate, ordered by time.
 
         Angular velocity is in degrees/second, matching IMU output format.
+
+        Port of upstream's ``recalculate_gyro_data`` (core/synchronization/
+        mod.rs). Three details there are load-bearing and were all missing:
+
+        * **The sample is stamped between this frame and the next**, not on
+          the frame. The motion measured between two frames happened during
+          the transition from one to the other, so attributing it to either
+          endpoint biases the whole timeline by half a frame — which is
+          exactly the quantity an offset search is trying to measure.
+        * **On the final pass, a frame whose pose estimate failed borrows a
+          linearly interpolated euler angle from its nearest successful
+          neighbours.** Skipping it instead leaves a hole in the signal the
+          correlation has to step over. ``final_pass=False`` is upstream's
+          cheap intermediate pass, used only to update the UI while frames
+          are still arriving.
+        * **An optional low-pass filter** runs over the assembled samples
+          (``lowpass_filter(freq, fps)``), zero-phase via forward-backward
+          filtering.
         """
+        entries = sorted(self._frames.items())  # by timestamp
+        eulers: dict[int, tuple[float, float, float] | None] = {
+            ts: fr.euler_angles for ts, fr in entries
+        }
+        if final_pass:
+            eulers = self._interpolate_missing(eulers)
+
         result: list[tuple[int, np.ndarray]] = []
-        for fr in sorted(self._frames.values(), key=lambda f: f.frame_no):
-            if fr.euler_angles is not None:
-                wx, wy, wz = fr.euler_angles
-                # Swap X/Y for IMU coordinate convention and convert rad -> deg
-                av = np.array([wy, wx, wz], dtype=np.float64) * (180.0 / np.pi)
-                # Midpoint timestamp between this frame and next
-                ts = fr.timestamp_us
-                result.append((ts, av))
+        for index, (ts, _frame) in enumerate(entries):
+            eul = eulers.get(ts)
+            if eul is None:
+                continue
+            wx, wy, wz = eul
+            # Swap X/Y for the IMU coordinate convention, rad -> deg.
+            av = np.array([wy, wx, wz], dtype=np.float64) * (180.0 / np.pi)
+            result.append((self._midpoint_us(entries, index), av))
+
+        if self._lpf > 0.0 and self._fps > 0.0:
+            result = self._filtered(result)
         return result
+
+    def lowpass_filter(self, freq: float, fps: float | None = None) -> None:
+        """Set the low-pass cutoff applied to the estimated gyro signal.
+
+        Mirrors upstream's ``PoseEstimator::lowpass_filter``, including its
+        storage: the frequency is kept as hundredths of a Hz in an integer,
+        so it is quantised to 0.01 Hz. Filtering only happens when the
+        pipeline next rebuilds the signal.
+        """
+        self._lpf = float(int(freq * 100.0)) / 100.0
+        if fps is not None:
+            self._fps = float(fps)
+
+    @staticmethod
+    def _midpoint_us(
+        entries: list[tuple[int, FrameResult]], index: int
+    ) -> int:
+        """This frame's timestamp moved half way towards the next one.
+
+        The last frame has no successor, so it keeps its own timestamp —
+        upstream's ``iter.peek()`` returning None does the same.
+        """
+        ts = entries[index][0]
+        if index + 1 < len(entries):
+            next_ts = entries[index + 1][0]
+            return int(round(ts + (next_ts - ts) / 2.0))
+        return int(ts)
+
+    @staticmethod
+    def _interpolate_missing(
+        eulers: dict[int, tuple[float, float, float] | None],
+    ) -> dict[int, tuple[float, float, float] | None]:
+        """Fill gaps by linear interpolation between the nearest known values.
+
+        A gap at either end of the clip is left as it is: there is nothing to
+        interpolate from, and extrapolating a motion signal past its data
+        would invent a direction rather than a magnitude.
+        """
+        keys = sorted(eulers)
+        known = [k for k in keys if eulers[k] is not None]
+        if not known:
+            return dict(eulers)
+
+        out = dict(eulers)
+        for key in keys:
+            if out[key] is not None:
+                continue
+            previous = next((k for k in reversed(known) if k < key), None)
+            following = next((k for k in known if k > key), None)
+            if previous is None or following is None:
+                continue
+            span = following - previous
+            if span == 0:
+                continue
+            ratio = (key - previous) / span
+            before, after = eulers[previous], eulers[following]
+            out[key] = tuple(
+                before[i] + (after[i] - before[i]) * ratio for i in range(3)
+            )
+        return out
+
+    def _filtered(
+        self, result: list[tuple[int, np.ndarray]]
+    ) -> list[tuple[int, np.ndarray]]:
+        """Zero-phase low-pass over the three angular-velocity channels."""
+        from pygyroflow.filtering.lowpass import lowpass_filter_channels
+
+        values = np.stack([av for _, av in result], axis=1)  # (3, N)
+        filtered = lowpass_filter_channels(
+            values, self._lpf, self._fps, forward_backward=True
+        )
+        return [
+            (ts, np.asarray(filtered[:, i], dtype=np.float64))
+            for i, (ts, _) in enumerate(result)
+        ]
 
     def get_frame_results(self) -> dict[int, FrameResult]:
         """Return the full ``{timestamp_us: FrameResult}`` map."""

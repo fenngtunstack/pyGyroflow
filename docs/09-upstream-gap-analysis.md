@@ -208,7 +208,7 @@ return find_offset_visual_features(...)
 
 ---
 
-### G-10 [实测] `get_visual_rotations` 的时间戳——注释与代码矛盾
+### G-10 [实测] ~~`get_visual_rotations` 的时间戳——注释与代码矛盾~~ 已修（`待提交`）
 
 ```python
 # pygyroflow/synchronization/pose_estimator.py:274-275
@@ -216,7 +216,9 @@ return find_offset_visual_features(...)
 ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 ```
 
-**上游** `mod.rs:312-317` 把陀螺样本放在两帧时间戳**中点**。同一函数还缺失败帧的欧拉角线性插值（上游 `final_pass` 做）与可选低通。
+**上游** `core/synchronization/mod.rs` 的 `recalculate_gyro_data` 做三件我们没做的事：① 把样本放在两帧时间戳**中点**（`ts += (next_ts - ts) / 2.0`，`iter.peek()` 取下一个 sync 结果）；② `final_pass` 时对姿态估计失败帧用**左右最近的成功帧线性插值**补上欧拉角（按时间戳比例加权），首尾缺口不补——外推是凭空造方向；③ `lpf > 0` 时对拼好的信号做零相位前后向低通（`lowpass_filter(freq, fps)`，注意上游把它存成「百分之一赫兹的整数」，精度 0.01 Hz）。中点这一条最要紧：offset 搜索量的就是这个时间平移，把半帧偏置加在每个样本上等于给被测量本身加了个恒差。
+
+已按上游逐条补齐（`_midpoint_us` / `_interpolate_missing` / `_filtered`），并暴露 `PoseEstimator.lowpass_filter` 与 `AutosyncProcess.set_lpf`。注意上游 CLI 里没有任何东西驱动 lpf，它是 GUI 侧旋钮——仍然移植并保持可达，因为低对比度素材上光流信号噪声大时调用方没有别的入口。
 
 ---
 
@@ -383,6 +385,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-06 `.gyroflow` 工程读写 + base91/zlib/bincode/CBOR 编解码 | `1077433` | 两个官方工程 JSON 层往返「缺失键 [] / 变化键 {}」；base91/bincode 与仓库内独立解码器逐字节一致；CBOR 按规范和 nalgebra serde 推导后按位固化 |
 | C-04 渲染时裁剪区间 + 音频同步裁剪 + 逐区间导出 | `11294ef` | 8 组区间组合断言保留帧数与帧内容（帧身份写进画面象限）；输出 pts 相邻差值恒定（无空洞）；回调收到源时间线；带音轨素材裁后音频时长同步变短 |
 | C-11/C-06 余下：CLI 吃工程与 preset、`--preset`/`--export-project 1`/`-p`/`-s`/`-t`/`-f`/`--version`、`python -m pygyroflow` | `e7fb663` | subprocess 跑真 CLI：真工程（自带 base91 bincode 陀螺块）→ 读工程 → 从块里取得陀螺 → 出片帧数正确；`--export-project 1` 无运动载荷且 fov 随 preset 变化；缺 `-f` 时拒绝覆盖 |
+| G-10 视觉角速度信号：中点时间戳 + 失败帧欧拉角插值 + 可选低通 | `待提交` | 中点用 1 ms 等距夹具断言精确值、30fps 用规则断言；缺口按位置加权插值（中点=均值）且首尾不外推；低通使单帧尖峰幅度降到 60% 以下且时间戳不变 |
 | C-05 渲染时变速与 `fps_scale` | `6a95077` | `video_speed` 2.0 出 6/12 帧且留下的正是奇数帧、0.5 出 22 帧、4.0 出 3 帧；`fps_scale=2` 帧数不变且查询时间戳被 spy 证实为 `ts/2`；变速时自动丢弃音轨 |
 
 **实施中新发现的、原清单没有的缺陷**：

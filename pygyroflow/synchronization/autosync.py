@@ -77,6 +77,16 @@ class AutosyncProcess:
     def pose_estimator(self) -> PoseEstimator:
         return self._pose_estimator
 
+    def set_lpf(self, freq: float) -> None:
+        """Low-pass cutoff for the estimated gyro signal, in Hz (0 = off).
+
+        Upstream exposes this on ``PoseEstimator`` too and, like this one,
+        nothing in the CLI drives it — it is a GUI-side knob. It is ported
+        and reachable rather than dropped, because a caller that needs it
+        (noisy optical flow on a low-contrast clip) has no other way in.
+        """
+        self._pose_estimator.lowpass_filter(freq, self._fps)
+
     def run(
         self,
         frames: Sequence[tuple[int, npt.NDArray[np.uint8]]],
