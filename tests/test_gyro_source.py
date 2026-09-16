@@ -9,6 +9,7 @@ from numpy.testing import assert_allclose
 from pygyroflow.types.quaternion import Quat64
 from pygyroflow.types.time_types import TimeIMU, TimeQuat
 from pygyroflow.gyro_source import GyroSource, IMUTransforms
+from pygyroflow.gyro_source.file_metadata import FileMetadata
 
 
 class TestGyroSourceInit:
@@ -141,3 +142,63 @@ class TestIMUTransforms:
         # 90 deg yaw: X -> Y
         assert_allclose(abs(result[0]), 0.0, atol=1e-6)
         assert result[1] > 0.5  # Y component should be large
+
+class TestGyroChecksum:
+    """The cache key must cover everything that changes the output.
+
+    Upstream hashes the source, the transform angles, the bias, the file URL,
+    the integration method, the sync offsets and the endpoints of the
+    quaternion stream (gyro_source/mod.rs::get_checksum). Ours hashed only the
+    source and two lengths, so changing any of the rest left a stale cache in
+    place.
+    """
+
+    @staticmethod
+    def _loaded(n=50):
+        from pygyroflow.gyro_source.source import GyroSource
+
+        source = GyroSource()
+        source.init_from_params(500.0)
+        source.load_from_telemetry(FileMetadata(
+            detected_source="Test",
+            imu_orientation="XYZ",
+            raw_imu=[
+                TimeIMU(timestamp_ms=i * 10.0, gyro=np.array([1.0, 2.0, 3.0]))
+                for i in range(n)
+            ],
+        ))
+        return source
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda s: setattr(s.imu_transforms, "imu_mf", 5),
+            lambda s: setattr(s.imu_transforms, "imu_lpf", 15.0),
+            lambda s: setattr(s.imu_transforms, "acc_rotation_angles", (1.0, 2.0, 3.0)),
+            lambda s: setattr(s.imu_transforms, "imu_rotation_angles", (1.0, 2.0, 3.0)),
+            lambda s: setattr(s.imu_transforms, "gyro_bias", [5.0, 0.0, 0.0]),
+            lambda s: setattr(s.imu_transforms, "imu_orientation", "ZYX"),
+            lambda s: setattr(s, "integration_method", 3),
+            lambda s: setattr(s, "use_gravity_vectors", True),
+            lambda s: setattr(s, "file_url", "/tmp/x.mp4"),
+            lambda s: s.set_offset(0, 12.0),
+        ],
+    )
+    def test_parameter_change_changes_the_checksum(self, mutate):
+        base = self._loaded()
+        changed = self._loaded()
+        mutate(changed)
+        assert changed.get_checksum() != base.get_checksum()
+
+    def test_identical_state_hashes_identically(self):
+        assert self._loaded().get_checksum() == self._loaded().get_checksum()
+
+    def test_quaternion_endpoint_is_covered(self):
+        from pygyroflow.types.quaternion import Quat64
+
+        base = self._loaded()
+        changed = self._loaded()
+        changed.quaternions[min(changed.quaternions)] = Quat64.from_euler_angles(
+            0.1, 0.0, 0.0
+        )
+        assert changed.get_checksum() != base.get_checksum()

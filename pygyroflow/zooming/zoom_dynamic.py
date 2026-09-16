@@ -67,12 +67,17 @@ def compute(
 
 
 def _get_frames_per_window(compute_params: ComputeParams) -> int:
-    """Convert time window to frame count (guaranteed odd)."""
+    """Convert time window to frame count (guaranteed odd).
+
+    No lower clamp: upstream (zoom_dynamic.rs) allows a window of one frame,
+    and clamping to 3 silently widens any window below 3/fps — a sub-frame
+    window is a legitimate way to say "barely smooth the FOV".
+    """
     fps = compute_params.scaled_fps if compute_params.scaled_fps > 0 else 30.0
     frames = int(compute_params.adaptive_zoom_window * fps)
     if frames % 2 == 0:
         frames += 1
-    return max(frames, 3)
+    return max(frames, 1)
 
 
 def _min_rolling(a: list[float], window: int) -> list[float]:

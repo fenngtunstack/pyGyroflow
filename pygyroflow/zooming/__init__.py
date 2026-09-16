@@ -60,6 +60,14 @@ def calculate_fovs(
         scaled_duration_ms=compute_params.scaled_duration_ms,
         quaternions=compute_params.quaternions,
         smoothed_quaternions=compute_params.smoothed_quaternions,
+        # Upstream clones the whole ComputeParams (zooming/mod.rs), so the
+        # keyframe manager and the sync-offset map come along. Dropping them
+        # here meant FovIterative saw an empty KeyframeManager: every
+        # keyframed zooming parameter (ZoomingCenterX/Y, ZoomingSpeed,
+        # LensCorrectionStrength, VideoRotation...) was silently ignored.
+        keyframes=compute_params.keyframes,
+        sync_offsets_adjusted=dict(compute_params.sync_offsets_adjusted),
+        per_frame_time_offsets=list(compute_params.per_frame_time_offsets),
         fovs=[],  # Clear for fresh computation
         minimal_fovs=[],
         fov_scale=1.0,  # Reset to neutral

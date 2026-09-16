@@ -461,19 +461,60 @@ class GyroSource:
     # ------------------------------------------------------------------
 
     def get_checksum(self) -> int:
-        """Compute a hash of all gyro data for cache invalidation."""
+        """Compute a hash of all gyro data for cache invalidation.
+
+        Covers upstream's whole field set (gyro_source/mod.rs::get_checksum),
+        not just the source and the two lengths: the transform angles, the
+        gyro bias, the integration method, the sync offsets and the endpoints
+        of the quaternion stream all change the pipeline's output, so leaving
+        them out let a stale cache survive a parameter change.
+        """
         import hashlib
         import struct as _struct
 
         hasher = hashlib.sha256()
-        if self.file_metadata.detected_source:
-            hasher.update(self.file_metadata.detected_source.encode())
-        if self.imu_transforms.imu_orientation:
-            hasher.update(self.imu_transforms.imu_orientation.encode())
-        hasher.update(_struct.pack('d', self.duration_ms))
-        hasher.update(_struct.pack('d', self.imu_transforms.imu_lpf))
-        hasher.update(str(len(self.raw_imu)).encode())
-        hasher.update(str(len(self.quaternions)).encode())
+
+        def _text(value: str | None) -> None:
+            if value:
+                hasher.update(value.encode())
+
+        def _f64(value: float) -> None:
+            hasher.update(_struct.pack('d', float(value)))
+
+        t = self.imu_transforms
+        _text(self.file_metadata.detected_source)
+        _text(t.imu_orientation)
+        for angles in (t.imu_rotation_angles, t.acc_rotation_angles, t.gyro_bias):
+            if angles is not None:
+                for component in angles:
+                    _f64(component)
+        _text(self.file_url)
+        _f64(self.duration_ms)
+        _f64(t.imu_lpf)
+        hasher.update(_struct.pack('i', int(t.imu_mf)))
+
+        for count in (
+            len(self.raw_imu),
+            len(self.file_metadata.raw_imu),
+            len(self.quaternions),
+            len(self.file_metadata.quaternions),
+            len(self.file_metadata.lens_positions),
+            len(self.file_metadata.lens_params),
+        ):
+            hasher.update(_struct.pack('Q', count))
+        hasher.update(_struct.pack('I', 1 if self.use_gravity_vectors else 0))
+        hasher.update(_struct.pack('Q', int(self.integration_method)))
+
+        for ts in sorted(self.offsets):
+            hasher.update(_struct.pack('q', int(ts)))
+            _f64(self.offsets[ts])
+
+        for ts in (min(self.quaternions), max(self.quaternions)) if self.quaternions else ():
+            q = self.quaternions[ts].quaternion()
+            hasher.update(_struct.pack('q', int(ts)))
+            for component in q:
+                _f64(component)
+
         return int(hasher.hexdigest()[:16], 16)
 
     @staticmethod

@@ -234,11 +234,11 @@ class KeyframeManager:
         3. Single keyframe -> its value
         4. Clamp to keyframe range, then interpolate between neighbors
         """
-        # 1. Custom provider
+        # 1. Custom provider. The scale is applied by the callers that take a
+        #    *video* timestamp (value_at_video_timestamp), which is where
+        #    upstream applies it too; doing it again here scaled it twice.
         if self._custom_provider is not None:
-            scale = self.timestamp_scale if self.timestamp_scale is not None else 1.0
-            ts_ms = timestamp_us / 1000.0 * scale
-            result = self._custom_provider(self, key, ts_ms)
+            result = self._custom_provider(self, key, timestamp_us / 1000.0)
             if result is not None:
                 return result
 
@@ -411,10 +411,17 @@ class KeyframeManager:
     # ------------------------------------------------------------------
 
     def clear(self) -> None:
-        """Remove all keyframes and reset state."""
+        """Reset to a fresh manager.
+
+        Upstream's ``clear`` is ``*self = Self::new()`` (keyframes.rs), which
+        also drops ``custom_provider``, ``timestamp_scale`` and the gyro
+        offsets. Keeping the provider and scale (as this did) left state
+        behind that a reload then operated on.
+        """
         self._keyframes.clear()
         self._timestamps.clear()
-        # Keep custom provider and timestamp_scale
+        self._custom_provider = None
+        self.timestamp_scale = None
 
     def clear_type(self, key: KeyframeType) -> None:
         """Remove all keyframes of a specific type."""

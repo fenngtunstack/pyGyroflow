@@ -431,7 +431,9 @@ class DefaultAlgo(SmoothingAlgorithm):
             sr = smoothness_roll_per_ts.get(ts, self.smoothness_roll)
             s = smoothness_per_ts.get(ts, self.smoothness)
 
-            frame = int(ts / 1000.0 * scaled_fps)
+            # Upstream uses `(ts_ms * fps / 1000).round()`; truncating
+            # picks the neighbouring frame for any fractional value.
+            frame = int(round(ts / 1000.0 * scaled_fps))
             if len(camera_diagonal_fovs) == 1:
                 fov_ratio = camera_diagonal_fovs[0] / FOV_REFERENCE
             else:

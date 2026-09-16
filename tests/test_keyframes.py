@@ -138,3 +138,56 @@ class TestKeyframeSerialization:
 
         assert km2.is_keyframed(KeyframeType.Fov)
         assert km2.is_keyframed(KeyframeType.SmoothingParamSmoothness)
+
+class TestClearResetsEverything:
+    """clear() is upstream's `*self = Self::new()` — including provider/scale."""
+
+    def test_clear_drops_keyframes(self):
+        km = KeyframeManager()
+        km.set_keyframe(KeyframeType.Fov, 0, 1.0)
+        km.clear()
+        assert km.value_at_video_timestamp(KeyframeType.Fov, 0.0) is None
+
+    def test_clear_drops_custom_provider_and_scale(self):
+        km = KeyframeManager()
+        km.set_custom_provider(lambda mgr, key, ts_ms: 42.0)
+        km.timestamp_scale = 2.0
+        km.clear()
+        assert km._custom_provider is None
+        assert km.timestamp_scale is None
+        assert km.value_at_video_timestamp(KeyframeType.Fov, 0.0) is None
+
+
+class TestProviderTimestampScale:
+    """The video-time scale is applied once, not twice.
+
+    Upstream scales in value_at_video_timestamp only (keyframes.rs); the
+    provider receives `timestamp_ms * scale`. Applying it again on the way to
+    the provider squared it.
+    """
+
+    def test_provider_receives_scaled_video_time(self):
+        seen = []
+
+        def provider(manager, key, ts_ms):
+            seen.append(ts_ms)
+            return None
+
+        km = KeyframeManager()
+        km.set_custom_provider(provider)
+        km.timestamp_scale = 2.0
+        km.value_at_video_timestamp(KeyframeType.Fov, 100.0)
+        assert seen == [pytest.approx(200.0)]
+
+    def test_provider_scaled_once_from_direct_us_lookup(self):
+        seen = []
+
+        def provider(manager, key, ts_ms):
+            seen.append(ts_ms)
+            return None
+
+        km = KeyframeManager()
+        km.set_custom_provider(provider)
+        km.timestamp_scale = 2.0
+        km.value_at_timestamp(KeyframeType.Fov, 100_000)  # 100 ms
+        assert seen == [pytest.approx(100.0)]

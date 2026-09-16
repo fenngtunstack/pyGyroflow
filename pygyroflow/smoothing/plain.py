@@ -143,7 +143,7 @@ class PlainSmoothing(SmoothingAlgorithm):
 
         for ts in trimmed:
             scale = 1.0
-            frame = int(ts / 1000.0 * scaled_fps)
+            frame = int(round(ts / 1000.0 * scaled_fps))
             if frame in fov_limit_per_frame:
                 scale *= fov_limit_per_frame[frame]
             scalers[ts] = scale

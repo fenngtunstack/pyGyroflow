@@ -369,7 +369,7 @@ class FovIterative:
         nearest_idx: Optional[int] = None
         nearest_rect = initial
 
-        for _ in range(5):
+        for _ in range(4):
             nearest_idx, nearest_rect = self._nearest_edge(
                 polygon, center, nearest_rect
             )

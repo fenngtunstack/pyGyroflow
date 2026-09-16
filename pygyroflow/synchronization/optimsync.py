@@ -37,6 +37,9 @@ _MIN_RANK = 50.0
 # Minimum sync-point score to be considered valid
 _MIN_SCORE = 0.1
 
+# Mid-band peak below which the clip counts as low-motion (optimsync.rs).
+_LOW_MOTION_MF_MAX = 50.0
+
 
 def _blackman(width: int) -> np.ndarray:
     """Generate a Blackman window of given length."""
@@ -125,9 +128,23 @@ class OptimSync:
             axis_ffts: list[np.ndarray] = []
             for start in range(0, len(signal) - fft_size + 1, step_size):
                 chunk = signal[start : start + fft_size] * win
-                spectrum = np.fft.rfft(chunk)
-                magnitude = np.abs(spectrum) * scale
-                axis_ffts.append(magnitude)
+                # Upstream folds the full complex FFT against its own
+                # reverse: `zip(cm.iter(), cm.iter().rev()).take(n/2)
+                # .map(|(a, b)| a + b).norm()` (optimsync.rs). Bin k is
+                # cm[k] + cm[n-1-k], which for a real signal is
+                # `cm[k] + conj(cm[k+1])` — the *sum of adjacent bins*, not
+                # the modulus and not 2*Re(cm[k]).
+                #
+                # So this is not the spectrum's magnitude: it keeps the phase
+                # of a neighbouring bin. Verified against a rustfft reference
+                # (see tests/test_optimsync.py). The thresholds below — the
+                # rank gate, the 450/650 penalties, the 0.1 segment floor —
+                # are calibrated against the folded form, so the modulus used
+                # here before put them on the wrong scale.
+                spectrum = np.fft.fft(chunk)
+                half = fft_size // 2
+                folded = spectrum[:half] + spectrum[::-1][:half]
+                axis_ffts.append(np.abs(folded) * scale)
             stft_axes.append(axis_ffts)
 
         if not stft_axes or not stft_axes[0]:
@@ -160,11 +177,20 @@ class OptimSync:
         mf = band_energy(*_MID_BAND)
         hf = band_energy(*_HIGH_BAND)
 
-        # Score
+        # Low-motion footage keeps its signal below 2 Hz, where the normal
+        # formula penalises it away; upstream switches to LF+MF for those
+        # (optimsync.rs, `mf_max < 50.0`), so a slow pan still yields sync
+        # points instead of an empty selection.
+        low_motion = float(np.max(mf)) < _LOW_MOTION_MF_MAX if len(mf) else False
+
         rank = np.array(
             [
-                m / (1.0 + _nlfunc(h, _HIGH_PENALTY_TRIP) * 0.003)
+                (
+                    (l + m) / (1.0 + _nlfunc(h, _HIGH_PENALTY_TRIP) * 0.003)
+                    if low_motion
+                    else m / (1.0 + _nlfunc(h, _HIGH_PENALTY_TRIP) * 0.003)
                     / (1.0 + _nlfunc(l, _LOW_PENALTY_TRIP) * 0.003)
+                )
                 for l, m, h in zip(lf, mf, hf)
             ],
             dtype=np.float32,

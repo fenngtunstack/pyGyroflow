@@ -80,3 +80,81 @@ class TestCalculateFovs:
 
         assert len(fovs) == 50
         assert all(f > 0.0 for f in fovs)
+
+class TestFovEstimatorParams:
+    """The FOV estimator's working params carry the caller's keyframes.
+
+    Upstream clones the whole ComputeParams (zooming/mod.rs), so the keyframe
+    manager and the sync-offset map come with it. The copy built here used to
+    let both fall back to their defaults — an empty KeyframeManager — which
+    meant every keyframed zooming parameter was silently ignored.
+    """
+
+    @staticmethod
+    def _captured(compute_params, timestamps):
+        from pygyroflow import zooming as zooming_mod
+
+        captured = {}
+        real = zooming_mod.FovIterative
+
+        class _Spy(real):  # type: ignore[misc, valid-type]
+            def __init__(self, params, org_output_size):
+                captured["params"] = params
+                super().__init__(params, org_output_size)
+
+        zooming_mod.FovIterative = _Spy
+        try:
+            calculate_fovs(compute_params, timestamps)
+        finally:
+            zooming_mod.FovIterative = real
+        return captured["params"]
+
+    def _timestamps(self, n=50):
+        return [(i, i * 20.0) for i in range(n)]
+
+    def test_keyframes_are_forwarded(self):
+        from pygyroflow.keyframes import KeyframeManager, KeyframeType
+
+        params = _make_test_params()
+        params.keyframes = KeyframeManager()
+        params.keyframes.set_keyframe(KeyframeType.ZoomingCenterX, 0, 0.25)
+
+        forwarded = self._captured(params, self._timestamps())
+        assert forwarded.keyframes is params.keyframes
+        assert forwarded.keyframes.value_at_video_timestamp(
+            KeyframeType.ZoomingCenterX, 0.0
+        ) == pytest.approx(0.25)
+
+    def test_sync_offsets_are_forwarded(self):
+        params = _make_test_params()
+        params.sync_offsets_adjusted = {0: 12.0, 1_000_000: 12.0}
+        forwarded = self._captured(params, self._timestamps())
+        assert forwarded.sync_offsets_adjusted == {0: 12.0, 1_000_000: 12.0}
+
+    def test_forwarded_params_do_not_alias_the_originals(self):
+        """The working copy resets fov state; the caller's must stay intact."""
+        params = _make_test_params()
+        params.fovs = [1.5] * 50
+        forwarded = self._captured(params, self._timestamps())
+        assert forwarded.fovs == []
+        assert params.fovs == [1.5] * 50
+
+
+class TestFramesPerWindow:
+    """A sub-frame adaptive-zoom window stays a sub-frame window."""
+
+    def test_no_lower_clamp(self):
+        from pygyroflow.zooming.zoom_dynamic import _get_frames_per_window
+
+        params = _make_test_params()
+        params.scaled_fps = 100.0
+        params.adaptive_zoom_window = 0.01  # 1 frame at 100 fps
+        assert _get_frames_per_window(params) == 1
+
+    def test_window_is_forced_odd(self):
+        from pygyroflow.zooming.zoom_dynamic import _get_frames_per_window
+
+        params = _make_test_params()
+        params.scaled_fps = 100.0
+        params.adaptive_zoom_window = 0.04  # 4 frames -> 5
+        assert _get_frames_per_window(params) == 5
