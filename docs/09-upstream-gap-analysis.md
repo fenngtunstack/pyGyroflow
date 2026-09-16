@@ -208,7 +208,7 @@ return find_offset_visual_features(...)
 
 ---
 
-### G-10 [实测] ~~`get_visual_rotations` 的时间戳——注释与代码矛盾~~ 已修（`待提交`）
+### G-10 [实测] ~~`get_visual_rotations` 的时间戳——注释与代码矛盾~~ 已修（`0420488`）
 
 ```python
 # pygyroflow/synchronization/pose_estimator.py:274-275
@@ -308,7 +308,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | D-05 | R | **max-zoom 反馈回路缺失**。上游 `lib.rs:548-605` 最多 5 轮 {夹紧 FOV 上限 → 按阈值 `[0.95,0.9,0.85,0.8]` 逐帧缩放 `smoothing_fov_limit_per_frame` → 重平滑 → 重缩放}。我们 `recompute_adaptive_zoom`（`manager.py:386-404`）只算一次；`ComputeParams` 无 `smoothing_fov_limit_per_frame` 字段，`default_algo.py:423`/`plain.py:141` 用 `getattr(...,{})` 读，**永远是空字典**。另无 `video_speed_affects_zooming_limit` | [实测] |
 | D-06 | R | **`at_timestamp_for_points` / `undistort_points*` 家族整体缺失**。上游 `frame_transform.rs:344-430` + `cpu_undistort.rs:634-803`：逐点按各自行时刻取旋转、逐点 IBIS 位移、mesh 校正、数字镜头、GoPro 数字镜头 0.91/0.81 x 修正。我们只有 `zooming/fov_iterative.py:104-253` 一个简化版；`almeida.py:43-44` 注释自认点**没有**畸变校正。**自动同步与自适应缩放的采样点全程跑在畸变坐标上** | [实测] |
 | D-07 | E | **`frame_readout_time` 未按传感器裁切缩放**。上游 `frame_transform.rs:22-36` 乘 `capture_area_size/sensor_size_px`；我们 `frame_transform.py:83-107` 只移植符号逻辑 —— 已实现（`3be3629`）：从 `lens_params` 的 `capture_area_size[1]/sensor_size_px[1]` 取到缩放 | [实测] |
-| D-08 | R | **焦距平滑整文件缺失**。上游 `smoothing/focal_length.rs:8-146`（高斯 + 自适应两套）+ `lib.rs:442-513` 编排 + `frame_transform.rs:71-80` `focal_length_fov_compensation`。字段在（`stabilization_params.py:104-106`）但从不填充 | [报告] |
+| D-08 | E | **焦距平滑整文件缺失**。上游 `smoothing/focal_length.rs:8-146`（高斯 + 自适应两套）+ `lib.rs:442-513` 编排 + `frame_transform.rs:71-80` `focal_length_fov_compensation`。字段在（`stabilization_params.py:104-106`）但从不填充 —— 已实现（`cb606bb`）：两个滤波器 + 编排 + 补偿全部移植，`zooming.get_checksum` 顺带补齐两个字段。**唯一没做到的是真机端到端**：解析器只填 `lens_positions`，`lens_params` 的写入侧仍是缺口，没有现成素材带逐帧焦距，验证止步于「与上游 Rust 逐位一致 + 合成内参接线」 | [实测] |
 | D-09 | R | **自适应缩放丢失全部关键帧支持**。`zooming/__init__.py:52-100` 构造工作副本时**不传 `keyframes`**（默认空 KeyframeManager）也不传 `sync_offsets_adjusted`；上游 `zooming/mod.rs:40` 克隆完整 params。连带 `zoom_dynamic.py:27-66` 只有静态窗口路径（无 `DataPerTimestamp`/`min_rolling_dynamic`/`convolve_dynamic`/逐时间戳 envelope alpha），`fov_iterative.py:308-312` 只用常量 kv | [实测] |
 | D-10 | R | **关键帧查询忽略陀螺同步偏移**。`keyframes/manager.py:302-311` `value_at_gyro_timestamp` 直接委托 `value_at_video_timestamp`，无偏移（docstring 自认）；无 `update_gyro`、无 `gyro_offsets`。上游 `keyframes.rs:79,205-208` | [报告] |
 | D-11 | E | **`camera_diagonal_fovs` 塌缩为单值**。上游 `compute_params.rs:140-155` 变焦镜头逐帧一值；我们 `manager.py:1189-1219` 恒 `[单值]` —— 已实现（`3be3629`）：`ComputeParams.calculate_camera_fovs()`，仅当 `lens_params` 多于一项（标定真在动）才逐帧算，定焦保持单值以免做 `frame_count` 次恒等查找 | [实测] |
@@ -388,12 +388,14 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | G-10 视觉角速度信号：中点时间戳 + 失败帧欧拉角插值 + 可选低通 | `0420488` | 中点用 1 ms 等距夹具断言精确值、30fps 用规则断言；缺口按位置加权插值（中点=均值）且首尾不外推；低通使单帧尖峰幅度降到 60% 以下且时间戳不变 |
 | C-05 渲染时变速与 `fps_scale` | `6a95077` | `video_speed` 2.0 出 6/12 帧且留下的正是奇数帧、0.5 出 22 帧、4.0 出 3 帧；`fps_scale=2` 帧数不变且查询时间戳被 spy 证实为 `ts/2`；变速时自动丢弃音轨 |
 | D-01 逐时间戳镜头数据（`lens_positions`/`lens_params`/`digital_zoom`/`invert_asym_lens`）+ `MapClosest`、D-11 逐帧 `camera_diagonal_fovs`、D-07 读出时间按裁切缩放 | `3be3629` | 真素材：`a7s3-sony85mm` 450 包里 200 个带 `0x8005`，每个都是 85.0 mm（15015 条 IMU 行）；`rx100-7-ois-only` 无该标签、map 为空。`ClosestMap` 的等距返回 None、严格 `<` 上限、缺席侧 −99999 哨兵逐条断言；`stretch_lens` 门控与主点重置；`lens_params` 多于一项才逐帧算 FOV |
+| D-08 焦距平滑（两个滤波器 + strength 映射 + fov 补偿 + FOV 缓存键） | `cb606bb` | **与上游 Rust 逐位一致**：上游 `focal_length.rs` 原样拷进临时 crate、只新写 `main()`，22 个用例全 `max_rel = 0.0`；生成脚本复现的驱动脚本与实跑逐字节相同，fixture 明确标注非自生成。接线在恒等陀螺下按 `矩阵[0,0] = fov/相机fx` 的比值断言补偿量本身 |
 
 **实施中新发现的、原清单没有的缺陷**：
 
 - `default_algo`/`plain` 用 `if frame in fov_limit_per_frame:` 读逐帧限制——对 list 是**值成员测试**，浮点限制值永远不匹配，限制实际从未生效（`bfb11d9`）。
 - `gpu/backend.py` 的 pipeline 缓存 key 只哈希 shader 源码、不含 pipeline 常量，某个畸变模型首次建出的 kernel 会被整个进程复用（`cd705a0`）。
 - 测试夹具 `tests/test_e2e.py` 的合成 GoPro mp4 的 `hdlr` 只有裸 `gpmd`，而真机是 `mhlr`/`meta` + Pascal 串 `GoPro MET`（`12f2eb6`）。
+- `zooming.get_checksum` 少哈希两个字段。上游 `zooming/mod.rs:91-92` 把 `focal_length_smoothing_enabled` 和 `_strength` 都算进 FOV 缓存键；我们只哈希了 `distortion_coeffs`/尺寸/`max_zoom`/`trim_ranges`/`video_rotation`/`adaptive_zoom_window`。后果是**改了焦距平滑滑块不会让 FOV 缓存失效**——重渲染静默沿用旧变焦，看起来"滑块没反应"。已补齐（`cb606bb`）。
 
 **做 C-06 时新发现的缺陷**：
 
@@ -446,7 +448,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | 项 | 说明 |
 |---|---|
 | D-06 `at_timestamp_for_points`/`undistort_points*` 逐点家族 | D-01 的内参路径已通（`3be3629`），剩下的是**逐点**按各自行时刻取旋转、IBIS 位移、mesh、数码镜头；**自动同步与自适应缩放的采样点仍跑在畸变坐标上** |
-| D-08 焦距平滑 | 整文件移植 |
+| D-08 焦距平滑 | ~~整文件移植~~ 已实现（`cb606bb`），但需要 `lens_params` 写入侧才能上真机 |
 | D-05 max-zoom 反馈回路 | 需加字段 + 循环 |
 | D-09 自适应缩放关键帧 | 传 params 即可恢复大半 |
 | B-01/B-02 offset method 0/1 | 两套算法 |
