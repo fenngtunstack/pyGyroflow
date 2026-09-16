@@ -282,8 +282,8 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-03 | R | **底层缺像素格式类型**。上游 `pixel_formats.rs` 12 种（含 NV12/P010/AYUV16/RGBAf16/BGRA8 通道交换 + Rec709 full→limited 重映射）；我们 `pixel_formats.py:15-55` 只做 dtype 探测。这是 C-02 的根因 | [报告] |
 | C-04 | R | **trim ranges 渲染时不生效**。`params.trim_ranges` 只有平滑用；`manager.render` 与 `ffmpeg_processor` 完全忽略 → 永远整片渲染。上游 `mod.rs:194-200,278-280` 定位+时间戳重基+`pad_with_black`+`export_trims_separately` | [报告] |
 | C-05 | R | **帧率控制 / 变速缺失**。上游回调可设 `repeat_times`/`out_timestamp_us`（`mod.rs:460-479`）+ `fps_scale` VFR；我们的回调只读时间戳，`video_speed`/`fps_scale` 渲染时被忽略 | [报告] |
-| C-06 | R | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** | [实测] |
-| C-07 | R | **容器旋转元数据没读**（见 G-07） | [实测] |
+| C-06 | E | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** —— 已实现（见下），CLI 接线未做 | [实测] |
+| C-07 | E | **容器旋转元数据没读**（见 G-07）—— 已实现（`3aadd0d`） | [实测] |
 | C-08 | R | 无 GPU 解码/编码（上游 `ffmpeg_hw.rs` 412 行 + 各平台 interop）；无 GPU 解码重试阶梯、无像素格式回退 | [报告] |
 | C-09 | R | 渲染健壮性：上游写 `.tmp` 再改名、拷贝容器元数据/timecode、清残留 `%Nd` 文件、保持系统唤醒；我们直接写目标路径、无元数据 | [报告] |
 | C-10 | R | **`settings.py` 是死代码**。106 行类，**全仓库零引用**。CLI 默认值硬编码在 argparse。上游 settings.json 约 25 个键驱动导出/同步默认值 | [报告] |
@@ -358,7 +358,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 
 ## 修复进展（2026-09-16）
 
-第一、二部分里已落地的项，按提交顺序（P0 全部完成）：
+第一、二部分里已落地的项，按提交顺序（P0 全部完成，P1 大部分，P2 部分）：
 
 | 项 | 提交 | 验证 |
 |---|---|---|
@@ -378,12 +378,22 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | D-09/D-21/D-22/D-23 缩放与平滑四小项 | `f2e05ce` | 关键帧透传、窗口下限、迭代次数、帧索引取整 |
 | A-11 get_checksum 补齐字段集 | `f2e05ce` | 11 项参数逐一断言影响哈希 |
 | D-05 max-zoom 反馈回路（此前 max_zoom 完全无效） | `bfb11d9` | max_zoom=110 时限制 0.3946 且 fovs 随之变化；130 不触发 |
+| C-07 容器旋转元数据（tkhd 矩阵） | `3aadd0d` | 手工构造 v0/v1 tkhd + 与 `ffmpeg -display_rotation` 三方对齐 |
+| C-01 PNG/EXR 图像序列输出 | `3aadd0d` | 30 帧序列进出帧数一致；EXR 用 `gbrpf32le` |
+| C-06 `.gyroflow` 工程读写 + base91/zlib/bincode/CBOR 编解码 | `待提交` | 两个官方工程 JSON 层往返「缺失键 [] / 变化键 {}」；base91/bincode 与仓库内独立解码器逐字节一致；CBOR 按规范和 nalgebra serde 推导后按位固化 |
 
 **实施中新发现的、原清单没有的缺陷**：
 
 - `default_algo`/`plain` 用 `if frame in fov_limit_per_frame:` 读逐帧限制——对 list 是**值成员测试**，浮点限制值永远不匹配，限制实际从未生效（`bfb11d9`）。
 - `gpu/backend.py` 的 pipeline 缓存 key 只哈希 shader 源码、不含 pipeline 常量，某个畸变模型首次建出的 kernel 会被整个进程复用（`cd705a0`）。
 - 测试夹具 `tests/test_e2e.py` 的合成 GoPro mp4 的 `hdlr` 只有裸 `gpmd`，而真机是 `mhlr`/`meta` + Pascal 串 `GoPro MET`（`12f2eb6`）。
+
+**做 C-06 时新发现的缺陷**：
+
+- **工程文件的版本号不是装饰**。上游当前写 `"version": 4`；`import_gyroflow_data` 把 `project_version` 存进 `FileLoadOptions`，`gyro_source/mod.rs:365,447` 用它决定 RED 素材是否要做"旧版陀螺时间戳偏移"。我最初的实现固定写 2，会让真 Gyroflow 去剥一个我们从没加过的偏移。改为写 4，并补齐 v4 才有的字段（`stabilization.frame_offset`/`focal_length_smoothing_*`、`gyro_source.sample_index`/`detected_source`、`video_info.created_at`），否则读了版本号的下游会找不到它该有的字段。
+- **两类 blob 的载荷编码不同**，此前 `util.py` 的注释写成笼统的"bincode/cbor"。按 `util.rs`：`gyro_source` 家族的 `quaternions`/`raw_imu`/`image_orientations`/`gravity_vectors` 走 `compress_to_base91`（bincode legacy），`WithProcessedData` 导出的 `integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps*`/`focal_lengths` 走 `compress_to_base91_cbor`（CBOR）。用错编码器不会报错，只会读出垃圾——`gravity_vectors` 每项 32 字节而非 40，`raw_imu` 的行长还是变长的（`Option<[f64;3]>` 带 1 字节 tag）。
+- `json.dump` 默认 `allow_nan=True` 会写出裸 `NaN`/`Infinity`，生成一个别的解析器（含 Gyroflow）读不了的文件；已改 `allow_nan=False`，让它在写的时候炸而不是交付一个坏文件。
+- `StabilizationParams` 是 numpy 支撑的，`params.fov` 是 `float32`，**`json.dump` 直接拒收**——任何一次真实保存都会 `TypeError`。已在 JSON 边界统一做 `_jsonable` 归一（numpy 标量取 `.item()`，数组转 list），对应上游 serde 把 f32 写成 f64。
 
 **原清单中经复核被推翻的结论**：
 
@@ -430,7 +440,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | B-01/B-02 offset method 0/1 | 两套算法 |
 | B-23 OptimSync 尺度 | **先量新尺度再重标定阈值** |
 | C-02/C-03 位深/HDR 管线 | 需先补像素格式类型 |
-| C-06 `.gyroflow` 工程读写 | 依赖 C-15 的 base91 |
+| C-06 余下：CLI 吃工程文件/preset、`file_metadata`/`raw_imu` 写出 | 读写层已就绪，缺接线 |
 | C-01 序列输出 | 与已完成的序列输入对称 |
 
 ---

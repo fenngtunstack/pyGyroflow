@@ -15,6 +15,24 @@ from typing import Any
 import numpy as np
 
 
+# Gyroflow's DistortionModelType discriminants, keyed by the model name this
+# port uses; written into `distortion_model_id` when saving a calibration.
+_DISTORTION_MODEL_IDS: dict[str, int] = {
+    "": 0,
+    "opencv_fisheye": 0,
+    "opencv_standard": 1,
+    "poly3": 2,
+    "poly5": 3,
+    "ptlens": 4,
+    "insta360": 5,
+    "sony": 6,
+    "gopro_superview": 7,
+    "gopro6_superview": 7,
+    "gopro_hyperview": 8,
+    "digital_stretch": 9,
+}
+
+
 def _gcd(a: int, b: int) -> int:
     """Greatest common divisor."""
     while b:
@@ -222,6 +240,85 @@ class LensProfile:
             p.checksum = str(data["checksum"])
 
         return p
+
+    def get_json_value(self) -> dict[str, Any]:
+        """Serialise back to the JSON shape Gyroflow reads and writes.
+
+        Inverse of :meth:`from_json`, and what lands in a `.gyroflow`
+        project's ``calibration_data``.
+
+        The base keys are always written — that is what Gyroflow does — so
+        a profile that never computed a value writes ``null`` rather than
+        omitting the key. Everything past ``distortion_model_id`` is an
+        optional extension and only appears when the profile actually
+        carries it, which is what keeps a round-trip of an older file from
+        growing keys it did not have.
+        """
+        # A profile parsed from JSON may leave this None; the file format
+        # spells the model out through use_opencv_fisheye / _standard.
+        model = self.distortion_model or ""
+        out: dict[str, Any] = {
+            "name": self.name,
+            "note": self.note,
+            "calibrated_by": self.calibrated_by,
+            "camera_brand": self.camera_brand,
+            "camera_model": self.camera_model,
+            "lens_model": self.lens_model,
+            "camera_setting": self.camera_setting,
+            "calib_dimension": dict(self.calib_dimension),
+            "orig_dimension": dict(self.orig_dimension),
+            "frame_readout_time": self.frame_readout_time,
+            "gyro_lpf": self.gyro_lpf,
+            "input_horizontal_stretch": self.input_horizontal_stretch,
+            "input_vertical_stretch": self.input_vertical_stretch,
+            "num_images": self.num_images,
+            "fps": self.fps,
+            "official": self.official,
+            "asymmetrical": self.asymmetrical,
+            "use_opencv_fisheye": model in ("", "opencv_fisheye"),
+            "fisheye_params": {
+                "RMS_error": self.rms_error,
+                "camera_matrix": [list(row) for row in self.camera_matrix],
+                "distortion_coeffs": list(self.distortion_coeffs),
+                "radial_distortion_limit": self.radial_distortion_limit,
+            },
+            "use_opencv_standard": model == "opencv_standard",
+            "calib_params": {
+                "RMS_error": 0.0,
+                "camera_matrix": [],
+                "distortion_coeffs": [],
+                "radial_distortion_limit": None,
+            },
+            "identifier": self.identifier,
+            "calibrator_version": self.calibrator_version,
+            "date": self.date,
+            "compatible_settings": list(self.compatible_settings),
+            "is_superview": bool(self.digital_lens == "gopro_superview"),
+            "distortion_model_id": _DISTORTION_MODEL_IDS.get(model, 0),
+        }
+        if self.output_dimension is not None:
+            out["output_dimension"] = dict(self.output_dimension)
+        if self.crop is not None:
+            out["crop"] = self.crop
+        if self.digital_lens:
+            out["digital_lens"] = self.digital_lens
+        if self.digital_lens_params is not None:
+            out["digital_lens_params"] = list(self.digital_lens_params)
+        if self.focal_length is not None:
+            out["focal_length"] = self.focal_length
+        if self.crop_factor is not None:
+            out["crop_factor"] = self.crop_factor
+        if self.global_shutter:
+            out["global_shutter"] = True
+        if self.interpolations_raw is not None:
+            out["interpolations"] = self.interpolations_raw
+        if self.sync_settings is not None:
+            out["sync_settings"] = self.sync_settings
+        if self.optimal_fov is not None:
+            out["optimal_fov"] = self.optimal_fov
+        if self.checksum is not None:
+            out["checksum"] = self.checksum
+        return out
 
     # --------------------------------------------------------------------- #
     #  Camera matrix / distortion accessors                                   #

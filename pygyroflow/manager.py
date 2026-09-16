@@ -11,6 +11,7 @@ Python's GIL provides sufficient synchronization for the intended use cases
 
 from __future__ import annotations
 
+import datetime
 import logging
 import math
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from pygyroflow.smoothing import Smoothing, get_max_angles
 from pygyroflow.keyframes import KeyframeManager, KeyframeType
 from pygyroflow.stabilization import ComputeParams, FrameTransform
 from pygyroflow.stabilization_params import StabilizationParams
+from pygyroflow.types.enums import ReadoutDirection
 from pygyroflow.types.errors import GyroflowError, TelemetryParseError, VideoIOError
 
 log = logging.getLogger(__name__)
@@ -360,6 +362,305 @@ class StabilizationManager:
     # ------------------------------------------------------------------
     # Recomputation pipeline
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # .gyroflow project files
+    # ------------------------------------------------------------------
+
+    def load_project(self, path: str) -> None:
+        """Adopt a `.gyroflow` project.
+
+        Applies the settings this port models and keeps the rest — the raw
+        sections round-trip untouched through :meth:`save_project`, so a file
+        written by a newer Gyroflow is not silently reduced.
+        """
+        from pygyroflow.project import GyroflowProject
+
+        proj = GyroflowProject.load(path)
+        self.project = proj
+        self.input_file.project_file_url = path
+        if proj.videofile:
+            self.input_file.url = proj.videofile
+        if proj.image_sequence_fps:
+            self.input_file.image_sequence_fps = proj.image_sequence_fps
+        if proj.image_sequence_start:
+            self.input_file.image_sequence_start = proj.image_sequence_start
+
+        info = proj.video_info
+        if info.width and info.height:
+            self.params.size = (info.width, info.height)
+        if info.fps:
+            self.params.fps = info.fps
+        if info.num_frames:
+            self.params.frame_count = info.num_frames
+        if info.duration_ms:
+            self.params.duration_ms = info.duration_ms
+        if info.fps_scale is not None:
+            self.params.fps_scale = info.fps_scale
+        self.params.video_rotation = info.rotation
+
+        if proj.calibration_data:
+            self._apply_project_calibration(proj.calibration_data)
+
+        stab = proj.stabilization
+        if stab:
+            self._apply_project_stabilization(stab)
+
+        gyro_src = proj.gyro_source
+        if gyro_src:
+            t = self.gyro.imu_transforms
+            if "lpf" in gyro_src:
+                t.imu_lpf = float(gyro_src["lpf"] or 0.0)
+            if "mf" in gyro_src:
+                t.imu_mf = int(gyro_src["mf"] or 0)
+            if gyro_src.get("rotation"):
+                t.imu_rotation_angles = tuple(float(v) for v in gyro_src["rotation"])
+            if gyro_src.get("acc_rotation"):
+                t.acc_rotation_angles = tuple(
+                    float(v) for v in gyro_src["acc_rotation"]
+                )
+            if gyro_src.get("imu_orientation"):
+                t.imu_orientation = str(gyro_src["imu_orientation"])
+            if gyro_src.get("gyro_bias"):
+                t.gyro_bias = [float(v) for v in gyro_src["gyro_bias"]]
+            if "integration_method" in gyro_src:
+                self.gyro.integration_method = int(gyro_src["integration_method"])
+
+        self.gyro.set_offsets({int(k): float(v) for k, v in proj.offsets.items()})
+
+        self.params.background = tuple(float(v) for v in proj.background_color)
+        self.params.background_mode = proj.background_mode
+        self.params.background_margin = proj.background_margin
+        self.params.background_margin_feather = proj.background_margin_feather
+        self.params.light_refraction_coefficient = proj.light_refraction_coefficient
+
+        duration = proj.video_info.duration_ms or self.params.duration_ms
+        if proj.trim_ranges_ms:
+            # A negative end is relative to the clip's end, not a wrap-around;
+            # import_gyroflow_data does the same fold (lib.rs).
+            self.params.trim_ranges = [
+                (
+                    (a / duration, (duration + b if b < 0.0 else b) / duration)
+                    if duration
+                    else (0.0, 1.0)
+                )
+                for a, b in proj.trim_ranges_ms
+            ]
+        elif proj.trim_start or proj.trim_end != 1.0:
+            self.params.trim_ranges = [(proj.trim_start, proj.trim_end)]
+        else:
+            self.params.trim_ranges = []
+
+        log.info(
+            "Loaded project %s (version %d, %d field(s))",
+            path, proj.version, len(proj.to_dict()),
+        )
+
+    def _apply_project_calibration(self, calibration_data: dict) -> None:
+        """Build a LensProfile from the project's calibration_data."""
+        from pygyroflow.lens import LensProfile
+
+        try:
+            self.lens = LensProfile.from_json(dict(calibration_data))
+        except Exception:
+            log.warning(
+                "Could not load the project's calibration data", exc_info=True
+            )
+
+    def _apply_project_stabilization(self, stab: dict) -> None:
+        """Apply the `stabilization` section to params and the smoothing algo."""
+        p = self.params
+
+        def get(key: str, default=None):
+            value = stab.get(key, default)
+            return default if value is None else value
+
+        p.fov = float(get("fov", p.fov))
+        p.frame_readout_time = abs(float(get("frame_readout_time", p.frame_readout_time)))
+        if "frame_readout_direction" in stab:
+            try:
+                p.frame_readout_direction = ReadoutDirection(
+                    int(stab["frame_readout_direction"])
+                )
+            except (ValueError, TypeError):
+                log.warning(
+                    "Unknown frame_readout_direction %r in project",
+                    stab["frame_readout_direction"],
+                )
+        p.adaptive_zoom_window = float(get("adaptive_zoom_window", p.adaptive_zoom_window))
+        if stab.get("adaptive_zoom_center_offset"):
+            p.adaptive_zoom_center_offset = tuple(
+                float(v) for v in stab["adaptive_zoom_center_offset"]
+            )
+        if "adaptive_zoom_method" in stab:
+            p.adaptive_zoom_method = int(stab["adaptive_zoom_method"])
+        if stab.get("additional_rotation"):
+            p.additional_rotation = tuple(float(v) for v in stab["additional_rotation"])
+        if stab.get("additional_translation"):
+            p.additional_translation = tuple(
+                float(v) for v in stab["additional_translation"]
+            )
+        p.lens_correction_amount = float(
+            get("lens_correction_amount", p.lens_correction_amount)
+        )
+        if "max_zoom" in stab:
+            p.max_zoom = float(stab["max_zoom"]) if stab["max_zoom"] is not None else None
+        if "max_zoom_iterations" in stab:
+            p.max_zoom_iterations = int(stab["max_zoom_iterations"])
+        for flag in (
+            "video_speed_affects_smoothing",
+            "video_speed_affects_zooming",
+            "video_speed_affects_zooming_limit",
+        ):
+            if flag in stab:
+                setattr(p, flag, bool(stab[flag]))
+        if "video_speed" in stab:
+            p.video_speed = float(stab["video_speed"] or 1.0)
+
+        amount = float(stab.get("horizon_lock_amount") or 0.0)
+        roll = float(stab.get("horizon_lock_roll") or 0.0)
+        pitch_enabled = bool(stab.get("horizon_lock_pitch_enabled") or False)
+        pitch = float(stab.get("horizon_lock_pitch") or 0.0)
+        self.smoothing.horizon_lock.set_horizon(
+            lock_percent=amount, roll=roll,
+            lock_pitch=pitch_enabled, pitch=pitch,
+        )
+
+        method = stab.get("method")
+        if method:
+            names = self.smoothing.get_names()
+            if method in names:
+                self.smoothing.set_current(names.index(method))
+            else:
+                log.warning("Unknown smoothing method %r in project", method)
+        for entry in stab.get("smoothing_params") or []:
+            if isinstance(entry, dict) and "name" in entry:
+                self.smoothing.current().set_parameter(
+                    entry["name"], float(entry["value"])
+                )
+
+        if bool(get("use_gravity_vectors", False)):
+            self.gyro.use_gravity_vectors = True
+        if "horizon_lock_integration_method" in stab:
+            self.gyro.horizon_lock_integration_method = int(
+                stab["horizon_lock_integration_method"]
+            )
+
+    def save_project(self, path: str) -> None:
+        """Write the current state out as a `.gyroflow` project.
+
+        Sections the loader kept verbatim are written back unchanged; the
+        ones this port owns are rebuilt from live state.
+
+        `app_version` and `date` are stamped from the writer, as upstream's
+        `export_gyroflow_data` does — they describe who produced the file,
+        so carrying the loaded file's values over would be a false claim.
+        """
+        import pygyroflow
+        from pygyroflow.project import PROJECT_VERSION, GyroflowProject
+
+        proj = getattr(self, "project", None) or GyroflowProject()
+        self.project = proj
+
+        proj.version = PROJECT_VERSION
+        proj.app_version = pygyroflow.__version__
+        proj.date = datetime.date.today().isoformat()
+        if not proj.videofile:
+            proj.videofile = self.input_file.url
+        if self.lens is not None:
+            try:
+                proj.calibration_data = self.lens.get_json_value()
+            except Exception:
+                log.warning("Could not serialise the lens into the project", exc_info=True)
+
+        p = self.params
+        # Only overwrite the sections the caller actually owns; a project
+        # loaded from disk keeps its extra keys.
+        proj.video_info = type(proj.video_info).from_dict(
+            {
+                **proj.video_info.to_dict(),
+                "width": p.size[0],
+                "height": p.size[1],
+                "rotation": p.video_rotation,
+                "num_frames": p.frame_count,
+                "fps": p.fps,
+                "duration_ms": p.duration_ms,
+                "fps_scale": p.fps_scale,
+                "vfr_fps": p.get_scaled_fps(),
+                "vfr_duration_ms": p.get_scaled_duration_ms(),
+                "created_at": p.video_created_at,
+            }
+        )
+        proj.stabilization = {
+            **proj.stabilization,
+            "fov": p.fov,
+            "method": self.smoothing.current().get_name(),
+            "smoothing_params": [
+                {"name": e["name"], "value": e["value"]}
+                for e in self.smoothing.current().get_parameters_json()
+                if isinstance(e, dict) and "name" in e and "value" in e
+            ],
+            "frame_readout_time": abs(p.frame_readout_time),
+            "frame_readout_direction": int(p.frame_readout_direction),
+            "adaptive_zoom_window": p.adaptive_zoom_window,
+            "adaptive_zoom_center_offset": list(p.adaptive_zoom_center_offset),
+            "adaptive_zoom_method": p.adaptive_zoom_method,
+            "additional_rotation": list(p.additional_rotation),
+            "additional_translation": list(p.additional_translation),
+            "lens_correction_amount": p.lens_correction_amount,
+            "horizon_lock_amount": (
+                self.smoothing.horizon_lock.horizonlockpercent
+                if self.smoothing.horizon_lock.lock_enabled else 0.0
+            ),
+            "horizon_lock_roll": self.smoothing.horizon_lock.horizonroll,
+            "horizon_lock_pitch_enabled": self.smoothing.horizon_lock.lock_pitch,
+            "horizon_lock_pitch": self.smoothing.horizon_lock.horizonpitch,
+            "use_gravity_vectors": self.gyro.use_gravity_vectors,
+            "horizon_lock_integration_method": self.gyro.horizon_lock_integration_method,
+            "video_speed": p.video_speed,
+            "video_speed_affects_smoothing": p.video_speed_affects_smoothing,
+            "video_speed_affects_zooming": p.video_speed_affects_zooming,
+            "video_speed_affects_zooming_limit": p.video_speed_affects_zooming_limit,
+            "max_zoom": p.max_zoom,
+            "max_zoom_iterations": p.max_zoom_iterations,
+            # Added in project version 4.
+            "frame_offset": p.frame_offset,
+            "focal_length_smoothing_enabled": p.focal_length_smoothing_enabled,
+            "focal_length_smoothing_strength": p.focal_length_smoothing_strength,
+        }
+        t = self.gyro.imu_transforms
+        proj.gyro_source = {
+            **proj.gyro_source,
+            "filepath": self.gyro.file_url or self.input_file.url,
+            "lpf": t.imu_lpf,
+            "mf": t.imu_mf,
+            "rotation": list(t.imu_rotation_angles) if t.imu_rotation_angles else None,
+            "acc_rotation": list(t.acc_rotation_angles) if t.acc_rotation_angles else None,
+            "imu_orientation": t.imu_orientation,
+            "gyro_bias": list(t.gyro_bias) if t.gyro_bias else None,
+            "integration_method": self.gyro.integration_method,
+            # Added in project version 4.
+            "sample_index": self.gyro.file_load_options.sample_index,
+            "detected_source": getattr(self.gyro.file_metadata, "detected_source", None),
+        }
+        proj.background_color = list(p.background)
+        proj.background_mode = int(p.background_mode)
+        proj.background_margin = p.background_margin
+        proj.background_margin_feather = p.background_margin_feather
+        proj.light_refraction_coefficient = p.light_refraction_coefficient
+        proj.offsets = {int(k): float(v) for k, v in self.gyro.get_offsets().items()}
+        if p.trim_ranges:
+            proj.trim_ranges_ms = [
+                [a * p.duration_ms, b * p.duration_ms] for a, b in p.trim_ranges
+            ]
+            proj.trim_start, proj.trim_end = p.trim_ranges[0][0], p.trim_ranges[-1][1]
+        else:
+            proj.trim_ranges_ms = []
+            proj.trim_start, proj.trim_end = 0.0, 1.0
+
+        proj.save(path)
+        self.input_file.project_file_url = path
+        log.info("Saved project %s", path)
 
     def recompute_smoothing(self) -> None:
         """Recompute smoothed quaternions.
