@@ -1082,6 +1082,10 @@ class StabilizationManager:
 
         from pygyroflow.rendering import FfmpegProcessor
         from pygyroflow.stabilization import cpu_undistort
+        from pygyroflow.stabilization.cpu_undistort import (
+            CPU_TO_UPSTREAM_INTERPOLATION,
+        )
+        from pygyroflow.types.enums import Interpolation
 
         codec = options.get("codec", "H.265/HEVC")
         bitrate = options.get("bitrate", 0)
@@ -1154,6 +1158,13 @@ class StabilizationManager:
                 # Patch kernel params for GPU shader requirements
                 kp = transform.kernel_params
                 channels = frame_data.shape[2] if frame_data.ndim == 3 else 1
+                # The shader counts taps: its `interpolation` is 2/4/8/10-13,
+                # while `interp_index` above is the CPU path's 0/1/2/3-6. The
+                # two disagree on "2", so translate instead of passing it on
+                # (which silently downgraded every GPU render to bilinear).
+                kp.interpolation = CPU_TO_UPSTREAM_INTERPOLATION.get(
+                    interp_index, int(Interpolation.Lanczos4)
+                )
                 kp.output_stride = out_w * channels
                 kp.max_pixel_value = 255.0
                 kp.pixel_value_limit = 255.0

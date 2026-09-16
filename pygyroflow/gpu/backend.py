@@ -112,12 +112,18 @@ class WgpuBackend:
     ) -> object:
         """Return a cached compute pipeline or create a new one.
 
-        Caching is based on a hash of the shader source so the pipeline
-        is reused across frames when the distortion model does not change.
+        The cache key covers the shader source *and* the pipeline constants.
+        Keying on the source alone meant the first pipeline built for a given
+        distortion model was reused for the rest of the process, so every
+        later change to a constant — the interpolation kernel above all — was
+        silently dropped.
         """
         import hashlib
 
-        key = hashlib.sha256(shader_code.encode()).hexdigest()
+        key = hashlib.sha256(
+            shader_code.encode()
+            + repr(sorted(pipeline_constants.items())).encode()
+        ).hexdigest()
         if key in self._pipeline_cache:
             return self._pipeline_cache[key]
 

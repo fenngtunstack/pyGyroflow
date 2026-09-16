@@ -22,7 +22,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation
 
-from pygyroflow.types.enums import BackgroundMode, ReadoutDirection
+from pygyroflow.types.enums import BackgroundMode, Interpolation, ReadoutDirection
 from pygyroflow.types.kernel_params import KernelParams
 from pygyroflow.types.quaternion import Quat64
 from pygyroflow.gyro_source.source import GyroSource
@@ -417,7 +417,12 @@ class FrameTransform:
         kernel_params.output_width = params.output_width
         kernel_params.output_height = params.output_height
         kernel_params.matrix_count = num_rows
-        kernel_params.interpolation = 2  # Bilinear
+        # Upstream's numbering, not the CPU path's: 8 is Lanczos4, which is
+        # upstream's default. This used to be 2 with a "Bilinear" comment —
+        # 2 means Bilinear *to the shader* (it is the tap count there), so
+        # the GPU silently rendered every frame at the lowest-quality kernel
+        # while the CPU path read the same 2 as Lanczos4.
+        kernel_params.interpolation = int(Interpolation.Lanczos4)
 
         kernel_params.background_mode = int(params.background_mode)
         # HORIZONTAL_RS flag (bit 4, value 16): rolling-shutter direction is

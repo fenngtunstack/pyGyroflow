@@ -30,13 +30,26 @@ class ReadoutDirection(IntEnum):
 
 
 class Interpolation(IntEnum):
-    """Image interpolation method for GPU undistortion."""
+    """Resampling kernel, using upstream Gyroflow's values.
 
-    Nearest = 1
+    These are the numbers that belong in ``KernelParams.interpolation`` and
+    are uploaded to the WGSL shader, where the 2/4/8 entries double as the
+    kernel's tap count.
+
+    They are **not** the numbers ``stabilization.cpu_undistort`` takes — that
+    path indexes 0=Bilinear / 1=Bicubic / 2=Lanczos4 / 3-6=EWA. The two
+    conventions collide (both use "2"), so the conversion lives in
+    ``stabilization.cpu_undistort.CPU_TO_UPSTREAM_INTERPOLATION``. The old
+    values here (Nearest=1, EWA=16) existed in neither.
+    """
+
     Bilinear = 2
     Bicubic = 4
     Lanczos4 = 8
-    EWA = 16
+    RobidouxSharp = 10
+    Robidoux = 11
+    Mitchell = 12
+    CatmullRom = 13
 
 
 class DistortionModelType(IntEnum):

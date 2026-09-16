@@ -30,6 +30,22 @@ from pygyroflow.stabilization.ewa import EWA_FILTERS, ewa_sample, map_jacobian
 from pygyroflow.stabilization.frame_transform import FrameTransform
 from pygyroflow.types.kernel_params import KernelParams
 
+# The interpolation indices THIS module (and the CLI/GUI options that feed
+# it) uses are zero-based: 0=Bilinear, 1=Bicubic, 2=Lanczos4, 3-6=EWA.
+# Upstream Gyroflow — and therefore ``KernelParams.interpolation``, which is
+# uploaded to the WGSL shader — numbers the same filters 2/4/8/10-13, where
+# the value is also the kernel's tap count. The two collide on "2", so a
+# value going to the GPU has to be translated rather than passed through.
+CPU_TO_UPSTREAM_INTERPOLATION: dict[int, int] = {
+    0: 2,    # Bilinear
+    1: 4,    # Bicubic
+    2: 8,    # Lanczos4
+    3: 10,   # EWA RobidouxSharp
+    4: 11,   # EWA Robidoux
+    5: 12,   # EWA Mitchell
+    6: 13,   # EWA Catmull-Rom
+}
+
 # KernelParamsFlags::HORIZONTAL_RS (1 << 4)
 _HORIZONTAL_RS_FLAG = 16
 
