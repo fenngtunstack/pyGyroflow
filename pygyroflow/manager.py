@@ -536,25 +536,60 @@ class StabilizationManager:
     def _load_project_motion(self, proj) -> bool:
         """Load a project's embedded gyro into the gyro source.
 
-        This is the ``WithGyroData`` / ``WithProcessedData`` case: the project
-        carries its own IMU, so it can be stabilized without the original
-        clip's telemetry (and, for an external ``.gyro``/CSV source, without
-        that file either). ``Simple`` projects carry none and return False.
+        Returns True when something was loaded. This mirrors the branch order
+        of ``import_gyroflow_data`` (lib.rs), which is worth spelling out
+        because the two payload shapes are easy to conflate:
 
-        Upstream decodes the same four fields into the same struct
-        (``import_gyroflow_data``): ``raw_imu`` and ``quaternions`` as
-        bincode, ``gravity_vectors`` and ``image_orientations`` alongside.
+        1. The project counts as carrying data if its gyro file is a *different*
+           file from the video, or if the decoded ``file_metadata`` has motion.
+        2. Its ``gyro_source`` blobs are bincode, and hold either a full IMU
+           stream (``raw_imu``) or pre-integrated ``quaternions``.
+        3. ``file_metadata`` is CBOR and holds the whole metadata struct. It is
+           the *fallback*: upstream uses the bincode ``raw_imu`` when that is
+           non-empty and only reaches for ``file_metadata`` when it is not.
+
+        That last ordering is what a real Gyroflow 1.6.3 export needs. Those
+        write ``gyro_source.raw_imu``/``quaternions`` as ``null`` and keep
+        everything in ``file_metadata`` plus ``integrated_quaternions``, so a
+        loader that only knows the bincode branch finds no gyro at all in a
+        project that has 25185 samples of it.
+
+        Not implemented: upstream's final fallback, loading the gyro data out
+        of a separate ``gyro_source.filepath`` file. This port has no sidecar
+        loader, so a project in that shape is reported instead of silently
+        coming back empty.
         """
         from pygyroflow.gyro_source import FileMetadata
         from pygyroflow.types.quaternion import Quat64
         from pygyroflow.types.time_types import TimeIMU
 
+        gyro_src = proj.gyro_source or {}
+        built_in = None
+        if isinstance(gyro_src.get("file_metadata"), str):
+            try:
+                built_in = proj.read_blob("file_metadata")
+            except Exception:
+                log.warning("Could not decode file_metadata", exc_info=True)
+
+        gyro_path = gyro_src.get("filepath") or ""
+        gyro_is_another_file = bool(gyro_path) and gyro_path != (proj.videofile or "")
+        bincode_blobs_present = any(
+            gyro_src.get(name)
+            for name in ("quaternions", "raw_imu", "gravity_vectors", "image_orientations")
+        )
+        # Upstream's gate is the first two clauses. The third is this port's:
+        # our own writer has produced projects that carry a `quaternions` blob
+        # without a `file_metadata` (upstream always writes both for a non-Simple
+        # export, so it has no equivalent shape). Without it such a project
+        # loads as empty.
+        if not (gyro_is_another_file or bincode_blobs_present
+                or (built_in is not None and built_in.has_motion())):
+            return False
+
         quats = proj.read_blob("quaternions")
         raw_imu = proj.read_blob("raw_imu")
         gravity = proj.read_blob("gravity_vectors")
         orientations = proj.read_blob("image_orientations")
-        if not (quats or raw_imu or gravity or orientations):
-            return False
 
         def as_quats(blob):
             if not blob:
@@ -565,7 +600,7 @@ class StabilizationManager:
             }
 
         metadata = FileMetadata(
-            imu_orientation=proj.gyro_source.get("imu_orientation"),
+            imu_orientation=gyro_src.get("imu_orientation"),
             raw_imu=[
                 TimeIMU(
                     timestamp_ms=sample[0],
@@ -585,10 +620,30 @@ class StabilizationManager:
                 else None
             ),
             image_orientations=as_quats(orientations) or None,
-            detected_source=proj.gyro_source.get("detected_source"),
+            detected_source=gyro_src.get("detected_source"),
         )
-        self.gyro.load_from_telemetry(metadata)
-        return True
+
+        # Upstream only uses these blobs when `raw_imu` is non-empty, and
+        # otherwise falls through to re-reading the video's telemetry. This
+        # port uses whatever the blobs carry — a project that embedded
+        # `quaternions` said what it wanted, and the alternative here would be
+        # to go and parse a clip the caller may not even have loaded.
+        if (metadata.raw_imu or metadata.quaternions
+                or metadata.gravity_vectors or metadata.image_orientations):
+            self.gyro.load_from_telemetry(metadata)
+            return True
+
+        if built_in is not None:
+            self.gyro.load_from_telemetry(built_in)
+            return True
+
+        if gyro_is_another_file:
+            log.info(
+                "Project points at a separate gyro file (%s); this port has no "
+                "sidecar loader, so no gyro data was read",
+                gyro_path,
+            )
+        return False
 
     def output_options(self) -> dict:
         """The project's `output` section, for a caller building render options.
@@ -632,6 +687,29 @@ class StabilizationManager:
         if "sample_index" in gyro_src and gyro_src["sample_index"] is not None:
             self.gyro.file_load_options.sample_index = int(gyro_src["sample_index"])
 
+    @staticmethod
+    def _readout_direction_from_project(value, fallback: ReadoutDirection) -> ReadoutDirection:
+        """Parse ``stabilization.frame_readout_direction`` from a project.
+
+        Real Gyroflow 1.6.3 exports write the variant **name**
+        (``"TopToBottom"``), because serde serializes a unit enum as its
+        variant name; the field is not an integer in any file this port has
+        seen. Upstream accepts both — ``as_i64`` first, then ``as_str`` — so
+        both are accepted here too, and anything else keeps the previous value
+        rather than failing the load.
+        """
+        if isinstance(value, str):
+            try:
+                return ReadoutDirection[value]
+            except KeyError:
+                log.warning("Unknown frame_readout_direction %r in project", value)
+                return fallback
+        try:
+            return ReadoutDirection(int(value))
+        except (ValueError, TypeError):
+            log.warning("Unknown frame_readout_direction %r in project", value)
+            return fallback
+
     def _apply_project_stabilization(self, stab: dict) -> None:
         """Apply the `stabilization` section to params and the smoothing algo."""
         p = self.params
@@ -641,17 +719,17 @@ class StabilizationManager:
             return default if value is None else value
 
         p.fov = float(get("fov", p.fov))
-        p.frame_readout_time = abs(float(get("frame_readout_time", p.frame_readout_time)))
+        # The sign is kept, not dropped: upstream reads a negative readout time
+        # as "this sensor reads bottom to top" and nothing else carries that.
+        # Every consumer inside frame_transform takes abs() itself.
+        readout_time = float(get("frame_readout_time", p.frame_readout_time))
+        p.frame_readout_time = readout_time
+        if readout_time < 0.0:
+            p.frame_readout_direction = ReadoutDirection.BottomToTop
         if "frame_readout_direction" in stab:
-            try:
-                p.frame_readout_direction = ReadoutDirection(
-                    int(stab["frame_readout_direction"])
-                )
-            except (ValueError, TypeError):
-                log.warning(
-                    "Unknown frame_readout_direction %r in project",
-                    stab["frame_readout_direction"],
-                )
+            p.frame_readout_direction = self._readout_direction_from_project(
+                stab["frame_readout_direction"], p.frame_readout_direction
+            )
         p.adaptive_zoom_window = float(get("adaptive_zoom_window", p.adaptive_zoom_window))
         if stab.get("adaptive_zoom_center_offset"):
             p.adaptive_zoom_center_offset = tuple(

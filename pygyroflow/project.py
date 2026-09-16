@@ -34,6 +34,10 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from pygyroflow.gyro_source.file_metadata_cbor import (  # noqa: F401  (codec table)
+    decode_file_metadata,
+    encode_file_metadata,
+)
 from pygyroflow.util import (
     compress_to_base91,
     decode_cbor_f64_list,
@@ -105,6 +109,10 @@ _CBOR_READERS = {
     "synced_imu_timestamps_with_per_frame_offset": decode_cbor_f64_list,
     "focal_lengths": decode_cbor_f64_list,
     "smoothed_focal_lengths": decode_cbor_f64_list,
+    # The whole FileMetadata struct. Not a plain value like the others: it
+    # decodes to a FileMetadata, which is the payload a WithGyroData /
+    # WithProcessedData project keeps its IMU in.
+    "file_metadata": decode_file_metadata,
 }
 
 # Which encoder :meth:`GyroflowProject.write_blob` uses for each name.
@@ -117,6 +125,7 @@ _BLOB_WRITERS = {
     "synced_imu_timestamps_with_per_frame_offset": encode_cbor_f64_list,
     "focal_lengths": encode_cbor_f64_list,
     "smoothed_focal_lengths": encode_cbor_f64_list,
+    "file_metadata": encode_file_metadata,
 }
 
 # Readable but not writable here: their entry layouts are not the quaternion

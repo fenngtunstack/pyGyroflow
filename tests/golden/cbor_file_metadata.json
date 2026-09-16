@@ -1,0 +1,543 @@
+{
+  "_provenance": "ciborium 0.2.2 output for Gyroflow's FileMetadata and its constituent structs, produced by a scratch crate that mirrors the upstream struct definitions field-for-field (see _generator). NOT produced by the Python port: every case here is bytes the Rust CBOR writer emitted.",
+  "_generator": "tests/golden/generate_file_metadata_reference.py",
+  "_real_file_check": "tests/test_file_metadata_cbor.py additionally round-trips the file_metadata blob of a real Gyroflow 1.6.3 export (DJI_20260507160359_0005_D.gyroflow, 1059160 bytes) byte for byte.",
+  "cases": [
+    {
+      "name": "imu_all_channel_combinations",
+      "op": "imu_list",
+      "input": [
+        {
+          "timestamp_ms": 0.0,
+          "gyro": null,
+          "accl": null,
+          "magn": null
+        },
+        {
+          "timestamp_ms": 0.5,
+          "gyro": [
+            1.0,
+            -2.5,
+            0.25
+          ],
+          "accl": null,
+          "magn": null
+        },
+        {
+          "timestamp_ms": 3.25,
+          "gyro": [
+            0.1,
+            0.2,
+            0.3
+          ],
+          "accl": [
+            9.81,
+            0.0,
+            -9.81
+          ],
+          "magn": [
+            1.5,
+            2.5,
+            3.5
+          ]
+        },
+        {
+          "timestamp_ms": 1000.0,
+          "gyro": null,
+          "accl": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "magn": null
+        }
+      ],
+      "cbor": "84a46c74696d657374616d705f6d73f90000646779726ff6646163636cf6646d61676ef6a46c74696d657374616d705f6d73f93800646779726f83f93c00f9c100f93400646163636cf6646d61676ef6a46c74696d657374616d705f6d73f94280646779726f83fb3fb999999999999afb3fc999999999999afb3fd3333333333333646163636c83fb40239eb851eb851ff90000fbc0239eb851eb851f646d61676e83f93e00f94100f94300a46c74696d657374616d705f6d73f963d0646779726ff6646163636c83f90000f90000f90000646d61676ef6"
+    },
+    {
+      "name": "imu_empty",
+      "op": "imu_list",
+      "input": [],
+      "cbor": "80"
+    },
+    {
+      "name": "lens_params_full_and_empty",
+      "op": "lens_params_map",
+      "input": {
+        "0": {},
+        "1": {
+          "focal_length": 85.0,
+          "pixel_pitch": [
+            3400,
+            3400
+          ],
+          "sensor_size_px": [
+            6000,
+            4000
+          ],
+          "capture_area_origin": [
+            0.0,
+            120.5
+          ],
+          "capture_area_size": [
+            6000.0,
+            3376.0
+          ],
+          "pixel_focal_length": 1234.5,
+          "distortion_coefficients": [
+            0.1,
+            -0.05,
+            0.001
+          ],
+          "focus_distance": 1.3
+        },
+        "2": {
+          "focal_length": 18.0
+        }
+      },
+      "cbor": "a300a86c666f63616c5f6c656e677468f66b706978656c5f7069746368f66e73656e736f725f73697a655f7078f673636170747572655f617265615f6f726967696ef671636170747572655f617265615f73697a65f672706978656c5f666f63616c5f6c656e677468f677646973746f7274696f6e5f636f656666696369656e7473806e666f6375735f64697374616e6365f601a86c666f63616c5f6c656e677468f955506b706978656c5f706974636882190d48190d486e73656e736f725f73697a655f707882191770190fa073636170747572655f617265615f6f726967696e82f90000f9578871636170747572655f617265615f73697a6582f96ddcf96a9872706978656c5f666f63616c5f6c656e677468fa449a500077646973746f7274696f6e5f636f656666696369656e747383fb3fb999999999999afbbfa999999999999afb3f50624dd2f1a9fc6e666f6375735f64697374616e6365fa3fa6666602a86c666f63616c5f6c656e677468f94c806b706978656c5f7069746368f66e73656e736f725f73697a655f7078f673636170747572655f617265615f6f726967696ef671636170747572655f617265615f73697a65f672706978656c5f666f63616c5f6c656e677468f677646973746f7274696f6e5f636f656666696369656e7473806e666f6375735f64697374616e6365f6"
+    },
+    {
+      "name": "lens_params_empty_map",
+      "op": "lens_params_map",
+      "input": {},
+      "cbor": "a0"
+    },
+    {
+      "name": "lens_positions",
+      "op": "lens_positions",
+      "input": {
+        "0": 18.0,
+        "1000": 18.5
+      },
+      "cbor": "a200f94c801903e8f94ca0"
+    },
+    {
+      "name": "gravity_vectors",
+      "op": "gravity_vectors",
+      "input": {
+        "-100": [
+          0.0,
+          0.0,
+          9.81
+        ],
+        "500": [
+          -0.1,
+          0.2,
+          9.8
+        ]
+      },
+      "cbor": "a2386383f90000f90000fb40239eb851eb851f1901f483fbbfb999999999999afb3fc999999999999afb402399999999999a"
+    },
+    {
+      "name": "gravity_vectors_none",
+      "op": "gravity_vectors",
+      "input": null,
+      "cbor": "f6"
+    },
+    {
+      "name": "image_orientations",
+      "op": "image_orientations",
+      "input": {
+        "7": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "cbor": "a10784f93c00f90000f90000f90000"
+    },
+    {
+      "name": "image_orientations_none",
+      "op": "image_orientations",
+      "input": null,
+      "cbor": "f6"
+    },
+    {
+      "name": "camera_identifier",
+      "op": "camera_identifier",
+      "input": {
+        "brand": "DJI",
+        "model": "Osmo Nano",
+        "lens_model": "",
+        "lens_info": "",
+        "focal_length": 18.0,
+        "camera_setting": "",
+        "fps": 29970,
+        "video_width": 3840,
+        "video_height": 2160,
+        "additional": "",
+        "identifier": "dji-osmo-nano"
+      },
+      "cbor": "ab656272616e6463444a49656d6f64656c694f736d6f204e616e6f6a6c656e735f6d6f64656c60696c656e735f696e666f606c666f63616c5f6c656e677468f94c806e63616d6572615f73657474696e6760636670731975126b766964656f5f7769647468190f006c766964656f5f6865696768741908706a6164646974696f6e616c606a6964656e7469666965726d646a692d6f736d6f2d6e616e6f"
+    },
+    {
+      "name": "camera_identifier_none",
+      "op": "camera_identifier",
+      "input": null,
+      "cbor": "f6"
+    },
+    {
+      "name": "lens_profile_key_order_is_preserved",
+      "op": "json_value",
+      "input": {
+        "calibrated_by": "DJI",
+        "calib_dimension": {
+          "w": 3840,
+          "h": 2160
+        },
+        "num": 12,
+        "neg": -3,
+        "frac": 1.5,
+        "big": 1e+300,
+        "flag": true,
+        "nothing": null,
+        "nested": {
+          "a": [
+            1,
+            2,
+            3
+          ],
+          "b": "x"
+        }
+      },
+      "cbor": "a96d63616c696272617465645f627963444a496f63616c69625f64696d656e73696f6ea26177190f006168190870636e756d0c636e6567226466726163f93e0063626967fb7e37e43c8800759c64666c6167f5676e6f7468696e67f6666e6573746564a261618301020361626178"
+    },
+    {
+      "name": "additional_data_nested",
+      "op": "json_value",
+      "input": {
+        "clip_meta_header": {
+          "proto_file_name": "dvtm_ow001.proto",
+          "library_proto_version": "02"
+        }
+      },
+      "cbor": "a170636c69705f6d6574615f686561646572a26f70726f746f5f66696c655f6e616d65706476746d5f6f773030312e70726f746f756c6962726172795f70726f746f5f76657273696f6e623032"
+    },
+    {
+      "name": "json_value_scalars",
+      "op": "json_value",
+      "input": [
+        0,
+        -1,
+        1.5,
+        true,
+        false,
+        null,
+        "s"
+      ],
+      "cbor": "870020f93e00f5f4f66173"
+    },
+    {
+      "name": "per_frame_time_offsets",
+      "op": "per_frame_time_offsets",
+      "input": [
+        0.0,
+        1.5,
+        -2.25
+      ],
+      "cbor": "83f90000f93e00f9c080"
+    },
+    {
+      "name": "mesh_correction",
+      "op": "mesh_correction",
+      "input": [
+        [
+          [
+            0.0,
+            1.0,
+            2.0
+          ],
+          [
+            0.5,
+            1.5
+          ]
+        ]
+      ],
+      "cbor": "818283f90000f93c00f9400082f93800f93e00"
+    },
+    {
+      "name": "camera_stab_data",
+      "op": "camera_stab_data",
+      "input": [
+        {
+          "offset": 12.5,
+          "sensor_size": [
+            6000,
+            4000
+          ],
+          "crop_area": [
+            0.0,
+            0.0,
+            6000.0,
+            3376.0
+          ],
+          "pixel_pitch": [
+            3400,
+            3400
+          ],
+          "ibis_spline": {
+            "points": [
+              [
+                0.0,
+                [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              ],
+              [
+                1.5,
+                [
+                  0.1,
+                  0.2,
+                  0.3
+                ]
+              ]
+            ]
+          },
+          "ois_spline": {
+            "points": []
+          }
+        }
+      ],
+      "cbor": "81a6666f6666736574f94a406b73656e736f725f73697a6582191770190fa06963726f705f6172656184f90000f90000f96ddcf96a986b706978656c5f706974636882190d48190d486b696269735f73706c696e65a166706f696e74738282f9000083f90000f90000f9000082f93e0083fb3fb999999999999afb3fc999999999999afb3fd33333333333336a6f69735f73706c696e65a166706f696e747380"
+    },
+    {
+      "name": "file_metadata_full",
+      "op": "file_metadata",
+      "input": {
+        "imu_orientation": "XYZ",
+        "raw_imu": [
+          {
+            "timestamp_ms": 0.0,
+            "gyro": null,
+            "accl": null,
+            "magn": null
+          },
+          {
+            "timestamp_ms": 0.5,
+            "gyro": [
+              1.0,
+              -2.5,
+              0.25
+            ],
+            "accl": null,
+            "magn": null
+          },
+          {
+            "timestamp_ms": 3.25,
+            "gyro": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "accl": [
+              9.81,
+              0.0,
+              -9.81
+            ],
+            "magn": [
+              1.5,
+              2.5,
+              3.5
+            ]
+          },
+          {
+            "timestamp_ms": 1000.0,
+            "gyro": null,
+            "accl": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "magn": null
+          }
+        ],
+        "quaternions": {
+          "0": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "-10": [
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        "gravity_vectors": {
+          "-100": [
+            0.0,
+            0.0,
+            9.81
+          ],
+          "500": [
+            -0.1,
+            0.2,
+            9.8
+          ]
+        },
+        "image_orientations": {
+          "7": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "detected_source": "Sony",
+        "frame_readout_time": 9.109809308813688,
+        "frame_readout_direction": "BottomToTop",
+        "frame_rate": 29.97,
+        "camera_identifier": {
+          "brand": "DJI",
+          "model": "Osmo Nano",
+          "lens_model": "",
+          "lens_info": "",
+          "focal_length": 18.0,
+          "camera_setting": "",
+          "fps": 29970,
+          "video_width": 3840,
+          "video_height": 2160,
+          "additional": "",
+          "identifier": "dji-osmo-nano"
+        },
+        "lens_profile": {
+          "calibrated_by": "DJI",
+          "calib_dimension": {
+            "w": 3840,
+            "h": 2160
+          },
+          "num": 12,
+          "neg": -3,
+          "frac": 1.5,
+          "big": 1e+300,
+          "flag": true,
+          "nothing": null,
+          "nested": {
+            "a": [
+              1,
+              2,
+              3
+            ],
+            "b": "x"
+          }
+        },
+        "lens_positions": {
+          "0": 18.0,
+          "1000": 18.5
+        },
+        "lens_params": {
+          "0": {},
+          "1": {
+            "focal_length": 85.0,
+            "pixel_pitch": [
+              3400,
+              3400
+            ],
+            "sensor_size_px": [
+              6000,
+              4000
+            ],
+            "capture_area_origin": [
+              0.0,
+              120.5
+            ],
+            "capture_area_size": [
+              6000.0,
+              3376.0
+            ],
+            "pixel_focal_length": 1234.5,
+            "distortion_coefficients": [
+              0.1,
+              -0.05,
+              0.001
+            ],
+            "focus_distance": 1.3
+          },
+          "2": {
+            "focal_length": 18.0
+          }
+        },
+        "digital_zoom": 1.25,
+        "has_accurate_timestamps": true,
+        "additional_data": {
+          "clip_meta_header": {
+            "proto_file_name": "dvtm_ow001.proto"
+          }
+        },
+        "per_frame_time_offsets": [
+          0.0,
+          1.5,
+          -2.25
+        ],
+        "camera_stab_data": [
+          {
+            "offset": 12.5,
+            "sensor_size": [
+              6000,
+              4000
+            ],
+            "crop_area": [
+              0.0,
+              0.0,
+              6000.0,
+              3376.0
+            ],
+            "pixel_pitch": [
+              3400,
+              3400
+            ],
+            "ibis_spline": {
+              "points": [
+                [
+                  0.0,
+                  [
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                ],
+                [
+                  1.5,
+                  [
+                    0.1,
+                    0.2,
+                    0.3
+                  ]
+                ]
+              ]
+            },
+            "ois_spline": {
+              "points": []
+            }
+          }
+        ],
+        "mesh_correction": [
+          [
+            [
+              0.0,
+              1.0,
+              2.0
+            ],
+            [
+              0.5,
+              1.5
+            ]
+          ]
+        ]
+      },
+      "cbor": "b36f696d755f6f7269656e746174696f6e6358595a677261775f696d7584a46c74696d657374616d705f6d73f90000646779726ff6646163636cf6646d61676ef6a46c74696d657374616d705f6d73f93800646779726f83f93c00f9c100f93400646163636cf6646d61676ef6a46c74696d657374616d705f6d73f94280646779726f83fb3fb999999999999afb3fc999999999999afb3fd3333333333333646163636c83fb40239eb851eb851ff90000fbc0239eb851eb851f646d61676e83f93e00f94100f94300a46c74696d657374616d705f6d73f963d0646779726ff6646163636c83f90000f90000f90000646d61676ef66b7175617465726e696f6e73a22984f93800f93800f93800f938000084f93c00f90000f90000f900006f677261766974795f766563746f7273a2386383f90000f90000fb40239eb851eb851f1901f483fbbfb999999999999afb3fc999999999999afb402399999999999a72696d6167655f6f7269656e746174696f6e73a10784f93c00f90000f90000f900006f64657465637465645f736f7572636564536f6e79726672616d655f726561646f75745f74696d65fb40223838ecfc4d64776672616d655f726561646f75745f646972656374696f6e6b426f74746f6d546f546f706a6672616d655f72617465fb403df851eb851eb87163616d6572615f6964656e746966696572ab656272616e6463444a49656d6f64656c694f736d6f204e616e6f6a6c656e735f6d6f64656c60696c656e735f696e666f606c666f63616c5f6c656e677468f94c806e63616d6572615f73657474696e6760636670731975126b766964656f5f7769647468190f006c766964656f5f6865696768741908706a6164646974696f6e616c606a6964656e7469666965726d646a692d6f736d6f2d6e616e6f6c6c656e735f70726f66696c65a96d63616c696272617465645f627963444a496f63616c69625f64696d656e73696f6ea26177190f006168190870636e756d0c636e6567226466726163f93e0063626967fb7e37e43c8800759c64666c6167f5676e6f7468696e67f6666e6573746564a2616183010203616261786e6c656e735f706f736974696f6e73a200f94c801903e8f94ca06b6c656e735f706172616d73a300a86c666f63616c5f6c656e677468f66b706978656c5f7069746368f66e73656e736f725f73697a655f7078f673636170747572655f617265615f6f726967696ef671636170747572655f617265615f73697a65f672706978656c5f666f63616c5f6c656e677468f677646973746f7274696f6e5f636f656666696369656e7473806e666f6375735f64697374616e6365f601a86c666f63616c5f6c656e677468f955506b706978656c5f706974636882190d48190d486e73656e736f725f73697a655f707882191770190fa073636170747572655f617265615f6f726967696e82f90000f9578871636170747572655f617265615f73697a6582f96ddcf96a9872706978656c5f666f63616c5f6c656e677468fa449a500077646973746f7274696f6e5f636f656666696369656e747383fb3fb999999999999afbbfa999999999999afb3f50624dd2f1a9fc6e666f6375735f64697374616e6365fa3fa6666602a86c666f63616c5f6c656e677468f94c806b706978656c5f7069746368f66e73656e736f725f73697a655f7078f673636170747572655f617265615f6f726967696ef671636170747572655f617265615f73697a65f672706978656c5f666f63616c5f6c656e677468f677646973746f7274696f6e5f636f656666696369656e7473806e666f6375735f64697374616e6365f66c6469676974616c5f7a6f6f6df93d00776861735f61636375726174655f74696d657374616d7073f56f6164646974696f6e616c5f64617461a170636c69705f6d6574615f686561646572a16f70726f746f5f66696c655f6e616d65706476746d5f6f773030312e70726f746f767065725f6672616d655f74696d655f6f66667365747383f90000f93e00f9c0807063616d6572615f737461625f6461746181a6666f6666736574f94a406b73656e736f725f73697a6582191770190fa06963726f705f6172656184f90000f90000f96ddcf96a986b706978656c5f706974636882190d48190d486b696269735f73706c696e65a166706f696e74738282f9000083f90000f90000f9000082f93e0083fb3fb999999999999afb3fc999999999999afb3fd33333333333336a6f69735f73706c696e65a166706f696e7473806f6d6573685f636f7272656374696f6e818283f90000f93c00f9400082f93800f93e00"
+    },
+    {
+      "name": "file_metadata_default",
+      "op": "file_metadata",
+      "input": {},
+      "cbor": "b36f696d755f6f7269656e746174696f6ef6677261775f696d75806b7175617465726e696f6e73a06f677261766974795f766563746f7273f672696d6167655f6f7269656e746174696f6e73f66f64657465637465645f736f75726365f6726672616d655f726561646f75745f74696d65f6776672616d655f726561646f75745f646972656374696f6e6b546f70546f426f74746f6d6a6672616d655f72617465f67163616d6572615f6964656e746966696572f66c6c656e735f70726f66696c65f66e6c656e735f706f736974696f6e73a06b6c656e735f706172616d73a06c6469676974616c5f7a6f6f6df6776861735f61636375726174655f74696d657374616d7073f46f6164646974696f6e616c5f64617461f6767065725f6672616d655f74696d655f6f666673657473807063616d6572615f737461625f64617461806f6d6573685f636f7272656374696f6e80"
+    }
+  ]
+}
