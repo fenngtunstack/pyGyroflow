@@ -284,7 +284,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-03 | R | **底层缺像素格式类型**。上游 `pixel_formats.rs` 12 种（含 NV12/P010/AYUV16/RGBAf16/BGRA8 通道交换 + Rec709 full→limited 重映射）；我们 `pixel_formats.py:15-55` 只做 dtype 探测。这是 C-02 的根因 | [报告] |
 | C-04 | E | **trim ranges 渲染时不生效**。`params.trim_ranges` 只有平滑用；`manager.render` 与 `ffmpeg_processor` 完全忽略 → 永远整片渲染。上游 `mod.rs:194-200,278-280` 定位+时间戳重基+`pad_with_black`+`export_trims_separately` —— 已实现（`11294ef`） | [实测] |
 | C-05 | E | **帧率控制 / 变速缺失**。上游回调可设 `repeat_times`/`out_timestamp_us`（`mod.rs:460-479`）+ `fps_scale` VFR；我们的回调只读时间戳，`video_speed`/`fps_scale` 渲染时被忽略 —— 已实现（`6a95077`），两个机制分开：`video_speed` 改帧数、`fps_scale` 只改查询时间戳 | [实测] |
-| C-06 | E | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** —— 读写层与 CLI 接线都已实现（`1077433`、`e7fb663`）；余下只有 `--export-project` 的 2/3 模式（需 `raw_imu`/`file_metadata` 编码器） | [实测] |
+| C-06 | E | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** —— 读写层与 CLI 接线都已实现（`1077433`、`e7fb663`）；余下只有 `--export-project` 的 2/3 模式（需 `raw_imu`/`file_metadata` 编码器）。**另**：CBOR 编码器此前只有「按规范 + nalgebra serde 推导」的验证，已找到真机 `WithProcessedData` 导出（`DJI_20260507160359_0005_D.gyroflow`，25185 样本）并据此修掉一处浮点宽度错误（`b590c4b`）；`file_metadata` 这一唯一的大块此前无参照，现在也可以它为准 | [实测] |
 | C-07 | E | **容器旋转元数据没读**（见 G-07）—— 已实现（`3aadd0d`） | [实测] |
 | C-08 | R | 无 GPU 解码/编码（上游 `ffmpeg_hw.rs` 412 行 + 各平台 interop）；无 GPU 解码重试阶梯、无像素格式回退 | [报告] |
 | C-09 | R | 渲染健壮性：上游写 `.tmp` 再改名、拷贝容器元数据/timecode、清残留 `%Nd` 文件、保持系统唤醒；我们直接写目标路径、无元数据 | [报告] |
@@ -382,7 +382,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | D-05 max-zoom 反馈回路（此前 max_zoom 完全无效） | `bfb11d9` | max_zoom=110 时限制 0.3946 且 fovs 随之变化；130 不触发 |
 | C-07 容器旋转元数据（tkhd 矩阵） | `3aadd0d` | 手工构造 v0/v1 tkhd + 与 `ffmpeg -display_rotation` 三方对齐 |
 | C-01 PNG/EXR 图像序列输出 | `3aadd0d` | 30 帧序列进出帧数一致；EXR 用 `gbrpf32le` |
-| C-06 `.gyroflow` 工程读写 + base91/zlib/bincode/CBOR 编解码 | `1077433` | 两个官方工程 JSON 层往返「缺失键 [] / 变化键 {}」；base91/bincode 与仓库内独立解码器逐字节一致；CBOR 按规范和 nalgebra serde 推导后按位固化 |
+| C-06 `.gyroflow` 工程读写 + base91/zlib/bincode/CBOR 编解码 | `1077433` | 两个官方工程 JSON 层往返「缺失键 [] / 变化键 {}」；base91/bincode 与仓库内独立解码器逐字节一致；**CBOR 已升级为与真机导出逐字节对照（`b590c4b`）**——见下方 C-06 余下行，此前只有「按规范推导」 |
 | C-04 渲染时裁剪区间 + 音频同步裁剪 + 逐区间导出 | `11294ef` | 8 组区间组合断言保留帧数与帧内容（帧身份写进画面象限）；输出 pts 相邻差值恒定（无空洞）；回调收到源时间线；带音轨素材裁后音频时长同步变短 |
 | C-11/C-06 余下：CLI 吃工程与 preset、`--preset`/`--export-project 1`/`-p`/`-s`/`-t`/`-f`/`--version`、`python -m pygyroflow` | `e7fb663` | subprocess 跑真 CLI：真工程（自带 base91 bincode 陀螺块）→ 读工程 → 从块里取得陀螺 → 出片帧数正确；`--export-project 1` 无运动载荷且 fov 随 preset 变化；缺 `-f` 时拒绝覆盖 |
 | G-10 视觉角速度信号：中点时间戳 + 失败帧欧拉角插值 + 可选低通 | `0420488` | 中点用 1 ms 等距夹具断言精确值、30fps 用规则断言；缺口按位置加权插值（中点=均值）且首尾不外推；低通使单帧尖峰幅度降到 60% 以下且时间戳不变 |
@@ -396,6 +396,8 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 - `gpu/backend.py` 的 pipeline 缓存 key 只哈希 shader 源码、不含 pipeline 常量，某个畸变模型首次建出的 kernel 会被整个进程复用（`cd705a0`）。
 - 测试夹具 `tests/test_e2e.py` 的合成 GoPro mp4 的 `hdlr` 只有裸 `gpmd`，而真机是 `mhlr`/`meta` + Pascal 串 `GoPro MET`（`12f2eb6`）。
 - `zooming.get_checksum` 少哈希两个字段。上游 `zooming/mod.rs:91-92` 把 `focal_length_smoothing_enabled` 和 `_strength` 都算进 FOV 缓存键；我们只哈希了 `distortion_coeffs`/尺寸/`max_zoom`/`trim_ranges`/`video_rotation`/`adaptive_zoom_window`。后果是**改了焦距平滑滑块不会让 FOV 缓存失效**——重渲染静默沿用旧变焦，看起来"滑块没反应"。已补齐（`cb606bb`）。
+- **CBOR 浮点宽度写错**。`_cbor_f64` 一律写 8 字节，`ciborium` 却把能在半精度/单精度里精确表示的值写窄。此前只对着 CBOR 规范和 nalgebra 的 serde 推导，没有外部参照，所以没人发现——读侧完全不受影响（cbor2 任何宽度都认），只有拿真字节比才看得出来。在一个真的 `WithProcessedData` 工程上现形：25385 个时间戳差 934 字节。规则按文件反推为「取能精确容下该值的最窄形式，半精度优先于单精度」——反过来的优先级会错 9 个值。已修（`b590c4b`），四个载荷全部逐字节一致。
+- **这条顺带说明此前 C-06 的 CBOR 验证不够**。原验证是「按规范和 nalgebra serde 推导后按位固化」，即自证；真文件证明推导在一个细节上（浮点宽度）是错的。现在有了外部参照。
 
 **做 C-06 时新发现的缺陷**：
 
@@ -467,3 +469,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 - `sony-ois-only.MP4`：Sony OIS 靶子，库内无档案、当前零畸变校正（A-06）
 - `issue-44-*` 中 30+ 个 Sony 素材含 IBIS/变焦/comp-on-off 配对
 - 官方 `.gyroflow` 工程 + 官方稳定化渲染成片（可做逐帧对照）
+
+`/home/ft/workspace/PreReserach/msGyroFlow/DJI_20260507160359_0005_D.gyroflow`（3.4 MB）
+
+真机 Gyroflow 1.6.3 导出的 `WithProcessedData` 工程，25185 个 IMU 样本。**这是仓库里唯一带真实载荷的工程文件**：`testvideos/` 下那两个 `extra-*` 的所有运动载荷都是 `null`（更老的版本写出，靠原片遥测），所以只有它能用来核对编码器写出的字节。已用它修掉 CBOR 浮点宽度错误（`b590c4b`）；后续 2/3 模式导出与 `file_metadata` 路径都应以它为准。
