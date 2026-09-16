@@ -127,6 +127,20 @@ class ComputeParams:
     # Focal length in mm (None if unknown)
     focal_length: Optional[float] = None
 
+    # --- Focal length smoothing (upstream compute_params.rs:65-68) ---
+    # A zoom lens changes focal length mid-clip, and cameras report it in
+    # coarse steps. `focal_lengths` holds the DEQUANTIZED curve (the short
+    # Gaussian pass, smoothing/focal_length.py), not the raw metadata: it is
+    # the denominator of the compensation ratio, so stairs in it would become
+    # stairs in the sampling position. `smoothed_focal_lengths` is
+    # dequantized/adaptive-filtered — the curve the output actually tracks.
+    # Both are frame-indexed and only populated when smoothing is active; the
+    # raw curve for the UI timeline lives on StabilizationParams.
+    focal_lengths: list[float | None] = field(default_factory=list)
+    smoothed_focal_lengths: list[float | None] = field(default_factory=list)
+    focal_length_smoothing_enabled: bool = False
+    focal_length_smoothing_strength: float = 0.0
+
     # --- Per-timestamp lens data (FileMetadata.lens_positions / lens_params) ---
     # A zoom lens changes focal length during the clip, so its calibration
     # changes with it. Both maps are empty for a fixed-focal-length clip,

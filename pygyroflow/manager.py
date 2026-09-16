@@ -2011,6 +2011,7 @@ class StabilizationManager:
             lens_params=ClosestMap(metadata.lens_params),
             digital_zoom=metadata.digital_zoom,
             radial_distortion_limit=radial_limit,
+            focal_length_smoothing_strength=self.params.focal_length_smoothing_strength,
             optimal_fov=lens.optimal_fov,
             per_frame_time_offsets=list(
                 getattr(self.gyro.file_metadata, "per_frame_time_offsets", None) or []
@@ -2019,7 +2020,100 @@ class StabilizationManager:
         # One FOV per frame only when the calibration actually moves; see
         # ComputeParams.calculate_camera_fovs.
         cp.calculate_camera_fovs()
+        # Run FL smoothing unconditionally, so `cp.focal_lengths` always holds
+        # the dequantized curve by the time anything reads the compute params
+        # (upstream lib.rs: run it before the zooming checksum is compared).
+        self._apply_focal_length_smoothing(cp)
         return cp
+
+    @staticmethod
+    def extract_focal_lengths(cp: ComputeParams) -> list[float | None]:
+        """Per-frame focal length from the lens metadata, ``None`` where absent.
+
+        Port of upstream ``Gyroflow::extract_focal_lengths``. The per-frame
+        values come from ``lens_params`` at the frame's own timestamp, with the
+        same 100 ms lookup window the lens data uses — a zoom lens is exactly
+        the case where a static profile focal length is wrong.
+        """
+        from pygyroflow.stabilization.frame_transform import LENS_LOOKUP_MAX_DIFF_US
+        from pygyroflow.util import timestamp_at_frame
+
+        if not cp.lens_params:
+            return []
+
+        focal_lengths: list[float | None] = []
+        for frame in range(cp.frame_count):
+            timestamp_ms = timestamp_at_frame(frame, cp.scaled_fps)
+            entry = cp.lens_params.get_closest(
+                round(timestamp_ms * 1000.0), LENS_LOOKUP_MAX_DIFF_US
+            )
+            if entry is not None and entry.focal_length is not None:
+                focal_lengths.append(float(entry.focal_length))
+            else:
+                focal_lengths.append(None)
+        return focal_lengths
+
+    def _apply_focal_length_smoothing(self, cp: ComputeParams) -> None:
+        """Fill the focal length caches on *cp* (port of lib.rs
+        ``apply_focal_length_smoothing``).
+
+        Two curves, both frame-indexed:
+
+        * ``focal_lengths`` — the raw metadata run through a short Gaussian.
+          Dequantization, not smoothing: the raw curve is the denominator of
+          the compensation ratio, so its stairs would show up in the output.
+        * ``smoothed_focal_lengths`` — that dequantized curve through the
+          velocity-adaptive filter, and the curve the output is made to track.
+
+        The single UI knob (`focal_length_smoothing_strength`, 0..1) drives all
+        three filter dials so the slider feels monotonic: more strength means a
+        longer stationary time constant, a *higher* velocity threshold (the
+        filter resists opening up), and a longer fast-zoom time constant, so
+        real zoom edges round off instead of snapping to the raw shape.
+        """
+        from pygyroflow.smoothing.focal_length import (
+            smooth_focal_lengths_adaptive,
+            smooth_focal_lengths_gaussian,
+        )
+
+        params = self.params
+        raw = self.extract_focal_lengths(cp)
+        active = bool(params.focal_length_smoothing_enabled) and bool(raw)
+
+        dequantized: list[float | None] = []
+        smoothed: list[float | None] = []
+        if active:
+            # `math.floor(x + 0.5)` is Rust's round-half-away-from-zero; the
+            # `.max(5)` below makes the half-integer cases equal anyway, but
+            # the two languages should not be left to differ by accident.
+            window = max(math.floor(cp.scaled_fps * 0.5 + 0.5), 5)
+            dequantized = smooth_focal_lengths_gaussian(raw, 1.0, window)
+
+            s = min(max(params.focal_length_smoothing_strength, 0.0), 1.0)
+            smoothed = smooth_focal_lengths_adaptive(
+                dequantized,
+                cp.scaled_fps,
+                0.1 * 300.0**s,          # stationary time constant: 0.1 .. 30 s
+                0.05 + 0.35 * s * s,     # fast-zoom time constant: 0.05 .. 0.40 s
+                0.3 + 7.7 * s**1.5,      # velocity threshold: 0.3 .. 8.0
+            )
+
+        # Rendering side: only populated when smoothing is active, so
+        # frame_transform's compensation is a clean 1.0 otherwise.
+        if active:
+            cp.focal_lengths = dequantized
+            cp.smoothed_focal_lengths = list(smoothed)
+            cp.focal_length_smoothing_enabled = True
+        else:
+            cp.focal_lengths = []
+            cp.smoothed_focal_lengths = []
+            cp.focal_length_smoothing_enabled = False
+
+        # Chart side: expose the raw curve whenever per-frame data exists, so a
+        # timeline toggle works with smoothing off. The smoothed curve is only
+        # meaningful when it was actually computed.
+        params.focal_lengths = raw
+        params.smoothed_focal_lengths = smoothed
 
     def _get_radial_distortion_limit(self, model_name: str, coeffs: list[float]) -> float:
         """Compute (and cache) the radial distortion limit for a lens.

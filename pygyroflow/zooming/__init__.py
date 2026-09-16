@@ -166,6 +166,13 @@ def get_checksum(compute_params: ComputeParams) -> str:
         hasher.update(struct.pack('d', start))
         hasher.update(struct.pack('d', end))
 
+    # The focal length smoothing changes the fovs this cache holds, so both the
+    # switch and the strength belong in the key (upstream zooming/mod.rs:91-92).
+    # The strength matters even with smoothing off: it is copied onto the
+    # compute params unconditionally.
+    hasher.update(struct.pack('B', 1 if compute_params.focal_length_smoothing_enabled else 0))
+    hasher.update(struct.pack('d', float(compute_params.focal_length_smoothing_strength)))
+
     return hasher.hexdigest()
 
 

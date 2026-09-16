@@ -201,6 +201,34 @@ def _get_fov(
     return fov
 
 
+def _focal_length_fov_compensation(params: ComputeParams, frame: int) -> float:
+    """Digital zoom-out factor that tracks the smoothed focal length.
+
+    Port of upstream ``FrameTransform::focal_length_fov_compensation``.
+
+    Returns ``dequantized / smoothed``. When the true optical focal length is
+    longer than the smoothed target, the ratio is above 1 and the render zooms
+    out to compensate, so the apparent zoom follows the smoothed curve instead
+    of the raw metadata. The factor goes into ``fov`` only — ``scaled_k`` keeps
+    the raw pixel focal length — so it lands on ``new_k`` but not on the
+    forward projection, which is what makes it a visible digital zoom.
+
+    Both curves are frame-indexed, so no timestamp lookup is involved and the
+    two stay aligned by construction.
+    """
+    if not params.focal_length_smoothing_enabled:
+        return 1.0
+    if frame >= len(params.focal_lengths) or frame >= len(params.smoothed_focal_lengths):
+        return 1.0
+    dequantized = params.focal_lengths[frame]
+    smoothed = params.smoothed_focal_lengths[frame]
+    if dequantized is None or smoothed is None:
+        return 1.0
+    if dequantized > 0.0 and smoothed > 0.0:
+        return dequantized / smoothed
+    return 1.0
+
+
 # The per-frame lens maps are consulted within this window; a frame further
 # than that from any entry uses the profile as-is (upstream's 100000, µs).
 LENS_LOOKUP_MAX_DIFF_US = 100_000
@@ -439,7 +467,12 @@ class FrameTransform:
         ) = _get_lens_data_at_timestamp(params, timestamp_ms)
 
         # --- 3. FOV computation ---
-        fov = _get_fov(params, frame, True, timestamp_ms, False)
+        # The focal length compensation lands on the render fov only, and
+        # before the optimal_fov block below — upstream order (focal length
+        # smoothing, then the sharpest-FOV adjustment).
+        fov = _get_fov(params, frame, True, timestamp_ms, False) * (
+            _focal_length_fov_compensation(params, frame)
+        )
         ui_fov = _get_fov(params, frame, True, timestamp_ms, True)
 
         # Upstream frame_transform.rs: a lens profile may carry the FOV it is
@@ -652,11 +685,21 @@ class FrameTransform:
             ctypes.c_float * 4
         )(0.0, 0.0, float(params.output_width), float(params.output_height))
 
+        # Report the smoothed focal length so the "Focal length: X mm" readout
+        # tracks the curve the viewer actually sees, not the raw metadata.
+        reported_focal_length = focal_length
+        if params.focal_length_smoothing_enabled and frame < len(
+            params.smoothed_focal_lengths
+        ):
+            smoothed_fl = params.smoothed_focal_lengths[frame]
+            if smoothed_fl is not None:
+                reported_focal_length = smoothed_fl
+
         return FrameTransform(
             matrices=matrices,
             kernel_params=kernel_params,
             fov=ui_fov,
             minimal_fov=params.minimal_fovs[frame] if frame < len(params.minimal_fovs) else 1.0,
-            focal_length=focal_length,
+            focal_length=reported_focal_length,
             distortion_model_name=params.distortion_model_name,
         )
