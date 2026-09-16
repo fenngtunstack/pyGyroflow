@@ -287,6 +287,53 @@ def _format_focal_length_mm(value: float) -> str:
     return f"{value:.2f}"
 
 
+def _widen_f32(value: Any) -> float:
+    """Round-trip *value* through float32, the way Rust's ``read_f32`` does.
+
+    ``coeff_scale`` is an f32 on the wire. Rust widens it to f64 for the JSON
+    number, so 0.001 becomes 0.0010000000474974513 — and that exact double is
+    part of the hashed string. A plain Python 0.001 hashes differently.
+    """
+    import struct
+
+    return struct.unpack(">f", struct.pack(">f", float(value)))[0]
+
+
+def _sony_distortion_hash(ld: dict[str, Any]) -> str:
+    """CRC32 of the Sony distortion identity, byte-identical to upstream's.
+
+    Upstream builds the same JSON with ``serde_json::json!`` and stringifies
+    it (``camera_identifier.rs``). Two things have to match for the CRC — and
+    with it the lens-profile lookup — to land on the same value:
+
+    * ``serde_json`` serialises compactly (no space after ``:`` or ``,``);
+      Python's ``json.dumps`` defaults to ``", "`` / ``": "``. Every hash
+      differed before, because of nothing but whitespace.
+    * the numbers keep their Rust types: the two ``*_nm`` fields are u32,
+      ``unk1`` is u8, ``coeffs`` is a list of u16 (all integers), and
+      ``coeff_scale`` is the f32-widened double — not Python's 0.001.
+
+    Key order matches too: the vendored telemetry-parser enables serde_json's
+    ``preserve_order``, so ``json!`` emits the literal order, which is also
+    the sorted one.
+
+    Verified against a Rust reference program using the same crates: for
+    ``{24_000_000, 13_000_000, unk1=1, coeff_scale=0.001, coeffs=[100,200,300]}``
+    both produce ``906280fe``.
+    """
+    payload = {
+        "unk1": [
+            int(ld["focal_length_nm"]),
+            int(ld["effective_sensor_height_nm"]),
+        ],
+        "unk2": int(ld["unk1"]),
+        "unk3": _widen_f32(ld["coeff_scale"]),
+        "unk4": [int(c) for c in ld["coeffs"]],
+    }
+    compact = json.dumps(payload, separators=(",", ":"))
+    return format(zlib.crc32(compact.encode("utf-8")) & 0xFFFFFFFF, "x")
+
+
 def _extract_sony(obj: CameraIdentifier, samples: list[dict[str, Any]]) -> None:
     """Extract Sony-specific fields: focal length, lens name, distortion hash."""
     # Focal length from Lens group
@@ -309,15 +356,7 @@ def _extract_sony(obj: CameraIdentifier, samples: list[dict[str, Any]]) -> None:
         ld = _get_tag(samples, "LensDistortion", "Data")
         if ld is not None and isinstance(ld, dict):
             if "focal_length_nm" in ld:
-                # Replicate the Rust hashing: build a JSON with specific keys
-                hash_input = json.dumps({
-                    "unk1": [ld["focal_length_nm"], ld.get("effective_sensor_height_nm")],
-                    "unk2": ld.get("unk1"),
-                    "unk3": ld.get("coeff_scale"),
-                    "unk4": ld.get("coeffs"),
-                }, sort_keys=True)
-                crc = zlib.crc32(hash_input.encode("utf-8")) & 0xFFFFFFFF
-                obj.lens_info = format(crc, "x")
+                obj.lens_info = _sony_distortion_hash(ld)
 
 
 def _extract_insta360(obj: CameraIdentifier, samples: list[dict[str, Any]]) -> None:

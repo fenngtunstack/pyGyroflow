@@ -77,3 +77,120 @@ class TestHorizonLockWiring:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestHorizonLockAppliedOnce:
+    """The lock runs exactly once, on the originals, before smoothing.
+
+    It used to run twice: ``Smoothing.smooth`` locked the freshly smoothed
+    quaternions, and ``StabilizationManager.recompute_smoothing`` locked the
+    result again. ``HorizonLock.lock`` slerps toward the locked orientation
+    by a percentage, so applying it twice is not the same as once.
+    """
+
+    @staticmethod
+    def _mgr(lock_percent=100.0, roll_deg=6.0, n=200, additional=(0.0, 0.0, 0.0)):
+        mgr = StabilizationManager()
+        mgr.params.fps = 100.0
+        mgr.params.frame_count = n
+        mgr.params.duration_ms = n * 10.0
+        mgr.params.size = (640, 480)
+        mgr.params.additional_rotation = additional
+        mgr.gyro.init_from_params(n * 10.0)
+        mgr.gyro.quaternions = {
+            i * 10_000: Quat64.from_euler_angles(
+                np.deg2rad(roll_deg * np.sin(i / 9.0)), 0.0, np.deg2rad(0.05 * i)
+            )
+            for i in range(n)
+        }
+        if lock_percent:
+            mgr.smoothing.horizon_lock.set_horizon(
+                lock_percent=lock_percent, roll=0.0, lock_pitch=False, pitch=0.0
+            )
+        return mgr
+
+    @staticmethod
+    def _corrections(mgr):
+        return np.array(
+            [q.quaternion() for _, q in sorted(mgr.gyro.smoothed_quaternions.items())]
+        )
+
+    def test_smoothing_alone_does_not_lock(self):
+        from pygyroflow.smoothing import Smoothing
+
+        smoothing = Smoothing()
+        smoothing.horizon_lock.set_horizon(
+            lock_percent=100.0, roll=0.0, lock_pitch=False, pitch=0.0
+        )
+        calls = []
+        smoothing.horizon_lock.lock = lambda *a, **k: calls.append(1)
+
+        mgr = self._mgr(lock_percent=0.0)
+        cp = mgr._build_compute_params()
+        smoothing.smooth(mgr.gyro.quaternions, 2000.0, cp)
+        assert calls == []
+
+    def test_manager_locks_exactly_once(self):
+        mgr = self._mgr()
+        calls = []
+        original = mgr.smoothing.horizon_lock.lock
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        mgr.smoothing.horizon_lock.lock = spy
+        mgr.recompute_smoothing()
+        assert len(calls) == 1
+
+    def test_lock_off_does_not_lock(self):
+        mgr = self._mgr(lock_percent=0.0)
+        calls = []
+        mgr.smoothing.horizon_lock.lock = lambda *a, **k: calls.append(1)
+        mgr.recompute_smoothing()
+        assert calls == []
+
+    def test_lock_changes_the_correction(self):
+        off = self._mgr(lock_percent=0.0)
+        on = self._mgr(lock_percent=100.0)
+        off.recompute_smoothing()
+        on.recompute_smoothing()
+        assert np.abs(self._corrections(off) - self._corrections(on)).max() > 0.1
+
+
+class TestAdditionalRotation:
+    """`params.additional_rotation` reaches the smoothing input.
+
+    It was plumbed into ComputeParams and set by the GUI's horizon-roll
+    control, but nothing ever multiplied the quaternions by it.
+    """
+
+    @staticmethod
+    def _result(roll_deg):
+        mgr = TestHorizonLockAppliedOnce._mgr(
+            lock_percent=0.0, additional=(0.0, 0.0, roll_deg)
+        )
+        mgr.recompute_smoothing()
+        return np.array(
+            [q.quaternion() for _, q in sorted(mgr.gyro.smoothed_quaternions.items())]
+        )
+
+    def test_zero_rotation_is_a_no_op(self):
+        assert np.abs(self._result(0.0) - self._result(0.0)).max() == 0.0
+
+    def test_rotation_reaches_the_result(self):
+        base, rotated = self._result(0.0), self._result(5.0)
+        assert np.abs(base - rotated).max() > 1e-3
+
+    def test_half_angle_matches_a_five_degree_rotation(self):
+        """The correction moves by sin(5deg/2) — a 5 deg rotation's w-delta."""
+        delta = np.abs(self._result(0.0) - self._result(5.0)).max()
+        assert delta == pytest.approx(np.sin(np.deg2rad(5.0) / 2.0), abs=1e-3)
+
+
+class TestMaxAngles:
+    def test_max_angles_are_recorded(self):
+        mgr = TestHorizonLockAppliedOnce._mgr(lock_percent=100.0)
+        mgr.gyro.max_angles = (0.0, 0.0, 0.0)
+        mgr.recompute_smoothing()
+        assert mgr.gyro.max_angles != (0.0, 0.0, 0.0)

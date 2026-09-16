@@ -20,13 +20,25 @@ import numpy as np
 
 from pygyroflow.gyro_source import GyroSource, FileMetadata
 from pygyroflow.lens import LensProfile, LensProfileDatabase
-from pygyroflow.smoothing import Smoothing
-from pygyroflow.keyframes import KeyframeManager
+from pygyroflow.smoothing import Smoothing, get_max_angles
+from pygyroflow.keyframes import KeyframeManager, KeyframeType
 from pygyroflow.stabilization import ComputeParams, FrameTransform
 from pygyroflow.stabilization_params import StabilizationParams
 from pygyroflow.types.errors import GyroflowError, TelemetryParseError, VideoIOError
 
 log = logging.getLogger(__name__)
+
+
+def _keyframed_or(keyframes, key, timestamp_ms: float, default: float) -> float:
+    """Keyframed value at *timestamp_ms*, falling back to *default*.
+
+    Upstream's ``value_at_gyro_timestamp(...).unwrap_or(param)``: a keyframe
+    overrides the parameter, absence of one leaves it alone.
+    """
+    if keyframes is None:
+        return default
+    value = keyframes.value_at_gyro_timestamp(key, timestamp_ms)
+    return default if value is None else float(value)
 
 
 @dataclass
@@ -331,57 +343,112 @@ class StabilizationManager:
     # ------------------------------------------------------------------
 
     def recompute_smoothing(self) -> None:
-        """Recompute smoothed quaternions."""
+        """Recompute smoothed quaternions.
+
+        Mirrors upstream ``GyroSource::recompute_smoothness``, which does all
+        of this in one place and in this order:
+
+        1. multiply every original orientation by the additional rotation
+           (keyframed, else ``params.additional_rotation``);
+        2. lock the horizon **on the originals**, before smoothing;
+        3. smooth;
+        4. record the maximum angles over the trim range;
+        5. store the correction quaternion ``smoothed⁻¹ * org``.
+
+        Steps 2 and 5 used to be split across this method and
+        ``Smoothing.smooth``, which applied the lock twice (once after
+        smoothing there, again here) — and the additional rotation was never
+        applied at all, so the GUI's horizon-roll control did nothing.
+        """
+        from pygyroflow.types.quaternion import Quat64
+
         cp = self._build_compute_params()
-        smoothed = self.smoothing.smooth(
-            self.gyro.quaternions,
-            self.gyro.duration_ms,
-            cp,
-            org_quats=self.gyro.quaternions,
-        )
-
-        # Upstream recompute_smoothness(algo, horizon_lock, params) applies
-        # the horizon lock to the SMOOTHED orientations before the correction
-        # quaternions are derived. Quaternion mode (use_grav=False); the
-        # gravity-vector mode needs an accelerometer series and stays an
-        # opt-in enhancement.
-        if self.smoothing.horizon_lock.lock_enabled:
-            grav = None
-            use_grav = False
-            if self.gyro.use_gravity_vectors:
-                accl = [imu for imu in self.gyro.raw_imu if imu.accl is not None]
-                if len(accl) >= 3:
-                    grav = {}
-                    for imu in accl:
-                        v = np.asarray(imu.accl, dtype=np.float64)
-                        n = np.linalg.norm(v)
-                        if n > 1e-6:
-                            # accelerometer at rest reads "up" (~+g); the
-                            # gravity mode compares against +Y in sensor frame
-                            grav[int(round(imu.timestamp_ms * 1000.0))] = v / n
-                    use_grav = len(grav) >= 3
-                    if not use_grav:
-                        grav = None
-            self.smoothing.horizon_lock.lock(
-                smoothed,
-                org_quats=self.gyro.quaternions,
-                grav=grav,
-                use_grav=use_grav,
-                compute_params=cp,
-            )
-
-        # Upstream gyro_source.rs recompute_smoothness(): after smoothing,
-        # store the CORRECTION quaternion sm^-1 * org, not the smoothed
-        # orientation itself. FrameTransform composes it with the org
-        # lookups (smoothed * org_c^-1 * org_row = sm^-1 * org_row), which
-        # is the rotation that maps the raw frame back onto the smoothed
-        # path. Without this step the stabilization is ineffective.
         org = self.gyro.quaternions
+
+        # 1. Additional rotation, applied to a copy of the originals.
+        keyframes = getattr(cp, "keyframes", None)
+        base = cp.additional_rotation
+        rotated: dict[int, Quat64] = {}
+        for ts, q in org.items():
+            ts_ms = ts / 1000.0
+            angles = [
+                _keyframed_or(
+                    keyframes, kf_type, ts_ms, float(base[i])
+                )
+                for i, kf_type in enumerate(
+                    (
+                        KeyframeType.AdditionalRotationX,
+                        KeyframeType.AdditionalRotationY,
+                        KeyframeType.AdditionalRotationZ,
+                    )
+                )
+            ]
+            rot = Quat64.from_euler_angles(
+                np.deg2rad(angles[1]),  # roll
+                np.deg2rad(angles[0]),  # pitch
+                np.deg2rad(angles[2]),  # yaw
+            )
+            rotated[ts] = q * rot
+
+        # 2. Lock the horizon on the originals, then smooth (upstream's
+        #    `if true` branch; the reverse order is upstream's dead branch).
+        self._lock_horizon(rotated, org, cp)
+
+        smoothed = self.smoothing.smooth(rotated, self.gyro.duration_ms, cp)
+
+        # 3. Max angles over the trim range (upstream feeds these to the UI).
+        try:
+            self.gyro.max_angles = get_max_angles(org, smoothed, cp)
+        except Exception:
+            log.warning("Could not compute max angles", exc_info=True)
+
+        # 4. Store the CORRECTION quaternion sm⁻¹ * org, not the smoothed
+        #    orientation itself. FrameTransform composes it with the org
+        #    lookups (smoothed * org_c⁻¹ * org_row = sm⁻¹ * org_row), which
+        #    is the rotation that maps the raw frame back onto the smoothed
+        #    path. Without this step the stabilization is ineffective.
         self.gyro.smoothed_quaternions = {
             ts: q.inverse() * org[ts]
             for ts, q in smoothed.items()
             if ts in org
         }
+
+    def _lock_horizon(
+        self,
+        quats: dict,
+        org_quats: dict,
+        cp,
+    ) -> None:
+        """Apply the horizon lock in place, when it is enabled or keyframed.
+
+        Quaternion mode by default; the gravity-vector mode needs an
+        accelerometer series and stays opt-in (``--horizon-gravity``).
+        """
+        lock = self.smoothing.horizon_lock
+        if not (lock.lock_enabled or cp.keyframes.is_keyframed(
+            KeyframeType.LockHorizonAmount
+        )):
+            return
+
+        grav = None
+        use_grav = False
+        if self.gyro.use_gravity_vectors:
+            accl = [imu for imu in self.gyro.raw_imu if imu.accl is not None]
+            if len(accl) >= 3:
+                grav = {}
+                for imu in accl:
+                    v = np.asarray(imu.accl, dtype=np.float64)
+                    n = np.linalg.norm(v)
+                    if n > 1e-6:
+                        # accelerometer at rest reads "up" (~+g); the gravity
+                        # mode compares against +Y in sensor frame
+                        grav[int(round(imu.timestamp_ms * 1000.0))] = v / n
+                use_grav = len(grav) >= 3
+                if not use_grav:
+                    grav = None
+
+        lock.lock(quats, org_quats=org_quats, grav=grav, use_grav=use_grav,
+                  compute_params=cp)
 
     def recompute_adaptive_zoom(self) -> None:
         """Recompute adaptive zoom FOVs."""

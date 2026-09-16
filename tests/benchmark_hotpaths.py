@@ -106,7 +106,7 @@ def bench_default_algo_smoothing():
     sm = Smoothing()
 
     def run():
-        sm.smooth(quats, 30000.0, cp, org_quats=quats)
+        sm.smooth(quats, 30000.0, cp)
 
     return _time(run)
 

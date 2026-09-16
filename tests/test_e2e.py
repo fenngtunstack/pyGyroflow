@@ -367,7 +367,15 @@ def build_synthetic_gopro_mp4(gyro_xyz: list[tuple[int, int, int]],
             boxes += stts
         stbl = _mp4_box("stbl", boxes)
         minf = _mp4_box("minf", stbl)
-        hdlr = _mp4_box("hdlr", b"\x00" * 8 + b"gpmd" + b"\x00" * 12)
+        # Real GoPro metadata track: handler type "meta" plus the Pascal-string
+        # name "GoPro MET". That name is the marker upstream keys on
+        # (gopro/mod.rs::GoPro::detect) — the "gpmd" codec tag in stsd is not,
+        # since it also occurs by chance inside compressed video data.
+        hdlr = _mp4_box(
+            "hdlr",
+            b"\x00" * 4 + b"mhlr" + b"meta" + b"\x00" * 12
+            + bytes([11]) + b"GoPro MET  ",
+        )
         # mdhd v0: version+flags(4) + creation(4) + modification(4) +
         # timescale(4) + duration(4)
         mdhd = _mp4_box("mdhd", struct.pack(">IIIII", 0, 0, 0, 1000, 30))

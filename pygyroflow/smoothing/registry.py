@@ -72,66 +72,15 @@ class Smoothing:
         quats: TimeQuat,
         duration_ms: float,
         compute_params: Any,
-        org_quats: TimeQuat | None = None,
-        grav: Any | None = None,
-        use_grav: bool = False,
     ) -> TimeQuat:
-        """Execute smoothing with the current algorithm and optional horizon lock.
+        """Run the currently selected smoothing algorithm.
 
-        Args:
-            quats: Input quaternion sequence.
-            duration_ms: Total duration in milliseconds.
-            compute_params: Computation parameters.
-            org_quats: Original quaternions for horizon lock roll rate.
-            grav: Gravity vectors for horizon lock.
-            use_grav: Whether to use gravity vectors in horizon lock.
-
-        Returns:
-            Smoothed (and optionally horizon-locked) quaternion sequence.
+        The horizon lock is *not* applied here. Upstream composes the two in
+        ``GyroSource::recompute_smoothness``, and the order matters: it locks
+        the horizon on the original orientations and then smooths. Applying
+        it here as well (as this did) locked a second time after smoothing —
+        ``lock()`` slerps toward the locked orientation by a percentage, so
+        two passes are not the same as one. See
+        ``StabilizationManager.recompute_smoothing``.
         """
-        result = self.current().smooth(quats, duration_ms, compute_params)
-
-        # Apply horizon lock if enabled
-        if self.horizon_lock.lock_enabled or (
-            hasattr(compute_params, "keyframes")
-            and compute_params.keyframes.is_keyframed(
-                __import__(
-                    "pygyroflow.keyframes", fromlist=["KeyframeType"]
-                ).KeyframeType.LockHorizonAmount
-            )
-        ):
-            if org_quats is None:
-                org_quats = quats
-            self.horizon_lock.lock(result, org_quats, grav, use_grav, compute_params)
-
-        return result
-
-    def clone(self) -> Smoothing:
-        """Create a copy of this Smoothing manager.
-
-        Copies parameters from each algorithm to a new instance.
-        """
-        ret = Smoothing()
-        ret.current_index = self.current_index
-        ret.horizon_lock = HorizonLock()
-        # Copy horizon lock params
-        ret.horizon_lock.lock_enabled = self.horizon_lock.lock_enabled
-        ret.horizon_lock.horizonlockpercent = self.horizon_lock.horizonlockpercent
-        ret.horizon_lock.horizonroll = self.horizon_lock.horizonroll
-        ret.horizon_lock.lock_pitch = self.horizon_lock.lock_pitch
-        ret.horizon_lock.horizonpitch = self.horizon_lock.horizonpitch
-        ret.horizon_lock.automatic_lock = self.horizon_lock.automatic_lock
-        ret.horizon_lock.turn_threshold = self.horizon_lock.turn_threshold
-        ret.horizon_lock.turn_smoothing_ms = self.horizon_lock.turn_smoothing_ms
-        ret.horizon_lock.turn_multiplier = self.horizon_lock.turn_multiplier
-        ret.horizon_lock.tilt_accel_limit = self.horizon_lock.tilt_accel_limit
-
-        # Copy current algorithm parameters
-        params = self.current().get_parameters_json()
-        for p in params:
-            name = p.get("name")
-            value = p.get("value", 0.0)
-            if name is not None:
-                ret.current().set_parameter(name, value)
-
-        return ret
+        return self.current().smooth(quats, duration_ms, compute_params)
