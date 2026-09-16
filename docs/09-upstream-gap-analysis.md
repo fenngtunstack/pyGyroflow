@@ -14,6 +14,8 @@
 
 状态标记：**缺口 R**（上游有、我们无或结果错）、**差异 D**（都在，实现不同）、**等价 E**（核对过、一致——列出以便读者知道查过）。
 
+**关于「逐位一致」**：把上游 Rust 代码原样拷进临时 crate 跑参照时，同一份源码**重新编译后结果不保证逐位相同**——实测 `splines.rs` 有 11 个用例的个别值差 1 ULP（debug 与 release 也互相不一致，指向 LLVM 的乘加合并）。所以凡是标「逐位一致」的地方，指的是与该次构建的输出一致；跨构建应对到 1e-12 相对容差。
+
 ---
 
 ## 第一部分：实测复现的缺陷
@@ -234,7 +236,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | A-04 | R | **整个文件读进内存**。`parser.py:66-68` `f.read()`；上游 `lib.rs:73-84` 只读头尾。多 GB 素材会爆 | [报告] |
 | A-05 | R | **FileMetadata 19 字段中 9 个声明但从不写入**：`gravity_vectors`/`image_orientations`/`lens_positions`/`lens_params`/`per_frame_time_offsets`/`digital_zoom`/`camera_stab_data`/`mesh_correction`/`frame_readout_direction`。逐个 grep 确证（仅 `thin()` 会置 None） | [实测] |
 | A-06 | R | **Sony 专项全缺**（`sony.rs` 621 行，我们只读 7 个 tag）：`init_lens_profile`（从 LensDistortion 0xe421 建档案，6 项 SVD + Newton 逆）、`stab_collect`+`stab_calc_splines`（IBIS 0xe40f/0xe450、OIS 0xe416 → CatmullRom 样条）、`get_time_offset`（0xe40c/0xe40d/0xe437/0xe435）、`get_mesh_correction`（0xe42f Mesh + 0xe423 FPD）。**注意**：`distortion_models/sony.py` 我们写了 353 行的着色器侧模型，但**无任何东西喂它系数** | [实测] |
-| A-07 | R | **`splines.rs` 在 Python 侧不存在**（CatmullRom + BivariateSpline）。上游用于 Sony IBIS/OIS 与 mesh，不是死代码 | [报告] |
+| A-07 | R | **`splines.rs` 在 Python 侧不存在**（CatmullRom + BivariateSpline）。上游用于 Sony IBIS/OIS 与 mesh，不是死代码 | [报告] —— 已实现（`8bfa9e1`）：`gyro_source/splines.py`，CatmullRom 与 BivariateSpline 与上游 Rust 逐位一致（17 用例 / 108 个数值，见 `tests/golden/splines.json`） | [实测] |
 | A-08 | D | **GoPro method-0 `QuaternionConverter` 公式不同**。`converter.py:103` 写 `n_quat * io_quat * org⁻¹`，上游 `mod.rs:47` 是 `n_quat * (org_quat * io_quat⁻¹)⁻¹`。实测短片段影响小（差异是恒定 20.5°±0.40° 安装角，逐帧相对旋转只差 0.043°），但公式错是事实 | [实测] |
 | A-09 | D | **滤波边界行为不同**。上游零状态因果前后向；我们用 `sosfiltfilt`（奇数对称填充）与 `medfilt`（居中窗）。序列两端系统性不同 | [报告] |
 | A-10 | D | **VQF 磁力计输入不同**。上游 `mod.rs:126` 硬编码 `let m = [0,0,0]`；我们在 `TimeIMU.magn` 有值时传真实磁力计。当前 Python 解析器从不填 magn，属潜伏 | [报告] |
@@ -390,6 +392,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | D-01 逐时间戳镜头数据（`lens_positions`/`lens_params`/`digital_zoom`/`invert_asym_lens`）+ `MapClosest`、D-11 逐帧 `camera_diagonal_fovs`、D-07 读出时间按裁切缩放 | `3be3629` | 真素材：`a7s3-sony85mm` 450 包里 200 个带 `0x8005`，每个都是 85.0 mm（15015 条 IMU 行）；`rx100-7-ois-only` 无该标签、map 为空。`ClosestMap` 的等距返回 None、严格 `<` 上限、缺席侧 −99999 哨兵逐条断言；`stretch_lens` 门控与主点重置；`lens_params` 多于一项才逐帧算 FOV |
 | C-06 余下（前半）：`file_metadata` 的 CBOR 编解码 + `WithProcessedData` 工程的载入路径 + readout 方向解析 | `ef8801d` | ciborium 逐字节对照全部 19 个字段（scratch crate 用真 ciborium 0.2.2 生成，`--check` 可一键复查 fixture 是否同步）；**真机工程 1059160 字节整块逐字节往返**（四元数须以原始分量喂编码器，`Quat64` 构造时会归一化，偏差上界 2.2e-16 已单独断言）；另用真工程验证载入后拿到 25185 个四元数、`lens_profile`、`additional_data` 与 readout 时间/方向 |
 | C-06 余下（后半）：`--export-project` 2/3 模式 | `9772a50` | 真机工程：3 模式导出的 `synced_imu_timestamps` 与该工程原本导出**逐值相同**（25185 项），验证的是派生公式本身；2/3 产物都能被没见过原片的新 manager 载入并取回 25185 个四元数；CLI 侧 subprocess 跑真命令行验 2 与 3 |
+| A-07 `splines.rs`（CatmullRom + BivariateSpline） | `8bfa9e1` | 上游 Rust 原样跑参照，17 用例 108 个数值逐位相等；顺带查出参照跨编译不可复现（1 ULP），生成脚本改用容差比较并把这条写进 fixture 的 `_provenance` |
 | D-08 焦距平滑（两个滤波器 + strength 映射 + fov 补偿 + FOV 缓存键） | `cb606bb` | **与上游 Rust 逐位一致**：上游 `focal_length.rs` 原样拷进临时 crate、只新写 `main()`，22 个用例全 `max_rel = 0.0`；生成脚本复现的驱动脚本与实跑逐字节相同，fixture 明确标注非自生成。接线在恒等陀螺下按 `矩阵[0,0] = fov/相机fx` 的比值断言补偿量本身 |
 
 **实施中新发现的、原清单没有的缺陷**：
@@ -456,7 +459,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 
 | 项 | 说明 |
 |---|---|
-| D-06 `at_timestamp_for_points`/`undistort_points*` 逐点家族 | D-01 的内参路径已通（`3be3629`），剩下的是**逐点**按各自行时刻取旋转、IBIS 位移、mesh、数码镜头；**自动同步与自适应缩放的采样点仍跑在畸变坐标上** |
+| D-06 `at_timestamp_for_points`/`undistort_points*` 逐点家族 | D-01 的内参路径已通（`3be3629`），mesh 与 IBIS 曲线需要的 `splines.py` 也已就位（`8bfa9e1`）；剩下的是**逐点**按各自行时刻取旋转、IBIS 位移、mesh、数码镜头；**自动同步与自适应缩放的采样点仍跑在畸变坐标上** |
 | D-08 焦距平滑 | ~~整文件移植~~ 已实现（`cb606bb`），但需要 `lens_params` 写入侧才能上真机 |
 | D-05 max-zoom 反馈回路 | 需加字段 + 循环 |
 | D-09 自适应缩放关键帧 | 传 params 即可恢复大半 |
