@@ -31,6 +31,53 @@ _CODEC_MAP: dict[str, str] = {
 # Default codec when an unknown name is given.
 _DEFAULT_CODEC = "libx265"
 
+# Pixel format per encoder.  Encoders are not interchangeable here: prores_ks
+# only accepts 10-bit 4:2:2 (yuv422p10le), and hardcoding yuv420p for every
+# codec makes avcodec_open2 fail with EINVAL.  The 8-bit encoders are happy
+# with yuv420p.
+_PIX_FMT_MAP: dict[str, str] = {
+    "libx264": "yuv420p",
+    "libx265": "yuv420p",
+    "prores_ks": "yuv422p10le",
+    "libaom-av1": "yuv420p",
+    "libvpx-vp9": "yuv420p",
+    "mpeg4": "yuv420p",
+}
+
+# ProRes needs an explicit profile: prores_ks defaults to "proxy" (0), which
+# is a quarter-resolution mezzanine — the wrong thing to hand someone who
+# asked for ProRes output.  3 = HQ.
+_ENCODER_PROFILE: dict[str, int] = {"prores_ks": 3}
+
+
+def _put_unless_failed(q, item, failed: list, stop=None) -> bool:
+    """Put *item* on *q*, giving up if the consumer has died or *stop* is set.
+
+    The queues are bounded, so a plain ``put`` blocks forever once one fills
+    — and it fills for good as soon as the consumer exits.  Poll instead: the
+    moment the pipeline is aborting the producer has to stop, not wait.
+    """
+    import queue
+
+    while not failed and not (stop is not None and stop.is_set()):
+        try:
+            q.put(item, timeout=0.1)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _drain(q) -> None:
+    """Discard everything currently queued."""
+    import queue
+
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
 
 class FfmpegProcessor(VideoProcessor):
     """Video processor backed by PyAV (FFmpeg).
@@ -53,6 +100,7 @@ class FfmpegProcessor(VideoProcessor):
         self._image_sequence = None
         self._frame_index: int = 0
         self._audio_pairs: list = []
+        self._output_codec_name: str | None = None
 
     # ------------------------------------------------------------------
     # VideoProcessor interface
@@ -161,6 +209,7 @@ class FfmpegProcessor(VideoProcessor):
             raise VideoIOError("No input is open; call open_input() first")
 
         codec_name = _CODEC_MAP.get(codec, _DEFAULT_CODEC)
+        self._output_codec_name = codec_name
         self._output_container = av.open(path, mode="w")
         from fractions import Fraction
         fps_frac = Fraction(fps).limit_denominator(100000)
@@ -169,8 +218,17 @@ class FfmpegProcessor(VideoProcessor):
         )
         self._output_stream.width = width
         self._output_stream.height = height
-        # pix_fmt must be yuv420p for most encoder compatibility.
-        self._output_stream.pix_fmt = "yuv420p"
+        self._output_stream.pix_fmt = _PIX_FMT_MAP.get(codec_name, "yuv420p")
+
+        profile = _ENCODER_PROFILE.get(codec_name)
+        if profile is not None:
+            try:
+                self._output_stream.codec_context.profile = profile
+            except Exception:
+                log.warning(
+                    "Encoder %s accepted no profile %d; using its default",
+                    codec_name, profile,
+                )
 
         if bitrate > 0:
             self._output_stream.bit_rate = int(bitrate * 1_000_000)
@@ -232,32 +290,57 @@ class FfmpegProcessor(VideoProcessor):
         encode_q: "queue.Queue" = queue.Queue(maxsize=6)
         _DONE = object()
 
+        # Set when the main loop gives up (encode failure, callback error).
+        # Without it the decode thread keeps filling a queue nobody drains,
+        # blocks forever on its own put, and the join below burns its full
+        # timeout — 120 s of hang for a failure that was already known.
+        stop = threading.Event()
+
+        # Failures from either worker thread, read by the main loop.
+        fail: list[BaseException] = []
+
         def decode_loop():
             seq = 0
             try:
                 for packet in self._input_container.demux(self._input_stream):
+                    if stop.is_set():
+                        break
                     if packet.dts is None:
                         continue
                     for frame in packet.decode():
-                        decode_q.put(to_item(frame, seq))
+                        if not _put_unless_failed(decode_q, to_item(frame, seq), fail, stop):
+                            return
                         seq += 1
                 # Flush the threaded decoder (trailing buffered frames).
                 for frame in self._input_stream.decode():
-                    decode_q.put(to_item(frame, seq))
+                    if not _put_unless_failed(decode_q, to_item(frame, seq), fail, stop):
+                        return
                     seq += 1
             except Exception as exc:  # surfaced to the main loop
-                decode_q.put(exc)
+                fail.append(exc)
             finally:
+                # Drained first so this put cannot block: on the normal path
+                # the queue is already empty, on an aborted one its contents
+                # are stale. The main loop is guaranteed to see _DONE.
+                _drain(decode_q)
                 decode_q.put(_DONE)
 
+        # Encoder failures (a bad pix_fmt, an unavailable encoder) happen on
+        # the FIRST encode call inside this thread, not at add_stream. An
+        # exception here used to die silently as "Exception in thread
+        # pgf-encode": the main loop never saw it, so render() returned
+        # normally, the CLI printed "Done: <path>", and no file existed.
         def encode_loop():
-            while True:
-                item = encode_q.get()
-                if item is _DONE or isinstance(item, BaseException):
-                    return
-                out_frame = av.VideoFrame.from_ndarray(item, format="rgb24")
-                for pkt in self._output_stream.encode(out_frame):
-                    self._output_container.mux(pkt)
+            try:
+                while True:
+                    item = encode_q.get()
+                    if item is _DONE or isinstance(item, BaseException):
+                        return
+                    out_frame = av.VideoFrame.from_ndarray(item, format="rgb24")
+                    for pkt in self._output_stream.encode(out_frame):
+                        self._output_container.mux(pkt)
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                fail.append(exc)
 
         decoder = threading.Thread(target=decode_loop, name="pgf-decode", daemon=True)
         encoder = threading.Thread(target=encode_loop, name="pgf-encode", daemon=True)
@@ -278,19 +361,36 @@ class FfmpegProcessor(VideoProcessor):
                 # Ensure uint8 for encoding.
                 if processed.dtype != np.uint8:
                     processed = np.clip(processed, 0, 255).astype(np.uint8)
-                encode_q.put(processed)
+                if not _put_unless_failed(encode_q, processed, fail):
+                    pipeline_error = fail[0]
+                    break
                 self._frame_index += 1
         except BaseException as exc:
             pipeline_error = exc
             raise
         finally:
-            # Always release the encoder, even on stabilize errors.
+            stop.set()
+            _drain(decode_q)  # unblock a decode thread parked on a full queue
+            # Always release the encoder, even on stabilize errors. When the
+            # encoder already died its queue can be full and the final put
+            # would block forever, so drain it first.
+            if pipeline_error is not None or fail:
+                _drain(encode_q)
             encode_q.put(pipeline_error if pipeline_error is not None else _DONE)
-            encoder.join(timeout=120.0)
-            decoder.join(timeout=120.0)
+            encoder.join(timeout=30.0)
+            decoder.join(timeout=30.0)
 
         if pipeline_error is not None:
             raise pipeline_error
+
+        if fail and not isinstance(fail[0], Exception):
+            raise fail[0]
+
+        if fail:
+            raise VideoIOError(
+                f"Encoder '{self._output_codec_name}' failed after "
+                f"{self._frame_index} frame(s): {fail[0]}"
+            ) from fail[0]
 
         log.info("Processed %d frames", self._frame_index)
 
