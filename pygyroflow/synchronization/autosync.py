@@ -260,9 +260,30 @@ class AutosyncProcess:
             )
             return None
 
-        # full_sync delay: gyro_ts = visual_ts + delay
-        # convention:       visual_ts = gyro_ts + offset  =>  offset = -delay
-        return -delay_ms
+        # full_sync returns the delay in the same convention as upstream's
+        # `offset` (gyro_ts = visual_ts + delay), so a perfect match lands on
+        # the initial guess `-initial_offset_ms`.
+        #
+        # Upstream rejects results outside 90% of the search radius — at the
+        # edge of the window the cost minimum is not a real match, it is the
+        # boundary. Checked on the raw delay, before the readout term.
+        radius_ms = search_range_ms / 2.0
+        initial_delay_ms = -initial_offset_ms
+        if abs(delay_ms - initial_delay_ms) >= radius_ms * 0.9:
+            logger.warning(
+                "RS sync: delay %.2f ms is outside 90%% of the search radius "
+                "(%.2f ms from the initial guess, limit %.2f); rejecting",
+                delay_ms, abs(delay_ms - initial_delay_ms), radius_ms * 0.9,
+            )
+            return None
+
+        # Then subtract half the sensor readout time: the optical-flow pair
+        # sits at the frame's *readout* midpoint, and a rolling shutter takes
+        # frame_readout_time to sweep the frame, so the gyro↔frame
+        # correspondence is late by half of it. Dropping this term (as this
+        # did) biases every synced offset by a constant readout/2 — tens of
+        # ms on a slow sensor.
+        return -delay_ms - frame_readout_time_ms / 2.0
 
     def _pose_estimator_camera_matrix(self) -> np.ndarray | None:
         """Camera matrix set on the pose estimator (None if identity)."""

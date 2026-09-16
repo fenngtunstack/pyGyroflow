@@ -1327,6 +1327,10 @@ class StabilizationManager:
             input_vertical_stretch=lens.input_vertical_stretch if lens.input_vertical_stretch > 0.01 else 1.0,
             focal_length=lens.focal_length,
             radial_distortion_limit=radial_limit,
+            optimal_fov=lens.optimal_fov,
+            per_frame_time_offsets=list(
+                getattr(self.gyro.file_metadata, "per_frame_time_offsets", None) or []
+            ),
         )
 
     def _get_radial_distortion_limit(self, model_name: str, coeffs: list[float]) -> float:

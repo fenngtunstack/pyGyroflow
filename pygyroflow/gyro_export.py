@@ -75,14 +75,22 @@ def export_gyro_csv_full(
     fovs: list[float] | None = None,
     fps: float = 0.0,
 ) -> None:
-    """Export full gyro data (original + stabilized) to CSV.
+    """Export full gyro data (original + stabilized camera motion) to CSV.
 
     Args:
         original: Original quaternion stream.
-        smoothed: Smoothed quaternion stream.
+        smoothed: The *correction* stream — ``GyroSource.smoothed_quaternions``,
+            i.e. ``smooth⁻¹ * org``, which is what the pipeline stores.
+            Upstream's ``gyro.smoothed_quaternions`` holds the same thing.
         path: Output file path.
         fovs: Per-frame FOV values.
         fps: Video FPS for frame calculation.
+
+    The ``stab_*`` column is the stabilized **camera motion**, not the
+    correction: upstream reverses its own composition with
+    ``(quat_smooth / quat_org).inverse()`` (gyro_export.rs). Writing the
+    correction verbatim gives the inverse of what Blender/AE expect, so the
+    exported track moves the wrong way.
     """
     rad2deg = 180.0 / math.pi
 
@@ -100,7 +108,10 @@ def export_gyro_csv_full(
         for ts in sorted(original.keys()):
             ts_ms = ts / 1000.0
             oq = original[ts].quaternion()
-            sq = smoothed.get(ts, original[ts]).quaternion()
+            # (correction / org)⁻¹ — see the docstring. Dividing by a
+            # quaternion is multiplication by its inverse.
+            corr = smoothed.get(ts, original[ts])
+            sq = (corr * original[ts].inverse()).inverse().quaternion()
 
             row = [
                 ts, f"{ts_ms:.6f}",

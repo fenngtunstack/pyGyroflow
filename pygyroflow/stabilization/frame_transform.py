@@ -298,8 +298,15 @@ class FrameTransform:
         fov = _get_fov(params, frame, True, timestamp_ms, False)
         ui_fov = _get_fov(params, frame, True, timestamp_ms, True)
 
-        # Apply optimal FOV adjustment if lens provides one
-        # (simplified: not handling lens.optimal_fov here)
+        # Upstream frame_transform.rs: a lens profile may carry the FOV it is
+        # sharpest at. With per-frame fovs present the *UI* fov is divided by
+        # it (the render fov already went through StabilizationParams.set_fovs
+        # with the same factor); without them the render fov is scaled.
+        if params.optimal_fov:
+            if params.fovs:
+                ui_fov /= params.optimal_fov
+            else:
+                fov *= params.optimal_fov
 
         scaled_k = camera_matrix.copy()
         new_k = _get_new_k(params, camera_matrix, fov)
@@ -312,6 +319,14 @@ class FrameTransform:
         is_horizontal = params.frame_readout_direction.is_horizontal()
         rs_dim = params.width if is_horizontal else params.height
         row_readout_time = frame_readout_time / rs_dim if rs_dim > 0 else 0.0
+
+        # Per-frame timestamp correction, applied from here on (upstream
+        # shadows its `timestamp_ms` at exactly this point). Files that
+        # provide it — Sony RTMD, some DJI/RED streams — carry a few ms of
+        # per-frame jitter that otherwise lands straight on the gyro lookup.
+        if params.per_frame_time_offsets:
+            if 0 <= frame < len(params.per_frame_time_offsets):
+                timestamp_ms = timestamp_ms + params.per_frame_time_offsets[frame]
 
         # Start of readout = center time - half readout time
         start_ts = timestamp_ms - (frame_readout_time / 2.0)
@@ -462,7 +477,13 @@ class FrameTransform:
         kernel_params.background_margin = float(background_margin)
         kernel_params.background_margin_feather = float(background_feather)
 
-        # 2D translation from adaptive zoom center
+        # 2D translation from adaptive zoom center. With an inverted
+        # framebuffer (bottom-up row order) the vertical centre has to flip;
+        # upstream does this right before packing translation2d
+        # (frame_transform.rs), and the CPU and GPU samplers both rely on it.
+        if params.framebuffer_inverted:
+            adaptive_zoom_center_y = -adaptive_zoom_center_y
+
         fov_f = float(fov)
         kernel_params.translation2d = (ctypes.c_float * 2)(
             float(adaptive_zoom_center_x * params.width / fov_f),

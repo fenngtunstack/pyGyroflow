@@ -131,3 +131,12 @@ class ComputeParams:
 
     # Radial distortion limit
     radial_distortion_limit: float = 0.0
+    # LensProfile.optimal_fov: the FOV the lens is sharpest at, from the
+    # profile JSON. Upstream divides the *UI* fov by it when per-frame fovs
+    # exist, and multiplies the render fov by it when they don't
+    # (frame_transform.rs). None means "no adjustment".
+    optimal_fov: float | None = None
+    # FileMetadata.per_frame_time_offsets: per-frame timestamp corrections
+    # (Sony/DJI/RED). Upstream adds offsets[frame] to the video timestamp
+    # before the rolling-shutter and quaternion lookups.
+    per_frame_time_offsets: list[float] = field(default_factory=list)

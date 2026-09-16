@@ -95,3 +95,95 @@ class TestPiecewiseLookup:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+class TestRsSyncOffsetArithmetic:
+    """The rolling-shutter offset is delay plus a readout correction.
+
+    Upstream (rs_sync.rs::full_sync) computes ``-delay - readout/2`` and
+    rejects anything more than 90% of the search radius away from the initial
+    guess. The readout half was missing here, which biases every synced
+    offset by a constant — tens of milliseconds on a slow sensor.
+    """
+
+    class _Frame:
+        def __init__(self, frame_no, timestamp_us, n=20):
+            self.frame_no = frame_no
+            self.timestamp_us = timestamp_us
+            self.prev_points = np.zeros((n, 2), np.float32)
+            self.curr_points = np.ones((n, 2), np.float32)
+
+    @staticmethod
+    def _proc(delay_ms, *, cost=1.0, neighbour_cost=100.0):
+        """An AutosyncProcess whose RS search returns *delay_ms* verbatim."""
+        from pygyroflow.synchronization import autosync as mod
+        from pygyroflow.synchronization.find_offset import rs_sync as rs_mod
+
+        class _StubRs:
+            def __init__(self, *a, **k):
+                pass
+
+            def add_track_from_frames(self, *a, **k):
+                pass
+
+            def full_sync(self, **kwargs):
+                self.kwargs = kwargs
+                return cost, delay_ms
+
+            def _compute_cost(self, *a, **k):
+                return neighbour_cost
+
+        proc = mod.AutosyncProcess(fps=30.0)
+        proc._pose_estimator = type(
+            "PE",
+            (),
+            {"get_frame_results": lambda self: {
+                i: TestRsSyncOffsetArithmetic._Frame(i, i * 33_000)
+                for i in range(6)
+            }},
+        )()
+        rs_mod.RollingShutterSync = _StubRs
+        return proc
+
+    def _frames(self, n=6):
+        return [(i * 33_000, np.zeros((64, 64), np.uint8)) for i in range(n)]
+
+    def test_readout_half_is_subtracted(self):
+        proc = self._proc(delay_ms=10.0)
+        offset = proc._rs_sync_offset(
+            self._frames(), {}, frame_readout_time_ms=14.0, search_range_ms=500.0
+        )
+        assert offset == pytest.approx(-10.0 - 7.0)
+
+    def test_global_shutter_is_plain_negation(self):
+        proc = self._proc(delay_ms=10.0)
+        offset = proc._rs_sync_offset(
+            self._frames(), {}, frame_readout_time_ms=0.0, search_range_ms=500.0
+        )
+        assert offset == pytest.approx(-10.0)
+
+    def test_offset_near_the_search_limit_is_rejected(self):
+        """|delay - initial| >= 90% of the radius is the window edge, not a match."""
+        proc = self._proc(delay_ms=240.0)  # radius 250 -> limit 225
+        assert proc._rs_sync_offset(
+            self._frames(), {}, frame_readout_time_ms=0.0, search_range_ms=500.0
+        ) is None
+
+    def test_offset_inside_the_limit_is_accepted(self):
+        proc = self._proc(delay_ms=200.0)  # < 225
+        assert proc._rs_sync_offset(
+            self._frames(), {}, frame_readout_time_ms=0.0, search_range_ms=500.0
+        ) == pytest.approx(-200.0)
+
+    def test_initial_offset_shifts_the_acceptance_window(self):
+        """The guard measures distance from the initial guess, not from zero."""
+        proc = self._proc(delay_ms=300.0)
+        # initial_offset 100 -> initial_delay -100 -> |300 - (-100)| = 400 > 225
+        assert proc._rs_sync_offset(
+            self._frames(), {}, frame_readout_time_ms=0.0,
+            search_range_ms=500.0, initial_offset_ms=100.0,
+        ) is None
+        # initial_offset -300 -> initial_delay 300 -> distance 0
+        assert proc._rs_sync_offset(
+            self._frames(), {}, frame_readout_time_ms=0.0,
+            search_range_ms=500.0, initial_offset_ms=-300.0,
+        ) == pytest.approx(-300.0)

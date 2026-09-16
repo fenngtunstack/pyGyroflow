@@ -81,3 +81,109 @@ class TestFrameTransform:
             [m[6], m[7], m[8]],
         ], dtype=np.float32)
         assert np.all(np.isfinite(mat3x3)), "Matrix should not contain NaN or Inf"
+
+class TestOptimalFov:
+    """A lens profile's `optimal_fov` adjusts the UI fov (or the render fov).
+
+    Upstream frame_transform.rs: with per-frame fovs present the UI fov is
+    divided by it — the render fov already carries the same factor through
+    `StabilizationParams.set_fovs`. Without per-frame fovs the render fov is
+    multiplied. Neither branch existed here.
+    """
+
+    def test_ui_fov_is_divided_when_per_frame_fovs_exist(self):
+        """The UI fov lands on FrameTransform.fov; the kernel gets `fov`."""
+        base = _make_test_params()
+        adj = _make_test_params()
+        adj.optimal_fov = 1.25
+        assert base.fovs  # the branch under test
+
+        plain = FrameTransform.at_timestamp(base, timestamp_ms=500.0, frame=50)
+        adjusted = FrameTransform.at_timestamp(adj, timestamp_ms=500.0, frame=50)
+        assert adjusted.fov == pytest.approx(plain.fov / 1.25, rel=1e-6)
+        # the render fov is untouched — set_fovs already applied the factor
+        assert adjusted.kernel_params.fov == pytest.approx(
+            plain.kernel_params.fov, rel=1e-6
+        )
+
+    def test_render_fov_is_multiplied_without_per_frame_fovs(self):
+        base = _make_test_params()
+        base.fovs = []
+        adj = _make_test_params()
+        adj.fovs = []
+        adj.optimal_fov = 1.25
+
+        plain = FrameTransform.at_timestamp(base, timestamp_ms=500.0, frame=50)
+        adjusted = FrameTransform.at_timestamp(adj, timestamp_ms=500.0, frame=50)
+        assert adjusted.kernel_params.fov == pytest.approx(
+            plain.kernel_params.fov * 1.25, rel=1e-6
+        )
+
+    def test_absent_optimal_fov_is_a_no_op(self):
+        base = _make_test_params()
+        same = _make_test_params()
+        a = FrameTransform.at_timestamp(base, timestamp_ms=500.0, frame=50)
+        b = FrameTransform.at_timestamp(same, timestamp_ms=500.0, frame=50)
+        assert a.kernel_params.fov == b.kernel_params.fov
+
+
+class TestPerFrameTimeOffsets:
+    """Per-frame timestamp corrections shift the rolling-shutter timing.
+
+    Upstream adds `file_metadata.per_frame_time_offsets[frame]` to the video
+    timestamp after the readout time is resolved, so the gyro lookup for each
+    row starts from the corrected frame time.
+    """
+
+    def _transform(self, offsets):
+        params = _make_test_params()
+        params.frame_readout_time = 0.03
+        params.per_frame_time_offsets = offsets
+        return FrameTransform.at_timestamp(params, timestamp_ms=500.0, frame=50)
+
+    def test_offsets_move_the_row_matrices(self):
+        plain = self._transform([])
+        shifted = self._transform([0.0] * 50 + [5.0] + [0.0] * 49)
+        assert not np.allclose(plain.matrices, shifted.matrices)
+
+    def test_out_of_range_frame_is_ignored(self):
+        plain = self._transform([])
+        short = self._transform([3.0])
+        assert np.allclose(plain.matrices, short.matrices)
+
+    def test_zero_offset_matches_no_offsets(self):
+        plain = self._transform([])
+        zeros = self._transform([0.0] * 100)
+        assert np.allclose(plain.matrices, zeros.matrices)
+
+
+class TestFramebufferInverted:
+    """An inverted framebuffer flips the adaptive-zoom centre vertically."""
+
+    def _transform(self, inverted, center_y=0.1):
+        params = _make_test_params()
+        params.adaptive_zoom_center_offset = (0.0, center_y)
+        params.framebuffer_inverted = inverted
+        return FrameTransform.at_timestamp(params, timestamp_ms=500.0, frame=50)
+
+    def test_center_is_negated(self):
+        upright = self._transform(False)
+        flipped = self._transform(True)
+        assert flipped.kernel_params.translation2d[1] == pytest.approx(
+            -upright.kernel_params.translation2d[1], rel=1e-6
+        )
+
+    def test_horizontal_center_is_untouched(self):
+        params = _make_test_params()
+        params.adaptive_zoom_center_offset = (0.1, 0.1)
+        upright = FrameTransform.at_timestamp(params, timestamp_ms=500.0, frame=50)
+        params2 = _make_test_params()
+        params2.adaptive_zoom_center_offset = (0.1, 0.1)
+        params2.framebuffer_inverted = True
+        flipped = FrameTransform.at_timestamp(params2, timestamp_ms=500.0, frame=50)
+        assert flipped.kernel_params.translation2d[0] == pytest.approx(
+            upright.kernel_params.translation2d[0], rel=1e-6
+        )
+
+    def test_zero_center_is_unaffected(self):
+        assert self._transform(True, center_y=0.0).kernel_params.translation2d[1] == 0.0
