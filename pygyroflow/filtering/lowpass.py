@@ -8,6 +8,9 @@ application, which matches the biquad DirectForm2Transposed approach in Rust.
 import numpy as np
 from scipy import signal
 
+from pygyroflow.filtering.imu_channels import filter_imu_channels
+from pygyroflow.types.time_types import TimeIMU
+
 
 def lowpass_filter(
     data: np.ndarray,
@@ -73,68 +76,30 @@ def lowpass_filter_channels(
 
 
 def lowpass_filter_imu(
-    imu_data: list,
+    imu_data: list[TimeIMU],
     cutoff_freq: float,
     sample_rate: float,
     forward_backward: bool = True,
-) -> list:
-    """Apply lowpass filter to IMU data channels.
+) -> list[TimeIMU]:
+    """Apply a Butterworth lowpass to the gyro and accel axes of IMU samples.
 
-    Each element of imu_data is expected to be a dict-like with optional
-    'gyro' ([x, y, z]) and 'accl' ([x, y, z]) fields, mirroring the Rust
-    TimeIMU struct.
-
-    The Rust implementation runs 6 independent biquad filters (3 gyro + 3 accl).
-    We achieve the same by extracting each axis as an array, filtering, and
-    writing back.
+    Mirrors upstream's ``IMUTransforms`` lowpass step: the Rust implementation
+    runs 6 independent biquads (3 gyro + 3 accel). Each axis is lifted out as
+    an array, filtered, and written back.
 
     Args:
-        imu_data: List of IMU samples. Each sample is a dict with optional
-            'gyro' (list/array of 3) and 'accl' (list/array of 3).
+        imu_data: IMU samples (``TimeIMU`` objects).
         cutoff_freq: Cutoff frequency in Hz.
         sample_rate: Sample rate in Hz.
         forward_backward: If True, zero-phase forward-backward filtering.
 
     Returns:
-        New list with filtered IMU data (same structure, new objects).
+        New list of ``TimeIMU`` samples with filtered gyro/accl.
     """
     if cutoff_freq <= 0 or cutoff_freq >= sample_rate / 2:
         return imu_data
 
-    n = len(imu_data)
-
-    # Collect gyro and accl arrays
-    has_gyro = any(sample.get("gyro") is not None for sample in imu_data)
-    has_accl = any(sample.get("accl") is not None for sample in imu_data)
-
-    if has_gyro:
-        gyro_arr = np.array(
-            [sample.get("gyro", [0.0, 0.0, 0.0]) for sample in imu_data]
-        ).T  # shape (3, n)
-        gyro_filtered = lowpass_filter_channels(
-            gyro_arr, cutoff_freq, sample_rate, forward_backward
-        )
-    else:
-        gyro_filtered = None
-
-    if has_accl:
-        accl_arr = np.array(
-            [sample.get("accl", [0.0, 0.0, 0.0]) for sample in imu_data]
-        ).T  # shape (3, n)
-        accl_filtered = lowpass_filter_channels(
-            accl_arr, cutoff_freq, sample_rate, forward_backward
-        )
-    else:
-        accl_filtered = None
-
-    # Write back
-    result = []
-    for i, sample in enumerate(imu_data):
-        new_sample = dict(sample)
-        if gyro_filtered is not None and sample.get("gyro") is not None:
-            new_sample["gyro"] = [float(gyro_filtered[axis, i]) for axis in range(3)]
-        if accl_filtered is not None and sample.get("accl") is not None:
-            new_sample["accl"] = [float(accl_filtered[axis, i]) for axis in range(3)]
-        result.append(new_sample)
-
-    return result
+    return filter_imu_channels(
+        imu_data,
+        lambda arr: lowpass_filter_channels(arr, cutoff_freq, sample_rate, forward_backward),
+    )

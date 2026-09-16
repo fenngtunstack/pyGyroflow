@@ -7,6 +7,9 @@ Uses scipy.signal.medfilt which applies a sliding-window median.
 import numpy as np
 from scipy.signal import medfilt
 
+from pygyroflow.filtering.imu_channels import filter_imu_channels
+from pygyroflow.types.time_types import TimeIMU
+
 
 def median_filter(
     data: np.ndarray,
@@ -63,51 +66,21 @@ def median_filter_channels(
 
 
 def median_filter_imu(
-    imu_data: list,
+    imu_data: list[TimeIMU],
     kernel_size: int = 3,
     forward_backward: bool = True,
-) -> list:
-    """Apply median filter to IMU data channels.
-
-    Each element of imu_data is a dict-like with optional 'gyro' and 'accl'
-    fields, matching the TimeIMU structure.
+) -> list[TimeIMU]:
+    """Apply a median filter to the gyro and accel axes of IMU samples.
 
     Args:
-        imu_data: List of IMU samples.
+        imu_data: IMU samples (``TimeIMU`` objects).
         kernel_size: Size of the median window.
         forward_backward: If True, double-pass median filter.
 
     Returns:
-        New list with filtered IMU data.
+        New list of ``TimeIMU`` samples with filtered gyro/accl.
     """
-    n = len(imu_data)
-
-    has_gyro = any(sample.get("gyro") is not None for sample in imu_data)
-    has_accl = any(sample.get("accl") is not None for sample in imu_data)
-
-    if has_gyro:
-        gyro_arr = np.array(
-            [sample.get("gyro", [0.0, 0.0, 0.0]) for sample in imu_data]
-        ).T
-        gyro_filtered = median_filter_channels(gyro_arr, kernel_size, forward_backward)
-    else:
-        gyro_filtered = None
-
-    if has_accl:
-        accl_arr = np.array(
-            [sample.get("accl", [0.0, 0.0, 0.0]) for sample in imu_data]
-        ).T
-        accl_filtered = median_filter_channels(accl_arr, kernel_size, forward_backward)
-    else:
-        accl_filtered = None
-
-    result = []
-    for i, sample in enumerate(imu_data):
-        new_sample = dict(sample)
-        if gyro_filtered is not None and sample.get("gyro") is not None:
-            new_sample["gyro"] = [float(gyro_filtered[axis, i]) for axis in range(3)]
-        if accl_filtered is not None and sample.get("accl") is not None:
-            new_sample["accl"] = [float(accl_filtered[axis, i]) for axis in range(3)]
-        result.append(new_sample)
-
-    return result
+    return filter_imu_channels(
+        imu_data,
+        lambda arr: median_filter_channels(arr, kernel_size, forward_backward),
+    )

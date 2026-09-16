@@ -94,11 +94,26 @@ class GyroSource:
         self.duration_ms = duration_ms
 
     def clear(self) -> None:
-        """Reset all data to initial state."""
+        """Reset all data to initial state.
+
+        ``imu_orientation`` and ``gyro_bias`` deliberately survive, matching
+        upstream's ``GyroSource::clear`` (gyro_source/mod.rs): they are user
+        settings, not per-load state. Replacing the whole ``IMUTransforms``
+        object here (as this used to) silently dropped a gyro bias the caller
+        had set before loading — and because ``has_any()`` then went False,
+        ``apply_transforms`` took the "no transforms" branch and cleared
+        ``raw_imu`` entirely, leaving ``_get_imu_data()`` to fall back to the
+        untransformed samples. The bias was ignored with no error anywhere.
+        """
         self.quaternions.clear()
         self.smoothed_quaternions.clear()
         self.raw_imu.clear()
-        self.imu_transforms = IMUTransforms()
+        self.imu_transforms.imu_rotation_angles = None
+        self.imu_transforms._imu_rotation_matrix = None
+        self.imu_transforms.acc_rotation_angles = None
+        self.imu_transforms._acc_rotation_matrix = None
+        self.imu_transforms.imu_lpf = 0.0
+        self.imu_transforms.imu_mf = 0
         self.file_metadata = FileMetadata()
         self.clear_offsets()
 
