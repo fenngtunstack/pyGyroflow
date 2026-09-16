@@ -87,6 +87,57 @@ def _drain(q) -> None:
             return
 
 
+def normalise_ranges(
+    ranges: list[tuple[float, float]] | None,
+    duration_ms: float,
+) -> list[tuple[float | None, float | None]]:
+    """Trim fractions -> per-range ``(start_ms|None, end_ms|None)``.
+
+    Upstream's ``render`` does exactly this (rendering/mod.rs): a range that
+    starts at 0 becomes ``None`` (no seek needed) and one that ends at 1.0
+    becomes ``None`` (no cut needed). The distinction matters downstream —
+    ``None`` means "to the end of the clip", not "to 0".
+    """
+    if not ranges:
+        return []
+    out: list[tuple[float | None, float | None]] = []
+    for start, end in ranges:
+        out.append(
+            (
+                start * duration_ms if start > 0.0 else None,
+                end * duration_ms if end < 1.0 else None,
+            )
+        )
+    return out
+
+
+def split_range_ms(
+    ranges: list[tuple[float, float]],
+    duration_ms: float,
+) -> list[tuple[float, float]]:
+    """Same as :func:`normalise_ranges` but keeping both bounds concrete.
+
+    Used where a range has to be named and measured (per-range exports), so
+    the ``None`` shortcut is not available.
+    """
+    return [(start * duration_ms, end * duration_ms) for start, end in ranges]
+
+
+def output_path_for_range(path: str, index: int) -> str:
+    """``out.mp4`` -> ``out-002.mp4`` for the *index*-th trim range (1-based).
+
+    Upstream inserts ``-{:0>3}`` before the last dot when exporting ranges
+    separately (rendering/mod.rs).
+    """
+    import os
+
+    folder, name = os.path.split(path)
+    stem, dot, extension = name.rpartition(".")
+    if not dot:
+        return f"{name}-{index + 1:03d}"
+    return os.path.join(folder, f"{stem}-{index + 1:03d}.{extension}")
+
+
 class FfmpegProcessor(VideoProcessor):
     """Video processor backed by PyAV (FFmpeg).
 
@@ -278,7 +329,11 @@ class FfmpegProcessor(VideoProcessor):
             self._input_container, self._output_container
         )
 
-    def process_frames(self, callback: FrameCallback) -> None:
+    def process_frames(
+        self,
+        callback: FrameCallback,
+        ranges_ms: list[tuple[float | None, float | None]] | None = None,
+    ) -> None:
         """Decode all frames, apply *callback*, encode to output.
 
         The input decoder is explicitly flushed after the demux loop: with
@@ -287,6 +342,18 @@ class FfmpegProcessor(VideoProcessor):
         loop's ``dts is None`` packets are container flush markers and are
         skipped, so without this the trailing frames would be lost
         (~11 frames on a 438-frame GoPro clip).
+
+        *ranges_ms* selects the parts of the clip to keep, in the shape
+        :func:`normalise_ranges` returns. Frames outside every range are
+        dropped and the survivors are written back-to-back, so the output has
+        no gap where a range was cut out — the same thing upstream's
+        ``ranges_ms`` does in ffmpeg_processor.rs (it seeks to each range's
+        start and rebases the output timestamps).
+
+        The callback still receives each kept frame's *original* timestamp
+        and *original* index. That is deliberate: the stabilization transform
+        for a frame has to come from where it sat in the source timeline, not
+        from its position in the trimmed output.
         """
         import av  # type: ignore[import-untyped]
 
@@ -305,7 +372,11 @@ class FfmpegProcessor(VideoProcessor):
                 if frame.pts is not None
                 else seq * (1000.0 / fallback_fps)
             )
-            return img, timestamp_ms
+            return img, timestamp_ms, seq
+
+        ranges = list(ranges_ms or [])
+        range_idx = 0
+        skipped = 0
 
         # Three-stage pipeline: decode thread -> stabilize (this thread) ->
         # encode thread. Both C stages release the GIL (PyAV / numpy /
@@ -395,8 +466,26 @@ class FfmpegProcessor(VideoProcessor):
                 if isinstance(item, Exception):
                     pipeline_error = item
                     break
-                img, timestamp_ms = item
-                processed = callback(img, timestamp_ms, self._frame_index)
+                img, timestamp_ms, input_index = item
+                if ranges:
+                    # Retire every range this frame is already past, then
+                    # decide against the one that is left.
+                    while range_idx < len(ranges):
+                        _, end = ranges[range_idx]
+                        if end is not None and timestamp_ms > end:
+                            range_idx += 1
+                            continue
+                        break
+                    if range_idx >= len(ranges):
+                        # Past the last range: nothing further can be kept,
+                        # so stop decoding the tail. `stop` in finally
+                        # unblocks the decode thread.
+                        break
+                    start, _ = ranges[range_idx]
+                    if start is not None and timestamp_ms < start:
+                        skipped += 1
+                        continue
+                processed = callback(img, timestamp_ms, input_index)
                 # Ensure uint8 for encoding.
                 if processed.dtype != np.uint8:
                     processed = np.clip(processed, 0, 255).astype(np.uint8)
@@ -432,14 +521,25 @@ class FfmpegProcessor(VideoProcessor):
             ) from fail[0]
 
         log.info("Processed %d frames", self._frame_index)
+        if skipped:
+            log.info(
+                "Trim: kept %d of %d decoded frame(s) across %d range(s)",
+                self._frame_index, self._frame_index + skipped, len(ranges),
+            )
 
-    def copy_audio(self) -> None:
+    def copy_audio(
+        self,
+        ranges_ms: list[tuple[float | None, float | None]] | None = None,
+    ) -> None:
         """Mux audio packets into the streams added by ``prepare_audio``.
 
         Call after ``process_frames`` and before ``close``: the video demux
         only consumes video-stream packets, so audio packets are still
         unread when this runs. Direct stream copy is used when the output
         container supports the input codec, with an AAC re-encode fallback.
+
+        *ranges_ms* must be the same trim used by :meth:`process_frames`, or
+        the audio would keep the parts the video dropped.
         """
         if self._input_container is None or self._output_container is None:
             raise VideoIOError("Both input and output must be opened first")
@@ -448,7 +548,12 @@ class FfmpegProcessor(VideoProcessor):
 
         from pygyroflow.rendering.audio_resampler import mux_audio
 
-        mux_audio(self._input_container, self._output_container, self._audio_pairs)
+        mux_audio(
+            self._input_container,
+            self._output_container,
+            self._audio_pairs,
+            ranges_ms=ranges_ms,
+        )
         self._audio_pairs = []
 
     def close(self) -> None:

@@ -79,10 +79,60 @@ def _prepare_aac_stream(
     return out_stream
 
 
+def _make_rebaser(ranges_ms):
+    """Build ``(keep, rebase)`` for a trimmed render, or ``(None, None)``.
+
+    The video pass drops whole ranges and writes the survivors back-to-back;
+    audio has to be cut the same way or it drifts further ahead of the video
+    with every range removed. A packet in range *k* is kept if it starts
+    inside it and is shifted back by however much was cut before it plus the
+    range's own offset from the start of the clip — so range *k*'s audio
+    lands exactly where range *k-1*'s ended.
+
+    Packets, not samples: a packet straddling a boundary is kept or dropped
+    whole. That is the resolution of the container's own framing (a few ms
+    for AAC), well under one video frame.
+    """
+    if not ranges_ms:
+        return None, None
+
+    starts = [0.0 if r[0] is None else float(r[0]) for r in ranges_ms]
+    ends = [None if r[1] is None else float(r[1]) for r in ranges_ms]
+    offsets = []
+    acc = 0.0
+    for k, start in enumerate(starts):
+        offsets.append(acc)
+        end = ends[k]
+        if end is not None:
+            acc += end - start
+
+    def locate(ts_ms):
+        """Index of the range holding *ts_ms*, or None."""
+        for k, start in enumerate(starts):
+            end = ends[k]
+            if ts_ms < start:
+                return None
+            if end is None or ts_ms <= end:
+                return k
+        return None
+
+    def keep(ts_ms):
+        return locate(ts_ms) is not None
+
+    def rebase(ts_ms):
+        k = locate(ts_ms)
+        if k is None:
+            return None
+        return ts_ms - starts[k] + offsets[k]
+
+    return keep, rebase
+
+
 def mux_audio(
     input_container: "av.container.InputContainer",
     output_container: "av.container.OutputContainer",
     pairs: list[tuple["av.audio.stream.AudioStream", "av.stream.Stream"]],
+    ranges_ms: list[tuple[float | None, float | None]] | None = None,
 ) -> None:
     """Mux audio packets through the prepared stream pairs.
 
@@ -90,7 +140,11 @@ def mux_audio(
     input template; pairs whose output stream is a bare AAC encoder are
     re-encoded. A stream that fails mid-copy is skipped with an error log
     (streams cannot be replaced after muxing has started).
+
+    *ranges_ms* mirrors the video trim: only audio inside the ranges is
+    written, and the kept spans are concatenated (see :func:`_make_rebaser`).
     """
+    keep, rebase = _make_rebaser(ranges_ms)
     for i, (in_stream, out_stream) in enumerate(pairs):
         from_template = out_stream.codec_context.name == in_stream.codec_context.name
         try:
@@ -102,11 +156,19 @@ def mux_audio(
                 for packet in input_container.demux(in_stream):
                     if packet.dts is None:
                         continue
+                    if keep is not None:
+                        ts_ms = _packet_ms(packet, in_stream)
+                        if ts_ms is None or not keep(ts_ms):
+                            continue
+                        _rebase_packet(packet, in_stream, rebase(ts_ms))
                     packet.stream = out_stream
                     output_container.mux(packet)
                 log.info("Audio stream %d copied (stream copy)", i)
             else:
-                reencode_audio(input_container, output_container, in_stream, out_stream, i)
+                reencode_audio(
+                    input_container, output_container, in_stream, out_stream, i,
+                    ranges_ms=ranges_ms,
+                )
         except Exception:
             log.error(
                 "Failed to mux audio stream %d, skipping (output will miss "
@@ -116,12 +178,33 @@ def mux_audio(
             )
 
 
+def _packet_ms(packet, stream) -> float | None:
+    """A packet's start time in milliseconds, or None if it has no pts."""
+    if packet.pts is None:
+        return None
+    time_base = packet.time_base or stream.time_base
+    if time_base is None:
+        return None
+    return float(packet.pts) * float(time_base) * 1000.0
+
+
+def _rebase_packet(packet, stream, ts_ms: float) -> None:
+    """Move a packet to *ts_ms*, in the stream's own time base."""
+    time_base = packet.time_base or stream.time_base
+    if time_base is None:
+        return
+    new_pts = int(round(ts_ms / (float(time_base) * 1000.0)))
+    packet.pts = new_pts
+    packet.dts = new_pts
+
+
 def reencode_audio(
     input_container: "av.container.InputContainer",
     output_container: "av.container.OutputContainer",
     audio_stream: "av.audio.stream.AudioStream",
     out_stream: "av.stream.Stream",
     index: int = 0,
+    ranges_ms: list[tuple[float | None, float | None]] | None = None,
 ) -> None:
     """Re-encode an audio stream through a prepared AAC output stream."""
     import av  # type: ignore[import-untyped]
@@ -132,11 +215,21 @@ def reencode_audio(
         rate=48000,
     )
 
+    keep, _ = _make_rebaser(ranges_ms)
     input_container.seek(0)
     for packet in input_container.demux(audio_stream):
         if packet.dts is None:
             continue
         for frame in packet.decode():
+            # Trim before the resampler: the encoder assigns output
+            # timestamps from arrival order, so dropping frames here is
+            # already a gapless concatenation.
+            if keep is not None:
+                if frame.pts is None:
+                    continue
+                ts_ms = float(frame.pts) * float(frame.time_base) * 1000.0
+                if not keep(ts_ms):
+                    continue
             for r_frame in resampler.resample(frame):
                 for out_pkt in out_stream.encode(r_frame):
                     output_container.mux(out_pkt)

@@ -1458,7 +1458,14 @@ class StabilizationManager:
     # Rendering
     # ------------------------------------------------------------------
 
-    def render(self, input_path: str, output_path: str, options: dict | None = None) -> None:
+    def render(
+        self,
+        input_path: str,
+        output_path: str,
+        options: dict | None = None,
+        *,
+        trim_ranges: list[tuple[float, float]] | None = None,
+    ) -> None:
         """Render stabilized video.
 
         Args:
@@ -1468,6 +1475,13 @@ class StabilizationManager:
                 - codec: "H.264/AVC", "H.265/HEVC", "ProRes" (default: "H.265/HEVC")
                 - bitrate: Bitrate in Mbps (0 = auto)
                 - audio: Copy audio streams to the output (default: True)
+                - export_trims_separately: write one file per trim range
+                  instead of concatenating them (default: False). Each range
+                  gets a "-NNN" suffix before the extension, as upstream
+                  does. Needs more than one range to do anything.
+                - pad_with_black / preserve_other_tracks: keep the whole clip
+                  and ignore trim ranges, matching upstream's gate on those
+                  two flags.
                 - use_gpu: Whether to use GPU acceleration (default: False).
                   The GPU (wgpu) undistort path is numerically verified:
                   identity bit-exact vs CPU bilinear (also under lavapipe).
@@ -1476,15 +1490,42 @@ class StabilizationManager:
                   (78 vs 505 ms at 1280x1120), end-to-end ~2.4x; a
                   lavapipe software Vulkan yields only ~2.2x. CPU remains
                   the default; opt in for speed.
+            trim_ranges: Override ``params.trim_ranges``. Internal — the
+                per-range export path uses it to render one range at a time.
         """
         options = options or {}
 
+        if options.get("export_trims_separately") and len(self.params.trim_ranges) > 1:
+            from pygyroflow.rendering.ffmpeg_processor import output_path_for_range
+
+            for index, rng in enumerate(self.params.trim_ranges):
+                self.render(
+                    input_path,
+                    output_path_for_range(output_path, index),
+                    {**options, "export_trims_separately": False},
+                    trim_ranges=[rng],
+                )
+            return
+
+        if trim_ranges is None:
+            # Upstream only feeds ranges_ms to the processor when neither
+            # pad_with_black nor preserve_other_tracks is set; with either
+            # one the output keeps the full length and the ranges only drive
+            # the keyframe/zoom window.
+            if options.get("pad_with_black") or options.get("preserve_other_tracks"):
+                trim_ranges = []
+            else:
+                trim_ranges = self.params.trim_ranges
+
         from pygyroflow.rendering import FfmpegProcessor
+        from pygyroflow.rendering.ffmpeg_processor import normalise_ranges
         from pygyroflow.stabilization import cpu_undistort
         from pygyroflow.stabilization.cpu_undistort import (
             CPU_TO_UPSTREAM_INTERPOLATION,
         )
         from pygyroflow.types.enums import Interpolation
+
+        ranges_ms = normalise_ranges(trim_ranges, self.params.duration_ms)
 
         codec = options.get("codec", "H.265/HEVC")
         bitrate = options.get("bitrate", 0)
@@ -1580,13 +1621,15 @@ class StabilizationManager:
 
             return cpu_undistort(frame_data, transform, interpolation=interp_index)
 
-        proc.process_frames(stabilize_frame)
+        proc.process_frames(stabilize_frame, ranges_ms=ranges_ms)
 
         # Copy audio packets through the streams prepared before the video
-        # pass. Previously the output was always silent.
+        # pass. Previously the output was always silent. The same ranges
+        # have to be applied or a trimmed render would carry the audio of
+        # the parts it dropped.
         if options.get("audio", True):
             try:
-                proc.copy_audio()
+                proc.copy_audio(ranges_ms=ranges_ms)
             except Exception:
                 log.warning("Audio copy failed; output will be silent", exc_info=True)
 
