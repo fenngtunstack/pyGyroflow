@@ -282,12 +282,12 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-03 | R | **底层缺像素格式类型**。上游 `pixel_formats.rs` 12 种（含 NV12/P010/AYUV16/RGBAf16/BGRA8 通道交换 + Rec709 full→limited 重映射）；我们 `pixel_formats.py:15-55` 只做 dtype 探测。这是 C-02 的根因 | [报告] |
 | C-04 | E | **trim ranges 渲染时不生效**。`params.trim_ranges` 只有平滑用；`manager.render` 与 `ffmpeg_processor` 完全忽略 → 永远整片渲染。上游 `mod.rs:194-200,278-280` 定位+时间戳重基+`pad_with_black`+`export_trims_separately` —— 已实现（`11294ef`） | [实测] |
 | C-05 | R | **帧率控制 / 变速缺失**。上游回调可设 `repeat_times`/`out_timestamp_us`（`mod.rs:460-479`）+ `fps_scale` VFR；我们的回调只读时间戳，`video_speed`/`fps_scale` 渲染时被忽略 | [报告] |
-| C-06 | E | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** —— 已实现（见下），CLI 接线未做 | [实测] |
+| C-06 | E | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** —— 读写层与 CLI 接线都已实现（`1077433`、`e7fb663`）；余下只有 `--export-project` 的 2/3 模式（需 `raw_imu`/`file_metadata` 编码器） | [实测] |
 | C-07 | E | **容器旋转元数据没读**（见 G-07）—— 已实现（`3aadd0d`） | [实测] |
 | C-08 | R | 无 GPU 解码/编码（上游 `ffmpeg_hw.rs` 412 行 + 各平台 interop）；无 GPU 解码重试阶梯、无像素格式回退 | [报告] |
 | C-09 | R | 渲染健壮性：上游写 `.tmp` 再改名、拷贝容器元数据/timecode、清残留 `%Nd` 文件、保持系统唤醒；我们直接写目标路径、无元数据 | [报告] |
 | C-10 | R | **`settings.py` 是死代码**。106 行类，**全仓库零引用**。CLI 默认值硬编码在 argparse。上游 settings.json 约 25 个键驱动导出/同步默认值 | [报告] |
-| C-11 | R | **CLI 表面积**。上游有 `--export_project`(4 模式)/`--export_metadata`(3)/`--export_stmap`(2)/`-p`/`-s`/`--preset`/`-t`/`-j`/`-d`/`--stdout_progress`/`--watch`/`--version`/`-f`——我们全无 | [报告] |
+| C-11 | E | **CLI 表面积**。上游有 `--export_project`(4 模式)/`--export_metadata`(3)/`--export_stmap`(2)/`-p`/`-s`/`--preset`/`-t`/`-j`/`-d`/`--stdout_progress`/`--watch`/`--version`/`-f`。已补：多类型位置输入分流、`--preset`/`--export-project 1`/`-p`/`-s`/`-t`/`-f`/`--version`（`e7fb663`）。未补：`-j`/`-d`/`--watch`/`--open`/`-b`/`-r`/`--no-gpu-decoding`/`--stdout_progress`/`--export_metadata`/`--export_stmap` | [报告] |
 | C-12 | R | **RenderQueue 是骨架**。上游 1740 行（并行渲染、暂停/取消、队列持久化、preset 批量、渲染前 autosync、缩略图、when_done）；我们 227 行顺序执行，export 类 job 只 `json.dump` options，stmap job 抛 `NotImplementedError` | [报告] |
 | C-13 | R | `compute_distort_map` 无畸变模型（见 G-06） | [实测] |
 | C-14 | R | **manager setter 面**：上游约 45 个 `set_*`，我们 10 个。功能性缺失：`frame_readout_direction`/`additional_rotation`/`additional_translation`/`zooming_method`/`max_zoom`/`video_speed`/`digital_lens`/背景全套/IMU 变换全套 | [报告] |
@@ -382,6 +382,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-01 PNG/EXR 图像序列输出 | `3aadd0d` | 30 帧序列进出帧数一致；EXR 用 `gbrpf32le` |
 | C-06 `.gyroflow` 工程读写 + base91/zlib/bincode/CBOR 编解码 | `1077433` | 两个官方工程 JSON 层往返「缺失键 [] / 变化键 {}」；base91/bincode 与仓库内独立解码器逐字节一致；CBOR 按规范和 nalgebra serde 推导后按位固化 |
 | C-04 渲染时裁剪区间 + 音频同步裁剪 + 逐区间导出 | `11294ef` | 8 组区间组合断言保留帧数与帧内容（帧身份写进画面象限）；输出 pts 相邻差值恒定（无空洞）；回调收到源时间线；带音轨素材裁后音频时长同步变短 |
+| C-11/C-06 余下：CLI 吃工程与 preset、`--preset`/`--export-project 1`/`-p`/`-s`/`-t`/`-f`/`--version`、`python -m pygyroflow` | `e7fb663` | subprocess 跑真 CLI：真工程（自带 base91 bincode 陀螺块）→ 读工程 → 从块里取得陀螺 → 出片帧数正确；`--export-project 1` 无运动载荷且 fov 随 preset 变化；缺 `-f` 时拒绝覆盖 |
 
 **实施中新发现的、原清单没有的缺陷**：
 
@@ -395,6 +396,11 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 - **两类 blob 的载荷编码不同**，此前 `util.py` 的注释写成笼统的"bincode/cbor"。按 `util.rs`：`gyro_source` 家族的 `quaternions`/`raw_imu`/`image_orientations`/`gravity_vectors` 走 `compress_to_base91`（bincode legacy），`WithProcessedData` 导出的 `integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps*`/`focal_lengths` 走 `compress_to_base91_cbor`（CBOR）。用错编码器不会报错，只会读出垃圾——`gravity_vectors` 每项 32 字节而非 40，`raw_imu` 的行长还是变长的（`Option<[f64;3]>` 带 1 字节 tag）。
 - `json.dump` 默认 `allow_nan=True` 会写出裸 `NaN`/`Infinity`，生成一个别的解析器（含 Gyroflow）读不了的文件；已改 `allow_nan=False`，让它在写的时候炸而不是交付一个坏文件。
 - `StabilizationParams` 是 numpy 支撑的，`params.fov` 是 `float32`，**`json.dump` 直接拒收**——任何一次真实保存都会 `TypeError`。已在 JSON 边界统一做 `_jsonable` 归一（numpy 标量取 `.item()`，数组转 list），对应上游 serde 把 f32 写成 f64。
+
+**做 C-06 接线（CLI）时又发现的两处，都是我自己那一版 `load_project` 的问题**：
+
+- `load_project` 把 `params.background` 写成了 tuple，而该字段是 `np.ndarray`（`_build_compute_params` 对它调 `.copy()`）。于是"读工程 → `recompute_blocking()`"必炸 `AttributeError: 'tuple' object has no attribute 'copy'`。之前的验证只走到 load 就停了，没往下跑管线，所以没暴露。
+- **工程自带的陀螺数据根本没被载入**。`load_project` 只套用了 IMU 变换，没解码 `quaternions`/`raw_imu`/`gravity_vectors`/`image_orientations` 并交给 gyro source。参考工程里这四个字段恰好全是 `null`（它们靠原片遥测），所以最初的手工验证看起来是对的——而 `WithGyroData` 工程存在的全部意义就是脱离原片。修的时候还要注意顺序：`load_from_telemetry` 内部会 `clear()`，把 IMU 变换清掉，所以变换必须在载入数据**之后**套用。
 
 **原清单中经复核被推翻的结论**：
 
