@@ -397,3 +397,34 @@ python -m pygyroflow ..\GX010045.MP4 -o out.mp4 --smoothness 0.5   # 真实视�
 - 只做序列**输入**；输出仍是视频（上游的 "EXR Sequence"/"PNG Sequence" 输出编码器未实现）
 - 短序列上 autosync 会复现既有弱点（60 帧锁到 -254ms，长片段才锁得准，见上文"已知限制"）——非本次引入
 
+
+## 2026-09-16 镜头标定模块修复 + CLI 接线（P4 清单第三项）
+
+**背景**: `pygyroflow/calibration/` 早就存在（606 行），但**没有任何调用方**——gui/ 与 cli/ 都不引用它，只有一条 smoke 测试构造了个对象。逐行对照上游 `src/core/calibration/mod.rs`（334 行）后发现三处实质问题。
+
+**上游做法**: 每 10 帧找一次棋盘 → 随机抽 10 帧解一次 → 重复 1000 次取 RMS 最小（`rayon` 并行）。质量门是 `cv::estimateChessboardSharpness` 的返回值（**过渡带宽度，像素；越小越锐**），阈值 5.0。标定用 `cv::fisheye::calibrate`（`CALIB_RECOMPUTE_EXTRINSIC|FIX_SKEW`，4 个系数）——由 `cv_to_vec4` 只读 4 个、以及传入的是 fisheye 专有 flag 反推确认；这与渲染端 `opencv_fisheye` 读的 θ 多项式系数一致。
+
+**修复的三处**:
+
+1. **锐度度量是自造的**（原实现把各角点邻域拼成一条 1×N 数组再取 Laplacian 方差 ÷1000），与上游阈值 5.0 完全不可比 —— `sharpness < max_sharpness` 这个门等于随机开关。改为调用 `cv2.estimateChessboardSharpness(gray, grid, corners, 0.8)`（OpenCV ≥4.7；本机 4.13 有），取上游同一个元素（均值），语义恢复为"过渡带像素宽，越小越锐"。函数缺失时**跳过门限并告警**，而不是拿一个没有量纲的数去比。
+2. **poly3/poly5/ptlens 的"系数转换"是编的**（`a=k1*0.5, b=k2*0.25, c=k3*0.125`，注释还写"follows Gyroflow"，上游根本没有这个转换）。三个模型是**未失真半径**的多项式，鱼眼是 **θ 的多项式**，两者没有代数换元。改为：在标定图像实际覆盖的半径范围内采样 → 用鱼眼曲线解出 `r_d/r_u - 1` → 对目标模型做最小二乘（三个模型对系数都是线性的，列序按渲染端 `k1[0..]` 的存储序排），并把**最大相对残差**写进 profile 的 `distortion_model_fit_error`。实测同一鱼眼曲线：poly3 1 参数残差 182%、poly5 2 参数 22%、ptlens 3 参数 8%——数字本身说明了自由度够不够，超 5% 会告警。
+3. **`opencv_standard` 直接搬运系数会渲染错误**。渲染端 12 参数顺序是 `k1,k2,p1,p2,k3,k6,k7,k8,s1..s4`（Gyroflow 自己的前向/反向拆分），OpenCV 有理模型返回的是 `k1,k2,p1,p2,k3,k4,k5,k6`——**从第 5 个系数起含义就不一样**。原实现 `calibrateCamera(flags=0)` 返回 5 个再零填充，同样对不上。改为**显式拒绝**并在异常信息里说明原因；能对上号的只有鱼眼，以及上面按残差拟合的三个模型。`digital_lens` 也拒绝（上游会把角点先过一遍数码镜头再求解，这步没实现，否则标定出的几何是错的）。
+
+**顺带**:
+- **1000 次迭代并行化**：抽样先串行生成（保持随机性可复现），求解交给 `ThreadPoolExecutor`——`fisheye::calibrate` 内部释放 GIL，所以是真的并行（对应上游用 `rayon`）。8 核实测 19 帧 ×1000 次迭代 **5m22s → 68s**，结果逐位相同。
+- **CLI 接线**：`--calibrate`（配 `--cols/--rows/--square-size/--calib-model/--calib-every`，复用 `--fps/--gyro` 之外的输入通路），输入可以是视频、图像序列或单张静图，输出 `--lens` 能直接加载的 profile JSON。
+
+**验证**（412 passed, 5 skipped；新增 `tests/test_calibration.py` 39 项）:
+- 合成基准（最有力的一条）：把棋盘按**已知**鱼眼模型渲染出来（角点用 `cv2.fisheye.projectPoints` 投影、方格填充），交给真实检测器找角点，再标定 → **在未参与标定的位姿上**比对重投影：最大 **0.60 px**、RMS 0.45 px、fx 299.10（真值 300）。
+- 用系数向量本身比对是**错误**的判据：鱼眼 θ 多项式在有限采样下不唯一。实测窄视场协议（棋盘只在画面中心）RMS 0.467 px 与宽视场 0.453 px **几乎相同**，但重投影误差 4.37 px vs 0.60 px，差 7.3 倍——RMS 看不见这个问题。这条差异固化成 `test_narrow_field_of_view_leaves_the_curve_wrong`，也是"棋盘要走到画面角落"这句建议的实测依据。
+- 锐度门限：模糊帧仍被检出但被拒（`num_detected=1` vs `num_candidates=0`）；渲染棋盘 sharpness ≈1.1–1.6，模糊后升到 6+，与"越小越锐"一致。
+- 拒绝路径、CLI 退出码与默认输出命名（`<stem>_lens_profile.json`）、profile 能被 `LensProfile.from_json` 回读。
+- **真实视频端到端**：编码后的棋盘视频跑 CLI → fx 299.72（真值 300）、cx 319.98、RMS 0.445 px。
+
+**已知限制**:
+- 只支持 4 个模型（鱼眼 + 三个拟合模型）；`opencv_standard` 与 `digital_lens` 明确拒绝。
+- poly3/poly5/ptlens 的转换只在**标定图像覆盖的半径内**有意义，超出即外推；残差写进 profile 里但不阻断。
+- `feed_frame` 默认 `flags=0`（不要求白标记），上游默认要求 `CALIB_CB_MARKER`——对任意打印棋盘更宽容，带标记的板子也照样检出。
+- 相机原厂完整流程里的 `forced_frames`（手动指定帧）、进度回调、`pt_scale`/多分辨率重采样未移植（GUI 特性）。
+
+

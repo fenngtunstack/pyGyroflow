@@ -10,7 +10,8 @@ pyGyroFlow 是 Gyroflow（Rust）核心防抖算法的 **Python 完整移植**�
 - **数值一致性**：5 个 IMU 积分器与 Rust 移植版（`msgyro-imu-integration`）数值一致（max_err < 1e-14）；**VQF 暂无 Rust 对照**。golden 基准来自 Rust 移植版，**未与上游 Gyroflow 逐帧/逐像素验证**。
 - **GPU 路径**：wgpu undistort 的 uint8/RGB 路径**已修复并验证**（cf41506）——identity 与非零鱼眼系数下与 CPU bilinear **逐位一致**（`test_gpu_undistort.py`，2026-09-15 复测 max diff=0）。默认仍 CPU（`use_gpu=False`），`--gpu` opt-in。加速比依赖 Vulkan 实现：本机 lavapipe 软件渲染实测 ~2.2x（1280x1120，465→207 ms/帧），代码注释中 ~6.5x 为真硬件（Intel UHD 630）数字，lavapipe 环境复现不了。
 - **STMap**：此前"导入损坏"的记录已过时——模块当前可导入、`STMapExporter` 可构造、smoke 测试全部通过（原 xfail 已消除）。功能级（实际导出 stmap 文件）验证仍薄。
-- **测试覆盖**：核心算法模块有测试；`synchronization`/`telemetry`/`calibration`/`cli`/`gui` 已加 smoke 测试，但功能测试仍薄。
+- **测试覆盖**：核心算法模块有测试；`synchronization`/`telemetry`/`cli`/`gui` 已加 smoke 测试，但功能测试仍薄。
+- **镜头标定（calibration）**：`LensCalibrator` 有合成基准的功能测试（`tests/test_calibration.py`：渲染已知鱼眼畸变的棋盘→检测→标定→在未参与标定的位姿上比对重投影，实测最大 0.60 px）。**只支持 `opencv_fisheye`/`poly3`/`poly5`/`ptlens` 四种模型**——`opencv_standard` 被显式拒绝，因为渲染端的 12 参数布局是 Gyroflow 自己的前向/反向拆分，与 OpenCV 有理模型的系数顺序从第 5 个起就不一致，直接传会渲染错误。`digital_lens` 也被拒绝（上游会先把角点过一遍数码镜头再求解，这步没实现）。poly3/poly5/ptlens 的系数由鱼眼曲线最小二乘拟合而来，残差写在 profile 的 `distortion_model_fit_error` 里（poly3 在宽视场上可达 180%，profile 仍会写但会告警）。
 
 ## ⚠️ 工作区 inode 损坏（重要）
 

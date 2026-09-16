@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from argparse import BooleanOptionalAction
 
 log = logging.getLogger(__name__)
@@ -114,6 +115,36 @@ def main() -> None:
              "Gyroflow; EWA variants fall back to Lanczos4)",
     )
     parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Calibrate a lens from chessboard footage instead of stabilizing: "
+             "detect the board across the input (video or image sequence) and "
+             "write a lens profile JSON that --lens can load",
+    )
+    parser.add_argument(
+        "--cols", type=int, default=14,
+        help="Chessboard inner corners per row (default 14)",
+    )
+    parser.add_argument(
+        "--rows", type=int, default=8,
+        help="Chessboard inner corners per column (default 8)",
+    )
+    parser.add_argument(
+        "--square-size", type=float, default=1.0,
+        help="Chessboard square size in any unit (default 1.0; only the ratio matters)",
+    )
+    parser.add_argument(
+        "--calib-model", default="opencv_fisheye",
+        choices=["opencv_fisheye", "poly3", "poly5", "ptlens"],
+        help="Distortion model for the calibrated profile (default opencv_fisheye, "
+             "which is what upstream's calibrator produces)",
+    )
+    parser.add_argument(
+        "--calib-every", type=int, default=10,
+        help="Run detection on every N-th frame (default 10; detection is the "
+             "expensive part and neighbouring frames are near-duplicates)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -135,6 +166,9 @@ def main() -> None:
         looks_like_image_sequence,
         sequence_output_stem,
     )
+
+    if args.calibrate:
+        sys.exit(_run_calibration(args))
 
     for path in args.input:
         log.info("Processing: %s", path)
@@ -240,6 +274,100 @@ def main() -> None:
                 import traceback
                 traceback.print_exc()
             sys.exit(1)
+
+
+def _run_calibration(args) -> int:
+    """Chessboard-calibrate a lens and write a lens profile JSON.
+
+    Returns a process exit code.  Shares the input handling with the normal
+    path, so a video, an image sequence or a single still all work.
+    """
+    import json
+    import os
+
+    from pygyroflow.calibration import LensCalibrator
+    from pygyroflow.calibration.calibrator import SUPPORTED_MODELS, iter_gray_frames
+    from pygyroflow.rendering.image_sequence import (
+        FFMPEG_DEFAULT_FPS,
+        looks_like_image_sequence,
+        sequence_output_stem,
+    )
+
+    if len(args.input) != 1:
+        log.error("Calibration takes exactly one input, got %d", len(args.input))
+        return 2
+    path = args.input[0]
+
+    if args.calib_model not in SUPPORTED_MODELS:
+        log.error("Unsupported --calib-model '%s' (choose from %s)",
+                  args.calib_model, ", ".join(SUPPORTED_MODELS))
+        return 2
+
+    if looks_like_image_sequence(path) and not args.fps:
+        log.warning(
+            "Image sequence input without --fps: assuming FFmpeg's default %.0f fps",
+            FFMPEG_DEFAULT_FPS,
+        )
+
+    calibrator = LensCalibrator(
+        columns=args.cols,
+        rows=args.rows,
+        square_size=args.square_size,
+        distortion_model=args.calib_model,
+    )
+
+    log.info("Scanning %s for a %dx%d chessboard (every %d frames)",
+             path, args.cols, args.rows, args.calib_every)
+    try:
+        frames = iter_gray_frames(path, fps=args.fps, every_n=args.calib_every)
+        calibrator.feed_frames(frames, every_n=1)
+    except FileNotFoundError:
+        log.error("No such file, and not an image sequence: %s", path)
+        return 1
+    except Exception as exc:
+        log.error("Failed to read frames from %s: %s", path, exc)
+        return 1
+
+    log.info("Chessboard detected in %d frame(s), %d accepted for calibration",
+             calibrator.num_detected, calibrator.num_candidates)
+    if calibrator.num_candidates < 2:
+        log.error(
+            "Not enough usable frames (%d). Move the board around the frame — "
+            "calibrating only from the centre leaves the wider distortion "
+            "coefficients undetermined.", calibrator.num_candidates,
+        )
+        return 1
+
+    try:
+        result = calibrator.calibrate()
+    except ValueError as exc:
+        log.error("Calibration refused: %s", exc)
+        return 1
+    except RuntimeError as exc:
+        log.error("Calibration failed: %s", exc)
+        return 1
+
+    profile = calibrator.to_lens_profile_dict()
+    profile["name"] = f"{os.path.basename(os.path.abspath(path))} calibration"
+    profile["date"] = time.strftime("%Y-%m-%d")
+
+    output = args.output or (sequence_output_stem(path) + "_lens_profile.json")
+    with open(output, "w", encoding="utf-8") as handle:
+        json.dump(profile, handle, indent=2)
+
+    K = result.camera_matrix
+    log.info(
+        "Calibrated from %d frame(s): fx=%.2f fy=%.2f cx=%.2f cy=%.2f, RMS=%.3f px",
+        len(result.used_frames), K[0, 0], K[1, 1], K[0, 2], K[1, 2], result.rms,
+    )
+    if result.model_fit_error is not None:
+        log.warning(
+            "Model '%s' reproduces the calibrated fisheye curve to %.2f%% over the "
+            "image radius — check the frame edges before trusting it",
+            args.calib_model, result.model_fit_error * 100.0,
+        )
+    log.info("Wrote lens profile: %s", output)
+    return 0
 
 
 if __name__ == "__main__":

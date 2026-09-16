@@ -2,34 +2,133 @@
 
 Uses OpenCV chessboard detection to compute camera intrinsics and distortion
 coefficients from a set of calibration frames.  Ported from Gyroflow's
-core/calibration/mod.rs RANSAC-style calibration logic.
+core/calibration/mod.rs.
 
 Workflow:
   1. feed_frame() -- detect chessboard corners in each video frame
   2. calibrate()  -- random-sampling calibration, keep lowest RMS result
   3. get_result()  -- retrieve camera matrix, distortion coefficients, RMS
+
+Upstream's calibrator emits **fisheye** coefficients only (`cv::fisheye::
+calibrate` -- the four k's of ``theta_d = theta*(1 + k0*t^2 + k1*t^4 + ...)``,
+the same ones Gyroflow's ``opencv_fisheye`` render model reads back).  The
+other models are offered here as conversions from that fisheye fit, and the
+conversion residual is reported so the substitution can be judged.
+
+Calibration quality is dominated by how much of the field of view the board
+visits: with the board kept near the image centre the higher-order fisheye
+coefficients are effectively unidentifiable (many k-vectors describe the same
+central curve), and only the curve inside the covered radius is meaningful.
+Move the board into the corners of the frame.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import random
+from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Sequence
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Supported distortion model identifiers.
+# Supported distortion model identifiers.  ``opencv_standard`` is deliberately
+# absent: the renderer's 12-parameter layout is Gyroflow's own forward/inverse
+# split (k1,k2,p1,p2,k3,k6,k7,k8,s1..s4), and OpenCV's rational model produces
+# (k1,k2,p1,p2,k3,k4,k5,k6) — positions 4..7 mean different things, so handing
+# one to the other yields a profile that renders wrong.  Refusing is the safe
+# behaviour; converting between the two parametrisations is a separate job.
 SUPPORTED_MODELS = (
     "opencv_fisheye",
-    "opencv_standard",
     "poly3",
     "poly5",
     "ptlens",
 )
+
+_REFUSED_MODELS = {
+    "opencv_standard": (
+        "the renderer's opencv_standard layout (k1,k2,p1,p2,k3,k6,k7,k8,s1..s4) is "
+        "Gyroflow's forward/inverse split, while OpenCV's rational model returns "
+        "(k1,k2,p1,p2,k3,k4,k5,k6) — the two disagree from the fifth coefficient on, "
+        "so the coefficients cannot be passed through unchanged"
+    ),
+}
+
+# Upstream's chessboard sharpness acceptance threshold, in the units of
+# cv::estimateChessboardSharpness (transition width in pixels — smaller is
+# sharper).  A well-focused board measures well under 3.0.
+DEFAULT_MAX_SHARPNESS = 5.0
+
+# Forward distortion models we can fit to the fisheye curve, keyed by the
+# number of coefficients the resampling model expects.
+_FIT_MODELS = {"poly3": 1, "poly5": 2, "ptlens": 3}
+
+
+def iter_gray_frames(path: str, fps: float | None = None, every_n: int = 1) -> Iterator[np.ndarray]:
+    """Yield grayscale frames from a video or an image sequence.
+
+    Calibration only needs the frames, so this skips telemetry and takes the
+    sequence-aware path (see :mod:`pygyroflow.rendering.image_sequence`) when
+    the input is a directory, a printf pattern, or a single still.
+
+    Parameters
+    ----------
+    path:
+        Video file, or an image sequence.
+    fps:
+        Frame rate for image sequence input; ignored for video.
+    every_n:
+        Yield only every N-th frame.  Detection is the expensive part and
+        neighbouring frames are near-duplicates, so upstream looks at every
+        10th frame.
+
+    Raises
+    ------
+    FileNotFoundError: *path* is neither an existing file nor a sequence.
+    """
+    import av
+
+    from pygyroflow.rendering.image_sequence import (
+        format_options,
+        looks_like_image_sequence,
+        resolve_image_sequence,
+    )
+
+    if not os.path.isfile(path) and not looks_like_image_sequence(path):
+        raise FileNotFoundError(path)
+
+    sequence = resolve_image_sequence(path) if looks_like_image_sequence(path) else None
+    if sequence is not None:
+        container = av.open(
+            sequence.pattern,
+            format="image2" if sequence.is_sequence else None,
+            options=format_options(sequence, fps),
+        )
+    else:
+        container = av.open(path)
+
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        index = 0
+        for packet in container.demux(stream):
+            if packet.dts is None:
+                continue
+            for frame in packet.decode():
+                if index % every_n == 0:
+                    yield frame.to_ndarray(format="gray")
+                index += 1
+        # Flush the threaded decoder (trailing frames).
+        for frame in stream.decode():
+            if index % every_n == 0:
+                yield frame.to_ndarray(format="gray")
+            index += 1
+    finally:
+        container.close()
 
 
 @dataclass
@@ -39,7 +138,7 @@ class DetectedCorners:
     points: list[tuple[float, float]]
     frame_number: int
     timestamp_us: int
-    sharpness: float
+    sharpness: float | None
     is_forced: bool = False
 
 
@@ -52,6 +151,10 @@ class CalibrationResult:
     rms: float
     used_frames: list[int]
     image_size: tuple[int, int]  # (width, height)
+    # Max relative error of the fitted distortion model against the fisheye
+    # curve it was converted from.  None when no conversion happened (the
+    # fisheye fit *is* the result).
+    model_fit_error: float | None = None
 
 
 class LensCalibrator:
@@ -68,7 +171,10 @@ class LensCalibrator:
     iterations:
         Number of RANSAC iterations (more = better chance of good result).
     max_sharpness:
-        Sharpness threshold for frame quality filtering.
+        Sharpness threshold for frame quality filtering, in transition-width
+        pixels (``cv::estimateChessboardSharpness`` semantics — *lower* is
+        sharper, so a frame is accepted when its value is **below** this).
+        Upstream's default is 5.0; a focused board measures well under 3.0.
     distortion_model:
         One of ``SUPPORTED_MODELS``.  Determines the OpenCV calibration
         function and the number of output coefficients.
@@ -87,7 +193,7 @@ class LensCalibrator:
         square_size: float = 1.0,
         max_images: int = 10,
         iterations: int = 1000,
-        max_sharpness: float = 5.0,
+        max_sharpness: float = DEFAULT_MAX_SHARPNESS,
         distortion_model: str = "opencv_fisheye",
         digital_lens: str | None = None,
         digital_lens_params: list[float] | None = None,
@@ -95,6 +201,10 @@ class LensCalibrator:
     ) -> None:
         if columns < 2 or rows < 2:
             raise ValueError("Need at least 2x2 inner corners")
+        if distortion_model in _REFUSED_MODELS:
+            raise ValueError(
+                f"Unsupported model '{distortion_model}': {_REFUSED_MODELS[distortion_model]}"
+            )
         if distortion_model not in SUPPORTED_MODELS:
             raise ValueError(
                 f"Unsupported model '{distortion_model}', "
@@ -125,6 +235,7 @@ class LensCalibrator:
 
         # Last calibration result.
         self._result: CalibrationResult | None = None
+        self._warned_no_sharpness = False
 
     # ------------------------------------------------------------------
     # Object-point grid
@@ -191,6 +302,10 @@ class LensCalibrator:
             gray = self._enhance_image(gray)
 
         grid = (self.columns, self.rows)
+        # flags=0 accepts boards without the white orientation marker.
+        # Upstream defaults to CALIB_CB_MARKER (marker required) with a
+        # "no marker" toggle; being permissive by default suits arbitrary
+        # printed boards, and a marker-bearing board still detects.
         found, corners = cv2.findChessboardCornersSB(gray, grid, flags=0)
 
         if not found or corners is None or len(corners) == 0:
@@ -207,7 +322,9 @@ class LensCalibrator:
         )
         corners = corners_f32.reshape(-1, 2).astype(np.float64)
 
-        # Sharpness estimate: mean Laplacian variance in the ROI around corners.
+        # Sharpness: OpenCV's own chessboard sharpness, the same function
+        # upstream calls.  The value is a transition width in pixels, so it is
+        # not comparable with any home-grown focus metric.
         sharpness = self._estimate_sharpness(gray, corners)
 
         detected = DetectedCorners(
@@ -215,13 +332,16 @@ class LensCalibrator:
             frame_number=frame_number,
             timestamp_us=timestamp_us,
             sharpness=sharpness,
+            is_forced=False,
         )
 
         # Cache.
         self._all_matches[frame_number] = detected
 
-        # Accept if sharpness below threshold.
-        if sharpness < self.max_sharpness:
+        # Accept if sharpness is below the threshold (lower = sharper).
+        # When the metric is unavailable, accept rather than apply a
+        # meaningless comparison.
+        if sharpness is None or sharpness < self.max_sharpness:
             self._image_points[frame_number] = detected
 
         return detected
@@ -297,7 +417,20 @@ class LensCalibrator:
         ------
         RuntimeError
             If not enough frames have been detected (< 2).
+        ValueError
+            If ``digital_lens`` is set — upstream undistorts the detected
+            corners through the digital lens before calibrating, and that
+            step is not implemented here, so the calibration would silently
+            describe the wrong geometry.
         """
+        if self.digital_lens:
+            raise ValueError(
+                "digital_lens calibration is not supported: upstream undistorts the "
+                "detected corners through the digital lens model before solving, and "
+                "that step is missing here. Calibrate without digital_lens, or use "
+                "upstream Gyroflow."
+            )
+
         if only_used and self._result is not None:
             # Restrict to previously used frames.
             candidate_frames = set(self._result.used_frames)
@@ -316,49 +449,48 @@ class LensCalibrator:
             n_iter = 1
 
         image_size = (self._width, self._height)
-        objp = self._obj_points
-
-        best_rms = float("inf")
-        best_K: np.ndarray | None = None
-        best_D: np.ndarray | None = None
-        best_frames: list[int] = []
-
         calib_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-6)
 
-        for _ in range(n_iter):
-            chosen = self._pick_frames(candidate_frames)
+        # Draw every subset up front: the sampling is the only random part, so
+        # doing it sequentially keeps the run reproducible while the solves go
+        # wide.  OpenCV releases the GIL inside fisheye::calibrate, so threads
+        # really do overlap here — upstream gets the same effect from rayon.
+        subsets = [self._pick_frames(candidate_frames) for _ in range(n_iter)]
 
-            # Build object/image point arrays.
-            # OpenCV expects obj_points as (N,1,3) and img_points as (N,1,2).
-            objp_prepped = objp.reshape(-1, 1, 3).astype(np.float32)
+        def solve(chosen: list[int]) -> tuple[float, np.ndarray, np.ndarray, float | None, list[int]] | None:
             obj_points_list: list[np.ndarray] = []
             img_points_list: list[np.ndarray] = []
+            objp_prepped = self._obj_points.reshape(-1, 1, 3).astype(np.float32)
             for f in chosen:
                 det = self._image_points.get(f)
                 if det is None:
                     continue
-                pts = np.array(det.points, dtype=np.float32).reshape(-1, 1, 2)
                 obj_points_list.append(objp_prepped)
-                img_points_list.append(pts)
+                img_points_list.append(np.array(det.points, dtype=np.float32).reshape(-1, 1, 2))
 
             if len(obj_points_list) < 2:
-                continue
-
+                return None
             try:
-                rms, K, D = self._run_cv_calibration(
+                rms, K, D, fit_error = self._run_cv_calibration(
                     obj_points_list, img_points_list, image_size, calib_criteria
                 )
-                if rms < best_rms:
-                    best_rms = rms
-                    best_K = K.copy()
-                    best_D = D.copy()
-                    best_frames = list(chosen)
             except cv2.error as exc:
                 logger.warning("Calibration iteration failed: %s", exc)
-                continue
+                return None
+            return rms, K, np.asarray(D, dtype=np.float64), fit_error, list(chosen)
 
-        if best_K is None:
+        if n_iter > 1 and len(subsets) > 4:
+            workers = min(os.cpu_count() or 1, len(subsets))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                solved = list(pool.map(solve, subsets))
+        else:
+            solved = [solve(chosen) for chosen in subsets]
+
+        best = min((s for s in solved if s is not None), key=lambda s: s[0], default=None)
+        if best is None:
             raise RuntimeError("All calibration iterations failed")
+
+        best_rms, best_K, best_D, best_fit_error, best_frames = best
 
         self._result = CalibrationResult(
             camera_matrix=best_K,
@@ -366,6 +498,7 @@ class LensCalibrator:
             rms=best_rms,
             used_frames=best_frames,
             image_size=image_size,
+            model_fit_error=best_fit_error,
         )
         return self._result
 
@@ -427,6 +560,11 @@ class LensCalibrator:
         ``fisheye_params.camera_matrix`` (3x3 list),
         ``fisheye_params.distortion_coeffs`` (list),
         ``distortion_model``, etc.
+
+        ``distortion_model_fit_error`` is added when the coefficients came
+        from a conversion (poly3/poly5/ptlens): it is the largest relative
+        difference between the substituted model's undistortion scale and the
+        calibrated fisheye curve over the covered image radius.
         """
         if self._result is None:
             return {}
@@ -434,7 +572,7 @@ class LensCalibrator:
         K = self._result.camera_matrix
         D = self._result.dist_coeffs
 
-        return {
+        profile = {
             "calib_dimension": {
                 "w": self._width,
                 "h": self._height,
@@ -442,7 +580,7 @@ class LensCalibrator:
             "distortion_model": self.distortion_model,
             "fisheye_params": {
                 "camera_matrix": K.tolist(),
-                "distortion_coeffs": D.flatten().tolist(),
+                "distortion_coeffs": np.asarray(D).flatten().tolist(),
                 "RMS_error": self._result.rms,
             },
             "digital_lens": self.digital_lens,
@@ -450,6 +588,9 @@ class LensCalibrator:
             "asymmetrical": self.asymmetrical,
             "num_images": len(self._result.used_frames),
         }
+        if self._result.model_fit_error is not None:
+            profile["distortion_model_fit_error"] = self._result.model_fit_error
+        return profile
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -465,27 +606,34 @@ class LensCalibrator:
         enhanced = cv2.equalizeHist(enhanced)
         return enhanced
 
-    @staticmethod
-    def _estimate_sharpness(gray: np.ndarray, corners: np.ndarray) -> float:
-        """Estimate image sharpness around detected corners via Laplacian variance."""
-        h, w = gray.shape[:2]
-        margin = 20
-        # Collect patch around each corner.
-        patches = []
-        half = 15
-        for pt in corners:
-            x, y = int(round(pt[0])), int(round(pt[1]))
-            x0 = max(0, x - half)
-            x1 = min(w, x + half)
-            y0 = max(0, y - half)
-            y1 = min(h, y + half)
-            if x1 > x0 and y1 > y0:
-                patches.append(gray[y0:y1, x0:x1])
-        if not patches:
-            return 100.0
-        combined = np.concatenate([p.ravel() for p in patches])
-        laplacian_var = cv2.Laplacian(combined.reshape(1, -1).astype(np.float32), cv2.CV_32F)
-        return float(np.var(laplacian_var)) / 1000.0
+    def _estimate_sharpness(self, gray: np.ndarray, corners: np.ndarray) -> float | None:
+        """Chessboard sharpness via ``cv::estimateChessboardSharpness``.
+
+        Returns the average transition width in pixels (upstream's element 0):
+        *lower is sharper*.  A well-focused board lands well under 3.0 and a
+        visibly blurred one climbs past 6.
+
+        Returns ``None`` when the OpenCV build lacks the function (it appeared
+        in OpenCV 4.7) — the caller then skips the sharpness gate instead of
+        comparing against a number that has no meaning.
+        """
+        if not hasattr(cv2, "estimateChessboardSharpness"):
+            if not self._warned_no_sharpness:
+                self._warned_no_sharpness = True
+                logger.warning(
+                    "cv2.estimateChessboardSharpness unavailable (needs OpenCV >= 4.7) — "
+                    "accepting every detected frame"
+                )
+            return None
+        try:
+            # rise_distance 0.8 (10%..90% of the edge step) is upstream's value.
+            scalar, _per_view = cv2.estimateChessboardSharpness(
+                gray, (self.columns, self.rows), corners, 0.8
+            )
+        except cv2.error as exc:
+            logger.debug("Sharpness estimation failed: %s", exc)
+            return None
+        return float(np.asarray(scalar).ravel()[0])
 
     def _pick_frames(self, candidates: set[int]) -> list[int]:
         """Select a random subset of candidate frames for one calibration iteration.
@@ -528,14 +676,16 @@ class LensCalibrator:
         img_points: list[np.ndarray],
         image_size: tuple[int, int],
         criteria: tuple,
-    ) -> tuple[float, np.ndarray, np.ndarray]:
+    ) -> tuple[float, np.ndarray, np.ndarray, float | None]:
         """Dispatch to the correct OpenCV calibration function based on model.
 
-        Returns (rms, K, D).
+        Returns (rms, K, D, model_fit_error).
         """
 
         if self.distortion_model == "opencv_fisheye":
-            # Fisheye: 4 coefficients (k1-k4).
+            # Upstream's path: cv::fisheye::calibrate with FIX_SKEW |
+            # RECOMPUTE_EXTRINSIC, four coefficients (k0-k3 of the
+            # theta-polynomial that Gyroflow's opencv_fisheye model reads).
             K = np.zeros((3, 3), dtype=np.float64)
             D = np.zeros((4, 1), dtype=np.float64)
             flags = (
@@ -546,18 +696,10 @@ class LensCalibrator:
                 obj_points, img_points, image_size, K, D,
                 flags=flags, criteria=criteria,
             )
-            return float(rms), K, D
+            return float(rms), K, D, None
 
-        if self.distortion_model == "opencv_standard":
-            # Standard: up to 14 coefficients (k1-k6, p1-p2 + rational).
-            rms, K, D, _, _ = cv2.calibrateCamera(
-                obj_points, img_points, image_size, None, None,
-                criteria=criteria,
-            )
-            return float(rms), K, D
-
-        # For poly3 / poly5 / ptlens, calibrate with OpenCV fisheye first,
-        # then convert coefficients to the target model.
+        # poly3 / poly5 / ptlens: fit the fisheye curve, then convert it into
+        # the target model by least squares (see _convert_fisheye_coeffs).
         K = np.zeros((3, 3), dtype=np.float64)
         D = np.zeros((4, 1), dtype=np.float64)
         flags = (
@@ -569,38 +711,103 @@ class LensCalibrator:
             flags=flags, criteria=criteria,
         )
 
-        return float(rms), K, self._convert_fisheye_coeffs(D, K, image_size)
+        coeffs, fit_error = self._convert_fisheye_coeffs(D, K, image_size)
+        return float(rms), K, coeffs, fit_error
 
     def _convert_fisheye_coeffs(
         self,
         fisheye_D: np.ndarray,
         K: np.ndarray,
         image_size: tuple[int, int],
-    ) -> np.ndarray:
-        """Convert fisheye (k1-k4) coefficients to the target model format.
+    ) -> tuple[np.ndarray, float]:
+        """Fit the target model to the calibrated fisheye curve.
 
-        For poly3 / poly5 / ptlens, we fit a simple polynomial to the
-        fisheye distortion curve.  This follows the approach used by
-        Gyroflow's coefficient conversion.
+        The fisheye model is a theta-polynomial — ``r_d = t*(1 + k0*t^2 + ...)``
+        with ``r_u = tan(t)`` — while poly3/poly5/ptlens are radial polynomials
+        in the undistorted radius.  There is no algebraic reparametrisation
+        between them, so the target coefficients come from a least-squares fit
+        of the fisheye curve over the radius range the calibration images
+        actually cover.
+
+        Only that covered range is meaningful: outside it the fisheye fit is an
+        extrapolation and so is any conversion.  Returns ``(coeffs,
+        max_relative_error)`` where the error is measured on the undistortion
+        scale ``r_u/r_d`` — the quantity the resampler applies — so it says how
+        much the substituted model bends the image differently.
         """
-        k1, k2, k3, k4 = fisheye_D.ravel()[:4]
+        k = np.asarray(fisheye_D, dtype=np.float64).ravel()[:4]
+        n_coeffs = _FIT_MODELS[self.distortion_model]
 
+        r_max = self._max_normalized_radius(K, image_size)
+        theta = self._theta_for_radius(r_max, k)
+        thetas = np.linspace(1e-6, theta, 512)
+
+        t2 = thetas * thetas
+        r_d = thetas * (1.0 + k[0] * t2 + k[1] * t2**2 + k[2] * t2**3 + k[3] * t2**4)
+        r_u = np.tan(thetas)
+        if not np.all(np.isfinite(r_d)) or not np.all(np.isfinite(r_u)):
+            raise RuntimeError("Fisheye curve is not finite over the image radius")
+
+        # All three target models are linear in their coefficients once the
+        # ratio r_d/r_u - 1 is taken apart.  Columns are ordered so lstsq
+        # returns the coefficients in the order the renderer stores them.
         if self.distortion_model == "poly3":
-            # Poly3: single coefficient k.
-            # Approximate via least-squares fit of r_d = k * r_u^3 + r_u.
-            # Take k1 as the dominant term.
-            return np.array([[k1]], dtype=np.float64)
+            # r_d = r_u * (1 + k1*r_u^2)
+            design = np.stack([r_u**2], axis=-1)
+        elif self.distortion_model == "poly5":
+            # r_d = r_u * (1 + k1*r_u^2 + k2*r_u^4)
+            design = np.stack([r_u**2, r_u**4], axis=-1)
+        elif self.distortion_model == "ptlens":
+            # r_d = r_u * (1 + c*r_u + b*r_u^2 + a*r_u^3), stored as (a, b, c)
+            design = np.stack([r_u**3, r_u**2, r_u], axis=-1)
+        else:  # pragma: no cover - guarded by SUPPORTED_MODELS
+            raise ValueError(f"No fit for model '{self.distortion_model}'")
 
-        if self.distortion_model == "poly5":
-            # Poly5: two coefficients (k1, k2).
-            return np.array([[k1], [k2]], dtype=np.float64)
+        target = r_d / r_u - 1.0
+        coeffs, *_ = np.linalg.lstsq(design, target, rcond=None)
+        coeffs = coeffs[:n_coeffs]
 
-        if self.distortion_model == "ptlens":
-            # PTLens: three coefficients (a, b, c).
-            # Map fisheye k1..k4 to PTLens a, b, c via polynomial fit.
-            a = k1 * 0.5
-            b = k2 * 0.25
-            c = k3 * 0.125
-            return np.array([[a], [b], [c]], dtype=np.float64)
+        fitted_d = r_u * (1.0 + design @ coeffs)
+        truth_scale = np.where(r_d > 1e-12, r_u / r_d, 1.0)
+        fit_scale = np.where(fitted_d > 1e-12, r_u / fitted_d, 1.0)
+        scale = np.maximum(np.abs(truth_scale), 1e-9)
+        fit_error = float(np.max(np.abs(fit_scale - truth_scale) / scale))
 
-        return fisheye_D
+        if fit_error > 0.05:
+            logger.warning(
+                "Model '%s' reproduces the calibrated fisheye curve to only %.1f%% "
+                "over the image radius — it has too few degrees of freedom for this "
+                "lens. Prefer opencv_fisheye, or expect distortion at the frame edges.",
+                self.distortion_model, fit_error * 100.0,
+            )
+
+        return coeffs.reshape(-1, 1), fit_error
+
+    @staticmethod
+    def _max_normalized_radius(K: np.ndarray, image_size: tuple[int, int]) -> float:
+        """Largest distorted radius in the image, in normalised units."""
+        w, h = image_size
+        cx, cy = K[0, 2], K[1, 2]
+        f = 0.5 * (K[0, 0] + K[1, 1])
+        if f <= 0:
+            return 0.0
+        corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)]
+        return max(float(np.hypot(x - cx, y - cy)) for x, y in corners) / f
+
+    @staticmethod
+    def _theta_for_radius(r_d: float, k: np.ndarray) -> float:
+        """Invert the fisheye theta-polynomial by bisection."""
+        if r_d <= 0:
+            return 0.0
+        # tan() blows up at pi/2; stay inside the model's valid range.
+        hi = min(1.55, np.pi / 2 - 1e-3)
+        lo = 0.0
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            m2 = mid * mid
+            value = mid * (1.0 + k[0] * m2 + k[1] * m2**2 + k[2] * m2**3 + k[3] * m2**4)
+            if value < r_d:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
