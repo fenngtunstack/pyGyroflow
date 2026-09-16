@@ -301,17 +301,17 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 
 | # | 等级 | 项 | 证据 |
 |---|---|---|---|
-| D-01 | R | **逐时间戳镜头数据路径整体缺失**。上游 `frame_transform.rs:82-155`（70 行）做四件事：按 `lens_positions` 插值变焦内参、按 `lens_params` 覆盖内参与畸变系数并重算 `radial_distortion_limit`、按 `digital_zoom` 缩放、非对称镜头 `invert_asym_lens`。我们 `_get_lens_data_at_timestamp`（`frame_transform.py:190-220`）**连时间戳参数都不用** → **变焦镜头全程用一组静态内参**。（`LensProfile.get_interpolated_profile_at` 数学正确但无逐帧调用点） | [实测] |
+| D-01 | R | **逐时间戳镜头数据路径整体缺失**。上游 `frame_transform.rs:82-155`（70 行）做四件事：按 `lens_positions` 插值变焦内参、按 `lens_params` 覆盖内参与畸变系数并重算 `radial_distortion_limit`、按 `digital_zoom` 缩放、非对称镜头 `invert_asym_lens`。我们 `_get_lens_data_at_timestamp`（`frame_transform.py:190-220`）**连时间戳参数都不用** → **变焦镜头全程用一组静态内参**。（`LensProfile.get_interpolated_profile_at` 数学正确但无逐帧调用点）—— 已实现（`3be3629`）：四件事全部落地（`lens_positions` 插值 / `lens_params` 覆盖内参与畸变系数 + 重算 `radial_distortion_limit` / `digital_zoom` / `invert_asym_lens`），配套移植 `MapClosest`（`util.ClosestMap`）；Sony 解析器逐包读 `0x8005` 焦距喂 `lens_positions`。**留一处有意不改**：`_build_compute_params` 把 `calib_width/height` 设成视频尺寸，标定分辨率缩放仍是 no-op | [实测] |
 | D-02 | R | **`additional_rotation` 是死的**。`compute_params.py:107` 定义、`manager.py:1239` 拷贝、`gui/main_window.py:306` 唯一写入方（水平锁滑块 → additional_rotation[2]），但 `recompute_smoothing`（`manager.py:333-384`）**不乘这个旋转**。上游 `gyro_source/mod.rs:611-624` 在平滑/锁定**之前**对每个 org 四元数左乘。**GUI 上那个滑块对平滑结果无效** | [实测] |
 | D-03 | R | **`optimal_fov` 未应用**。`frame_transform.py:302` 注释自认 `# (simplified: not handling lens.optimal_fov here)`；上游 `frame_transform.rs:185-191` 有 `fov *= adj` / `ui_fov /= adj` 分支 | [实测] |
 | D-04 | R | **地平线锁顺序反了且应用两次**（见 G-08） | [实测] |
 | D-05 | R | **max-zoom 反馈回路缺失**。上游 `lib.rs:548-605` 最多 5 轮 {夹紧 FOV 上限 → 按阈值 `[0.95,0.9,0.85,0.8]` 逐帧缩放 `smoothing_fov_limit_per_frame` → 重平滑 → 重缩放}。我们 `recompute_adaptive_zoom`（`manager.py:386-404`）只算一次；`ComputeParams` 无 `smoothing_fov_limit_per_frame` 字段，`default_algo.py:423`/`plain.py:141` 用 `getattr(...,{})` 读，**永远是空字典**。另无 `video_speed_affects_zooming_limit` | [实测] |
 | D-06 | R | **`at_timestamp_for_points` / `undistort_points*` 家族整体缺失**。上游 `frame_transform.rs:344-430` + `cpu_undistort.rs:634-803`：逐点按各自行时刻取旋转、逐点 IBIS 位移、mesh 校正、数字镜头、GoPro 数字镜头 0.91/0.81 x 修正。我们只有 `zooming/fov_iterative.py:104-253` 一个简化版；`almeida.py:43-44` 注释自认点**没有**畸变校正。**自动同步与自适应缩放的采样点全程跑在畸变坐标上** | [实测] |
-| D-07 | R | **`frame_readout_time` 未按传感器裁切缩放**。上游 `frame_transform.rs:22-36` 乘 `capture_area_size/sensor_size_px`；我们 `frame_transform.py:83-107` 只移植符号逻辑 | [报告] |
+| D-07 | E | **`frame_readout_time` 未按传感器裁切缩放**。上游 `frame_transform.rs:22-36` 乘 `capture_area_size/sensor_size_px`；我们 `frame_transform.py:83-107` 只移植符号逻辑 —— 已实现（`3be3629`）：从 `lens_params` 的 `capture_area_size[1]/sensor_size_px[1]` 取到缩放 | [实测] |
 | D-08 | R | **焦距平滑整文件缺失**。上游 `smoothing/focal_length.rs:8-146`（高斯 + 自适应两套）+ `lib.rs:442-513` 编排 + `frame_transform.rs:71-80` `focal_length_fov_compensation`。字段在（`stabilization_params.py:104-106`）但从不填充 | [报告] |
 | D-09 | R | **自适应缩放丢失全部关键帧支持**。`zooming/__init__.py:52-100` 构造工作副本时**不传 `keyframes`**（默认空 KeyframeManager）也不传 `sync_offsets_adjusted`；上游 `zooming/mod.rs:40` 克隆完整 params。连带 `zoom_dynamic.py:27-66` 只有静态窗口路径（无 `DataPerTimestamp`/`min_rolling_dynamic`/`convolve_dynamic`/逐时间戳 envelope alpha），`fov_iterative.py:308-312` 只用常量 kv | [实测] |
 | D-10 | R | **关键帧查询忽略陀螺同步偏移**。`keyframes/manager.py:302-311` `value_at_gyro_timestamp` 直接委托 `value_at_video_timestamp`，无偏移（docstring 自认）；无 `update_gyro`、无 `gyro_offsets`。上游 `keyframes.rs:79,205-208` | [报告] |
-| D-11 | R | **`camera_diagonal_fovs` 塌缩为单值**。上游 `compute_params.rs:140-155` 变焦镜头逐帧一值；我们 `manager.py:1189-1219` 恒 `[单值]` | [报告] |
+| D-11 | E | **`camera_diagonal_fovs` 塌缩为单值**。上游 `compute_params.rs:140-155` 变焦镜头逐帧一值；我们 `manager.py:1189-1219` 恒 `[单值]` —— 已实现（`3be3629`）：`ComputeParams.calculate_camera_fovs()`，仅当 `lens_params` 多于一项（标定真在动）才逐帧算，定焦保持单值以免做 `frame_count` 次恒等查找 | [实测] |
 | D-12 | R | **`framebuffer_inverted` 时自适应缩放中心未翻转**。上游 `frame_transform.rs:310-312` `adaptive_zoom_center_y *= -1.0` | [报告] |
 | D-13 | R | **`input_rotation`/`output_rotation` 完全未处理**。`types/kernel_params.py:63-64` 有字段，**从不设置也从不读取**。上游 `cpu_undistort.rs:483-489,590-596` 按旋转量转 uv 与帧尺寸 | [报告] |
 | D-14 | R | **速度斜坡缺失**。`stabilization_params.py:65` 有 `speed_ramped_timestamps` 字段，**无生产者无消费者**。上游 `stabilization_params.rs:230-283` 用于输出时间→源时间映射 | [实测] |
@@ -385,8 +385,9 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-06 `.gyroflow` 工程读写 + base91/zlib/bincode/CBOR 编解码 | `1077433` | 两个官方工程 JSON 层往返「缺失键 [] / 变化键 {}」；base91/bincode 与仓库内独立解码器逐字节一致；CBOR 按规范和 nalgebra serde 推导后按位固化 |
 | C-04 渲染时裁剪区间 + 音频同步裁剪 + 逐区间导出 | `11294ef` | 8 组区间组合断言保留帧数与帧内容（帧身份写进画面象限）；输出 pts 相邻差值恒定（无空洞）；回调收到源时间线；带音轨素材裁后音频时长同步变短 |
 | C-11/C-06 余下：CLI 吃工程与 preset、`--preset`/`--export-project 1`/`-p`/`-s`/`-t`/`-f`/`--version`、`python -m pygyroflow` | `e7fb663` | subprocess 跑真 CLI：真工程（自带 base91 bincode 陀螺块）→ 读工程 → 从块里取得陀螺 → 出片帧数正确；`--export-project 1` 无运动载荷且 fov 随 preset 变化；缺 `-f` 时拒绝覆盖 |
-| G-10 视觉角速度信号：中点时间戳 + 失败帧欧拉角插值 + 可选低通 | `待提交` | 中点用 1 ms 等距夹具断言精确值、30fps 用规则断言；缺口按位置加权插值（中点=均值）且首尾不外推；低通使单帧尖峰幅度降到 60% 以下且时间戳不变 |
+| G-10 视觉角速度信号：中点时间戳 + 失败帧欧拉角插值 + 可选低通 | `0420488` | 中点用 1 ms 等距夹具断言精确值、30fps 用规则断言；缺口按位置加权插值（中点=均值）且首尾不外推；低通使单帧尖峰幅度降到 60% 以下且时间戳不变 |
 | C-05 渲染时变速与 `fps_scale` | `6a95077` | `video_speed` 2.0 出 6/12 帧且留下的正是奇数帧、0.5 出 22 帧、4.0 出 3 帧；`fps_scale=2` 帧数不变且查询时间戳被 spy 证实为 `ts/2`；变速时自动丢弃音轨 |
+| D-01 逐时间戳镜头数据（`lens_positions`/`lens_params`/`digital_zoom`/`invert_asym_lens`）+ `MapClosest`、D-11 逐帧 `camera_diagonal_fovs`、D-07 读出时间按裁切缩放 | `3be3629` | 真素材：`a7s3-sony85mm` 450 包里 200 个带 `0x8005`，每个都是 85.0 mm（15015 条 IMU 行）；`rx100-7-ois-only` 无该标签、map 为空。`ClosestMap` 的等距返回 None、严格 `<` 上限、缺席侧 −99999 哨兵逐条断言；`stretch_lens` 门控与主点重置；`lens_params` 多于一项才逐帧算 FOV |
 
 **实施中新发现的、原清单没有的缺陷**：
 
@@ -444,7 +445,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 
 | 项 | 说明 |
 |---|---|
-| D-01/D-06 逐时间戳镜头数据 + points 家族 | 需连 `MapClosest` 一起补；**变焦镜头与鱼眼同步精度的根** |
+| D-06 `at_timestamp_for_points`/`undistort_points*` 逐点家族 | D-01 的内参路径已通（`3be3629`），剩下的是**逐点**按各自行时刻取旋转、IBIS 位移、mesh、数码镜头；**自动同步与自适应缩放的采样点仍跑在畸变坐标上** |
 | D-08 焦距平滑 | 整文件移植 |
 | D-05 max-zoom 反馈回路 | 需加字段 + 循环 |
 | D-09 自适应缩放关键帧 | 传 params 即可恢复大半 |
