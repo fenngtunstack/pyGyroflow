@@ -308,7 +308,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | D-03 | R | **`optimal_fov` 未应用**。`frame_transform.py:302` 注释自认 `# (simplified: not handling lens.optimal_fov here)`；上游 `frame_transform.rs:185-191` 有 `fov *= adj` / `ui_fov /= adj` 分支 | [实测] |
 | D-04 | R | **地平线锁顺序反了且应用两次**（见 G-08） | [实测] |
 | D-05 | R | **max-zoom 反馈回路缺失**。上游 `lib.rs:548-605` 最多 5 轮 {夹紧 FOV 上限 → 按阈值 `[0.95,0.9,0.85,0.8]` 逐帧缩放 `smoothing_fov_limit_per_frame` → 重平滑 → 重缩放}。我们 `recompute_adaptive_zoom`（`manager.py:386-404`）只算一次；`ComputeParams` 无 `smoothing_fov_limit_per_frame` 字段，`default_algo.py:423`/`plain.py:141` 用 `getattr(...,{})` 读，**永远是空字典**。另无 `video_speed_affects_zooming_limit` | [实测] |
-| D-06 | R | **`at_timestamp_for_points` / `undistort_points*` 家族整体缺失**。上游 `frame_transform.rs:344-430` + `cpu_undistort.rs:634-803`：逐点按各自行时刻取旋转、逐点 IBIS 位移、mesh 校正、数字镜头、GoPro 数字镜头 0.91/0.81 x 修正。我们只有 `zooming/fov_iterative.py:104-253` 一个简化版；`almeida.py:43-44` 注释自认点**没有**畸变校正。**自动同步与自适应缩放的采样点全程跑在畸变坐标上** | [实测] |
+| D-06 | R | **`at_timestamp_for_points` / `undistort_points*` 家族整体缺失**。上游 `frame_transform.rs:344-430` + `cpu_undistort.rs:634-803`：逐点按各自行时刻取旋转、逐点 IBIS 位移、mesh 校正、数字镜头、GoPro 数字镜头 0.91/0.81 x 修正。我们只有 `zooming/fov_iterative.py:104-253` 一个简化版；`almeida.py:43-44` 注释自认点**没有**畸变校正。**自动同步与自适应缩放的采样点全程跑在畸变坐标上** —— **家族本身已实现（`c7cbf1f`）**：`util.map_coord`、`splines.as_catmull_rom`、`ComputeParams` 的 mesh/stab/digital-lens 四字段与 manager 接线、`frame_transform.at_timestamp_for_points` + 三个辅助、`cpu_undistort` 的七个函数全部落地。**余下的是调用方**（见下方「D-06 余下」行）——家族已就位但还没人换用它，`fov_iterative._undistort_points_simple` 那份副本仍在跑 | [实测] |
 | D-07 | E | **`frame_readout_time` 未按传感器裁切缩放**。上游 `frame_transform.rs:22-36` 乘 `capture_area_size/sensor_size_px`；我们 `frame_transform.py:83-107` 只移植符号逻辑 —— 已实现（`3be3629`）：从 `lens_params` 的 `capture_area_size[1]/sensor_size_px[1]` 取到缩放 | [实测] |
 | D-08 | E | **焦距平滑整文件缺失**。上游 `smoothing/focal_length.rs:8-146`（高斯 + 自适应两套）+ `lib.rs:442-513` 编排 + `frame_transform.rs:71-80` `focal_length_fov_compensation`。字段在（`stabilization_params.py:104-106`）但从不填充 —— 已实现（`cb606bb`）：两个滤波器 + 编排 + 补偿全部移植，`zooming.get_checksum` 顺带补齐两个字段。**唯一没做到的是真机端到端**：解析器只填 `lens_positions`，`lens_params` 的写入侧仍是缺口，没有现成素材带逐帧焦距，验证止步于「与上游 Rust 逐位一致 + 合成内参接线」 | [实测] |
 | D-09 | R | **自适应缩放丢失全部关键帧支持**。`zooming/__init__.py:52-100` 构造工作副本时**不传 `keyframes`**（默认空 KeyframeManager）也不传 `sync_offsets_adjusted`；上游 `zooming/mod.rs:40` 克隆完整 params。连带 `zoom_dynamic.py:27-66` 只有静态窗口路径（无 `DataPerTimestamp`/`min_rolling_dynamic`/`convolve_dynamic`/逐时间戳 envelope alpha），`fov_iterative.py:308-312` 只用常量 kv | [实测] |
@@ -394,6 +394,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-06 余下（后半）：`--export-project` 2/3 模式 | `9772a50` | 真机工程：3 模式导出的 `synced_imu_timestamps` 与该工程原本导出**逐值相同**（25185 项），验证的是派生公式本身；2/3 产物都能被没见过原片的新 manager 载入并取回 25185 个四元数；CLI 侧 subprocess 跑真命令行验 2 与 3 |
 | A-07 `splines.rs`（CatmullRom + BivariateSpline） | `8bfa9e1` | 上游 Rust 原样跑参照，17 用例 108 个数值逐位相等；顺带查出参照跨编译不可复现（1 ULP），生成脚本改用容差比较并把这条写进 fixture 的 `_provenance` |
 | D-08 焦距平滑（两个滤波器 + strength 映射 + fov 补偿 + FOV 缓存键） | `cb606bb` | **与上游 Rust 逐位一致**：上游 `focal_length.rs` 原样拷进临时 crate、只新写 `main()`，22 个用例全 `max_rel = 0.0`；生成脚本复现的驱动脚本与实跑逐字节相同，fixture 明确标注非自生成。接线在恒等陀螺下按 `矩阵[0,0] = fov/相机fx` 的比值断言补偿量本身 |
+| D-06（家族本身）`at_timestamp_for_points` + `undistort_points*` 七个函数 | `c7cbf1f` | 45 项测试。级联顺序用「把某一级的输出当下一级的输入、结果不变」断言（数字镜头、mesh），不重推畸变数学——那部分由 `test_distortion_models.py`/`test_distortion_cv2_parity.py` 覆盖。未收敛点的 `(-1000000,-1000000)` 哨兵用 `k1=-0.5`、归一化半径 1.0 触发（实测该点 10 次迭代不收敛），并断言只有失败的那个点进哨兵。变异检查：把 `_partial_correction` 换成恒等函数，`test_zero_correction_redistorts_the_point_back_where_it_started` 立刻失败 |
 
 **实施中新发现的、原清单没有的缺陷**：
 
@@ -420,6 +421,10 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 
 - `load_project` 把 `params.background` 写成了 tuple，而该字段是 `np.ndarray`（`_build_compute_params` 对它调 `.copy()`）。于是"读工程 → `recompute_blocking()`"必炸 `AttributeError: 'tuple' object has no attribute 'copy'`。之前的验证只走到 load 就停了，没往下跑管线，所以没暴露。
 - **工程自带的陀螺数据根本没被载入**。`load_project` 只套用了 IMU 变换，没解码 `quaternions`/`raw_imu`/`gravity_vectors`/`image_orientations` 并交给 gyro source。参考工程里这四个字段恰好全是 `null`（它们靠原片遥测），所以最初的手工验证看起来是对的——而 `WithGyroData` 工程存在的全部意义就是脱离原片。修的时候还要注意顺序：`load_from_telemetry` 内部会 `clear()`，把 IMU 变换清掉，所以变换必须在载入数据**之后**套用。
+
+**做 D-06 时新发现的缺陷**：
+
+- **`gopro6_superview` 这个畸变模型在本移植里根本不存在，却被两处代码当成存在**。上游有独立文件 `distortion_models/gopro6_superview.rs`（自带 `id() -> "gopro6_superview"`，多项式与 `gopro_superview` 不同，走 `1.0 - 0.48*|x|` 那一支）；本移植 `distortion_models/` 下没有它，`_MODEL_REGISTRY`（`distortion_models/__init__.py:57-67`）也没有这一项。而 `_MODEL_REGISTRY.get(name, OpenCVFisheyeModel)` 的兜底是**静默回落到 OpenCVFisheye**——一个完全不同的模型。可 `lens/profile.py` 自己认得这个名字：`_DISTORTION_MODEL_IDS` 里有 `"gopro6_superview": 7`（`profile.py:30`），`get_all_matching_profiles` 的标定尺寸重标定分支也专门把它和 `gopro_superview` 并列（`profile.py:558`）。所以带 `digital_lens: "gopro6_superview"` 的镜头档一路走到 `from_name` 就变成鱼眼模型，不报错、不出警告。这条是从 D-06 的数码镜头分支里牵出来的——`cpu_undistort.py` 的 0.91 修正按上游同时匹配 `"gopro_superview"` 与 `"gopro6_superview"`，但后者在这个移植里永远取不到。
 
 **原清单中经复核被推翻的结论**：
 
@@ -459,7 +464,8 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 
 | 项 | 说明 |
 |---|---|
-| D-06 `at_timestamp_for_points`/`undistort_points*` 逐点家族 | D-01 的内参路径已通（`3be3629`），mesh 与 IBIS 曲线需要的 `splines.py` 也已就位（`8bfa9e1`）；剩下的是**逐点**按各自行时刻取旋转、IBIS 位移、mesh、数码镜头；**自动同步与自适应缩放的采样点仍跑在畸变坐标上** |
+| D-06 `at_timestamp_for_points`/`undistort_points*` 逐点家族 | ~~家族本身~~ 已实现（`c7cbf1f`） |
+| **D-06 余下** 调用方换用逐点家族 | 家族已就位但**还没有任何调用方换过去**，所以这条缺口在观感上仍未闭合。上游五个调用点：`zooming/fov_iterative.rs:98,122`（多边形，用 `undistort_points_with_rolling_shutter`）、`synchronization/estimate_pose/almeida.rs:65`（用 `undistort_points`，`p = Some(camera_matrix)`）、`estimate_pose/{eight_point,find_essential_mat,find_homography}.rs` 与 `find_offset/rs_sync.rs:120-121`（用 `undistort_points_for_optical_flow`）、`find_offset/visual_features.rs:63-64`（用 `undistort_points_with_rolling_shutter`）。本移植对应位置：`zooming/fov_iterative.py:104-253` 有一份**平行实现** `_undistort_points_simple`（它已经补了畸变模型、光折射、逐行旋转，但缺 mesh、缺 IBIS 位移、缺数码镜头、缺 `lens_correction_amount < 1` 的混合），其余各处的 `undistort` 相关代码基本没有。换用的顺序建议先 `fov_iterative`（可删除那份副本），再 `rs_sync`/`visual_features`（真影响自动同步） |
 | D-08 焦距平滑 | ~~整文件移植~~ 已实现（`cb606bb`），但需要 `lens_params` 写入侧才能上真机 |
 | D-05 max-zoom 反馈回路 | 需加字段 + 循环 |
 | D-09 自适应缩放关键帧 | 传 params 即可恢复大半 |
