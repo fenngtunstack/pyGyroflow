@@ -1421,6 +1421,10 @@ def _parse_sony(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -
     orientation: str | None = None
     focal_length: float | None = None
     readout_ms: float | None = None
+    # One entry per IMU row, aligned with `rows`: the 0x8005 tag is present in
+    # every RTMD packet, and on a zoom it changes between them. This is what
+    # feeds FileMetadata.lens_positions, i.e. per-timestamp lens data.
+    focal_per_sample: list[float | None] = []
 
     for sample_idx, (offset, size, duration_ms) in enumerate(timed_samples):
         chunk = data[offset : offset + size]
@@ -1429,9 +1433,14 @@ def _parse_sony(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -
         tags: dict[int, bytes] = {}
         _sony_walk_tlv(chunk, 0x1C, len(chunk), tags)
 
+        packet_focal: float | None = None
+        if 0x8005 in tags and len(tags[0x8005]) >= 2:
+            # "LensZoom (Actual Focal Length)", mm (rtmd_tags.rs 0x8005).
+            packet_focal = _sony_read_f16(tags[0x8005]) * 1000.0
+            if focal_length is None:
+                focal_length = packet_focal
+
         if sample_idx == 0:
-            if 0x8005 in tags and len(tags[0x8005]) >= 2:
-                focal_length = _sony_read_f16(tags[0x8005]) * 1000.0
             if 0xe43a in tags:
                 raw_orient = _sony_orientation(tags[0xe43a])
                 if raw_orient:
@@ -1469,6 +1478,7 @@ def _parse_sony(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -
                 gyro_vals[i] if gyro_vals is not None and i < gyro_count else None,
                 accl_vals[i] if accl_vals is not None and i < accl_count else None,
             ))
+            focal_per_sample.append(packet_focal)
         total_duration_ms += duration_ms
         total_gyro_count += gyro_count
 
@@ -1477,6 +1487,18 @@ def _parse_sony(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -
         avg_diff_ms = total_duration_ms / total_gyro_count
         for i, (gyro, accl) in enumerate(rows):
             raw_imu.append(TimeIMU(timestamp_ms=i * avg_diff_ms, gyro=gyro, accl=accl))
+
+        # Per-timestamp lens data, on the same timeline as the IMU rows: the
+        # samples carry no timestamps of their own, so both are placed by the
+        # average step (upstream keys lens_positions by each sample's own
+        # timestamp, which the vendored parser does have and this one does
+        # not).
+        if any(v is not None for v in focal_per_sample):
+            metadata.lens_positions = {
+                round(i * avg_diff_ms * 1000.0): float(v)
+                for i, v in enumerate(focal_per_sample)
+                if v is not None
+            }
         log.info(
             "Sony: %d raw IMU readings, avg step %.4f ms (span %.1f ms, %d rtmd packets)",
             len(rows), avg_diff_ms, len(rows) * avg_diff_ms, len(timed_samples),

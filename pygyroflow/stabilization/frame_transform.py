@@ -99,6 +99,20 @@ def _get_frame_readout_time(
     """
     frt = abs(params.frame_readout_time)
 
+    # A sensor that reads out only part of its height finishes the frame
+    # proportionally sooner (upstream frame_transform.rs).
+    if params.lens_params:
+        entry = params.lens_params.get_closest(
+            round(timestamp_ms * 1000.0), LENS_LOOKUP_MAX_DIFF_US
+        )
+        if (
+            entry is not None
+            and entry.capture_area_size is not None
+            and entry.sensor_size_px is not None
+            and entry.sensor_size_px[1]
+        ):
+            frt *= entry.capture_area_size[1] / entry.sensor_size_px[1]
+
     if can_invert and params.framebuffer_inverted and not params.frame_readout_direction.is_horizontal():
         frt *= -1.0
     if params.frame_readout_direction.is_inverted():
@@ -187,37 +201,161 @@ def _get_fov(
     return fov
 
 
+# The per-frame lens maps are consulted within this window; a frame further
+# than that from any entry uses the profile as-is (upstream's 100000, µs).
+LENS_LOOKUP_MAX_DIFF_US = 100_000
+
+
 def _get_lens_data_at_timestamp(
     params: ComputeParams,
     timestamp_ms: float,
-) -> tuple[NDArray[np.float64], list[float], float]:
-    """Get camera intrinsics and distortion coefficients at a timestamp.
+    invert_asym_lens: bool = False,
+) -> tuple[NDArray[np.float64], list[float], float, float, float, float | None]:
+    """Camera intrinsics and distortion coefficients at a timestamp.
 
-    For zoom lenses, interpolates between calibration entries.
+    Port of ``FrameTransform::get_lens_data_at_timestamp`` (frame_transform.rs).
+    Two independent per-frame channels can override the static profile:
+
+    ``lens_positions``
+        A scalar per time (a focal length in mm, or a Sony crop score) that
+        selects an entry from the profile's own ``interpolations`` table,
+        interpolating between two of them. This is the zoom-lens path.
+    ``lens_params``
+        Raw per-frame intrinsics that override the camera matrix and
+        distortion coefficients outright. The pixel focal length comes either
+        from the file directly, or from mm / (pixel pitch × capture area
+        height) × video height. Guarded by ``distortion_coeffs.len() < 4``:
+        a profile that carries its own coefficients (Canon/Sony per-frame
+        ones do) wins over the file's.
+
+    When ``lens_params`` supplies a pixel focal length, the calibration-
+    resolution scaling below is **skipped** (``stretch_lens = false``) and the
+    principal point is reset to the frame centre: the override is already in
+    video pixels, so scaling it again would be wrong and the calibration's
+    off-centre principal point no longer applies.
 
     Args:
         params: Compute parameters.
         timestamp_ms: Frame timestamp in ms.
+        invert_asym_lens: Flip the vertical principal point of an asymmetric
+            profile (upstream's ``invert_asym_lens``).
 
     Returns:
-        Tuple of (camera_matrix 3x3, distortion_coeffs list[12], radial_distortion_limit).
+        ``(camera_matrix, distortion_coeffs, radial_distortion_limit,
+        input_horizontal_stretch, input_vertical_stretch, focal_length)``.
     """
-    camera_matrix = params.camera_matrix.copy()
-    distortion_coeffs = list(params.distortion_coeffs)
+    ts_us = round(timestamp_ms * 1000.0)
+    lens = params.lens
 
-    # Scale camera matrix from calibration resolution to video resolution
-    calib_w = params.calib_width if params.calib_width > 0 else params.width
-    calib_h = params.calib_height if params.calib_height > 0 else params.height
+    interpolated = None
+    if params.lens_positions and lens is not None:
+        position = params.lens_positions.get_closest(ts_us, LENS_LOOKUP_MAX_DIFF_US)
+        if position is not None:
+            interpolated = lens.get_interpolated_profile_at(float(position))
 
-    if calib_w > 0 and calib_h > 0:
-        ratio_x = (params.width / calib_w) * params.input_horizontal_stretch
-        ratio_y = (params.height / calib_h) * params.input_vertical_stretch
-        camera_matrix[0, 0] *= ratio_x
-        camera_matrix[1, 1] *= ratio_y
-        camera_matrix[0, 2] *= ratio_x
-        camera_matrix[1, 2] *= ratio_y
+    if interpolated is not None:
+        source = interpolated
+        camera_matrix = source.get_camera_matrix(
+            (params.width, params.height), invert_asym_lens
+        )
+        distortion_coeffs = source.get_distortion_coeffs()
+        radial_distortion_limit = float(source.radial_distortion_limit or 0.0)
+        focal_length = source.focal_length
+        # The *unpadded* count: `get_distortion_coeffs()` zero-pads to 12, and
+        # the gate below is upstream's `lens.fisheye_params.distortion_coeffs
+        # .len() < 4`, which counts what the profile actually carries.
+        coeff_count = len(source.distortion_coeffs)
+        calib_w = source.calib_dimension["w"] or params.width
+        calib_h = source.calib_dimension["h"] or params.height
+        h_stretch = source.input_horizontal_stretch
+        v_stretch = source.input_vertical_stretch
+    else:
+        camera_matrix = params.camera_matrix.copy()
+        distortion_coeffs = list(params.distortion_coeffs)
+        radial_distortion_limit = params.radial_distortion_limit
+        focal_length = params.focal_length
+        coeff_count = (
+            len(params.lens.distortion_coeffs)
+            if params.lens is not None
+            else len(params.distortion_coeffs)
+        )
+        calib_w = params.calib_width if params.calib_width > 0 else params.width
+        calib_h = params.calib_height if params.calib_height > 0 else params.height
+        h_stretch = params.input_horizontal_stretch
+        v_stretch = params.input_vertical_stretch
 
-    return camera_matrix, distortion_coeffs, params.radial_distortion_limit
+    h_stretch = h_stretch if h_stretch > 0.01 else 1.0
+    v_stretch = v_stretch if v_stretch > 0.01 else 1.0
+
+    stretch_lens = True
+    if params.lens_params and coeff_count < 4:
+        entry = params.lens_params.get_closest(ts_us, LENS_LOOKUP_MAX_DIFF_US)
+        if entry is not None:
+            pixel_focal_length = entry.pixel_focal_length
+            if pixel_focal_length is None and entry.focal_length is not None:
+                focal_length = float(entry.focal_length)
+                if entry.pixel_pitch is not None and entry.capture_area_size is not None:
+                    pitch_mm = entry.pixel_pitch[1] / 1_000_000.0
+                    pixel_focal_length = (
+                        entry.focal_length
+                        / (pitch_mm * entry.capture_area_size[1])
+                        * params.height
+                    )
+            if pixel_focal_length is not None:
+                camera_matrix[0, 0] = pixel_focal_length
+                camera_matrix[1, 1] = pixel_focal_length
+                camera_matrix[0, 2] = params.width / 2.0
+                camera_matrix[1, 2] = params.height / 2.0
+                stretch_lens = False
+                if entry.focal_length is not None:
+                    focal_length = float(entry.focal_length)
+
+            if 0 < len(entry.distortion_coefficients) <= 12:
+                for index, value in enumerate(entry.distortion_coefficients):
+                    distortion_coeffs[index] = float(value)
+                radial_distortion_limit = _radial_limit_for(
+                    params.distortion_model_name, distortion_coeffs
+                )
+
+    if stretch_lens:
+        # Scale camera matrix from calibration resolution to video resolution.
+        if calib_w > 0 and calib_h > 0:
+            ratio_x = (params.width / calib_w) * h_stretch
+            ratio_y = (params.height / calib_h) * v_stretch
+            camera_matrix[0, 0] *= ratio_x
+            camera_matrix[1, 1] *= ratio_y
+            camera_matrix[0, 2] *= ratio_x
+            camera_matrix[1, 2] *= ratio_y
+
+    if params.digital_zoom:
+        camera_matrix[0, 0] *= params.digital_zoom
+        camera_matrix[1, 1] *= params.digital_zoom
+
+    return (
+        camera_matrix,
+        distortion_coeffs,
+        radial_distortion_limit,
+        h_stretch,
+        v_stretch,
+        focal_length,
+    )
+
+
+def _radial_limit_for(model_name: str, distortion_coeffs: list[float]) -> float:
+    """Radial distortion limit for an overridden coefficient set.
+
+    The models return None when the distortion is valid over the whole field
+    of view, which counts as no limit.
+    """
+    from pygyroflow.stabilization.distortion_models import from_name
+
+    try:
+        result = from_name(model_name or "opencv_fisheye").radial_distortion_limit(
+            distortion_coeffs
+        )
+    except Exception:
+        return 0.0
+    return 0.0 if result is None else float(result)
 
 
 @dataclass
@@ -291,8 +429,14 @@ class FrameTransform:
         light_refraction_coefficient = params.light_refraction_coefficient
 
         # --- 2. Lens data ---
-        camera_matrix, distortion_coeffs, radial_distortion_limit = \
-            _get_lens_data_at_timestamp(params, timestamp_ms)
+        (
+            camera_matrix,
+            distortion_coeffs,
+            radial_distortion_limit,
+            input_horizontal_stretch,
+            input_vertical_stretch,
+            focal_length,
+        ) = _get_lens_data_at_timestamp(params, timestamp_ms)
 
         # --- 3. FOV computation ---
         fov = _get_fov(params, frame, True, timestamp_ms, False)
@@ -472,8 +616,10 @@ class FrameTransform:
         kernel_params.fov = float(fov)
         kernel_params.r_limit = float(radial_distortion_limit)
         kernel_params.lens_correction_amount = float(lens_correction_amount)
-        kernel_params.input_vertical_stretch = float(params.input_vertical_stretch)
-        kernel_params.input_horizontal_stretch = float(params.input_horizontal_stretch)
+        # From the per-timestamp lens, not the static params: a zoom lens'
+        # stretch comes from whichever profile is current for this frame.
+        kernel_params.input_vertical_stretch = float(input_vertical_stretch)
+        kernel_params.input_horizontal_stretch = float(input_horizontal_stretch)
         kernel_params.background_margin = float(background_margin)
         kernel_params.background_margin_feather = float(background_feather)
 
@@ -511,6 +657,6 @@ class FrameTransform:
             kernel_params=kernel_params,
             fov=ui_fov,
             minimal_fov=params.minimal_fovs[frame] if frame < len(params.minimal_fovs) else 1.0,
-            focal_length=params.focal_length,
+            focal_length=focal_length,
             distortion_model_name=params.distortion_model_name,
         )

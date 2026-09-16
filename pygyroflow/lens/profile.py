@@ -363,6 +363,13 @@ class LensProfile:
 
         Delegates to :meth:`get_interpolated_profile_at` for interpolation
         logic, then extracts the matrix.
+
+        Note: misleading and unused. The argument it forwards is a *position*
+        in the interpolation table (a focal length), not a time — a real
+        timestamp lookup is ``FileMetadata.lens_positions`` +
+        ``FrameTransform._get_lens_data_at_timestamp``. Nothing calls this;
+        left in place rather than deleted because it predates this port's
+        per-timestamp lens handling, but do not wire it up as written.
         """
         interp = self.get_interpolated_profile_at(timestamp_ms)
         return interp.get_camera_matrix()

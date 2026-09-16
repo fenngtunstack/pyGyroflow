@@ -27,6 +27,7 @@ from pygyroflow.stabilization import ComputeParams, FrameTransform
 from pygyroflow.stabilization_params import StabilizationParams
 from pygyroflow.types.enums import ReadoutDirection
 from pygyroflow.types.errors import GyroflowError, TelemetryParseError, VideoIOError
+from pygyroflow.util import ClosestMap
 
 log = logging.getLogger(__name__)
 
@@ -1944,22 +1945,14 @@ class StabilizationManager:
         camera_matrix = lens.get_camera_matrix(size=(w, h))
         distortion_coeffs = lens.get_distortion_coeffs()
 
-        # Camera diagonal FOV per frame from the lens intrinsics (mirrors
-        # upstream ComputeParams::calculate_camera_fovs, consumed by
-        # DefaultAlgo's velocity normalization: fov_ratio = dfov / 120).
-        w_px = float(w)
-        h_px = float(h)
-        diag_px = (w_px * w_px + h_px * h_px) ** 0.5
-        fy = camera_matrix[1, 1] if camera_matrix[1, 1] > 0 else 1.0
-        diagonal_fov = 2.0 * float(np.arctan(diag_px / (2.0 * fy))) * 180.0 / np.pi
-
         # Radial distortion limit from the lens's distortion model (mirrors
         # upstream lens_profile.rs: DistortionModel::from_name(...).radial_distortion_limit(&coeffs))
         radial_limit = self._get_radial_distortion_limit(
             lens.distortion_model or "opencv_fisheye", distortion_coeffs
         )
 
-        return ComputeParams(
+        metadata = self.gyro.file_metadata
+        cp = ComputeParams(
             width=w,
             height=h,
             output_width=ow,
@@ -1974,7 +1967,7 @@ class StabilizationManager:
             sync_offsets_adjusted=dict(self.gyro.offsets_adjusted),
             fovs=list(self.params.fovs),
             minimal_fovs=list(self.params.minimal_fovs),
-            camera_diagonal_fovs=[diagonal_fov],
+            camera_diagonal_fovs=[],  # filled by calculate_camera_fovs below
             fov_scale=self.params.fov,
             fov_overview=self.params.fov_overview,
             show_safe_area=self.params.show_safe_area,
@@ -2010,12 +2003,23 @@ class StabilizationManager:
             input_horizontal_stretch=lens.input_horizontal_stretch if lens.input_horizontal_stretch > 0.01 else 1.0,
             input_vertical_stretch=lens.input_vertical_stretch if lens.input_vertical_stretch > 0.01 else 1.0,
             focal_length=lens.focal_length,
+            # Per-timestamp lens data. Both maps are empty for a fixed-focal-
+            # length clip, which leaves get_lens_data_at_timestamp on exactly
+            # the static path it had before.
+            lens=lens,
+            lens_positions=ClosestMap(metadata.lens_positions),
+            lens_params=ClosestMap(metadata.lens_params),
+            digital_zoom=metadata.digital_zoom,
             radial_distortion_limit=radial_limit,
             optimal_fov=lens.optimal_fov,
             per_frame_time_offsets=list(
                 getattr(self.gyro.file_metadata, "per_frame_time_offsets", None) or []
             ),
         )
+        # One FOV per frame only when the calibration actually moves; see
+        # ComputeParams.calculate_camera_fovs.
+        cp.calculate_camera_fovs()
+        return cp
 
     def _get_radial_distortion_limit(self, model_name: str, coeffs: list[float]) -> float:
         """Compute (and cache) the radial distortion limit for a lens.

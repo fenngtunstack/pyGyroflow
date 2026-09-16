@@ -8,13 +8,14 @@ stabilization manager to avoid holding locks during rendering.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 from numpy.typing import NDArray
 
 from pygyroflow.types.enums import BackgroundMode, ReadoutDirection
 from pygyroflow.types.time_types import TimeQuat, TimeVec
+from pygyroflow.util import ClosestMap
 
 
 @dataclass
@@ -125,6 +126,59 @@ class ComputeParams:
 
     # Focal length in mm (None if unknown)
     focal_length: Optional[float] = None
+
+    # --- Per-timestamp lens data (FileMetadata.lens_positions / lens_params) ---
+    # A zoom lens changes focal length during the clip, so its calibration
+    # changes with it. Both maps are empty for a fixed-focal-length clip,
+    # which is the common case and leaves every consumer on the static path
+    # above; when they are not, `FrameTransform.get_lens_data_at_timestamp`
+    # prefers them (upstream frame_transform.rs).
+    #
+    # `lens_positions` is a scalar per time — a focal length in mm, or a Sony
+    # crop score — used to interpolate *within* the profile's own
+    # `interpolations` table. `lens_params` carries raw per-frame intrinsics
+    # that override the profile outright. They are independent: one does not
+    # feed the other.
+    lens_positions: ClosestMap = field(default_factory=ClosestMap)
+    lens_params: ClosestMap = field(default_factory=ClosestMap)
+    # The LensProfile itself, so a position lookup can interpolate a profile
+    # out of its `interpolations` table (LensProfile.get_interpolated_profile_at).
+    lens: Any = None
+    # FileMetadata.digital_zoom: a crop factor the camera decided on.
+    digital_zoom: Optional[float] = None
+
+    def calculate_camera_fovs(self) -> None:
+        """Fill ``camera_diagonal_fovs``, one value per frame.
+
+        Port of ``ComputeParams::calculate_camera_fovs`` (compute_params.rs).
+        A fixed-focal-length clip gets a single value and is left at that:
+        the FOV cannot change, so a per-frame pass would be ``frame_count``
+        identical lookups. Only a clip whose calibration actually moves —
+        a zoom lens, i.e. more than one ``lens_params`` entry — needs the
+        per-frame array, which DefaultAlgo consumes to scale its velocity
+        threshold by ``dfov / 120``.
+        """
+        import math
+
+        from pygyroflow.stabilization.frame_transform import (
+            _get_lens_data_at_timestamp,
+        )
+        from pygyroflow.util import timestamp_at_frame
+
+        frame_count = self.frame_count if len(self.lens_params) > 1 else 1
+        diagonal_px = math.hypot(self.width, self.height)
+        fovs: list[float] = []
+        for frame in range(frame_count):
+            timestamp_ms = timestamp_at_frame(frame, self.scaled_fps)
+            matrix, _, _, _, _, _ = _get_lens_data_at_timestamp(self, timestamp_ms)
+            fy = matrix[1, 1] if matrix[1, 1] else 0.0
+            if fy == 0.0:
+                fovs.append(120.0)
+                continue
+            fovs.append(
+                2.0 * math.degrees(math.atan(diagonal_px / (2.0 * fy)))
+            )
+        self.camera_diagonal_fovs = fovs
 
     # Keyframes
     keyframes: 'KeyframeManager' = field(default_factory=lambda: __import__('pygyroflow.keyframes', fromlist=['KeyframeManager']).KeyframeManager())

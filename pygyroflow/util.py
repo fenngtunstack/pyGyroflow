@@ -34,11 +34,20 @@ corrupt the stream.
 
 from __future__ import annotations
 
+import bisect
 import struct
 import zlib
 from typing import Any
 
 import cbor2
+
+# Upstream's `MapClosest` stands in for "no such neighbour" with this key
+# rather than an Option, so an absent side ends up at a distance of about
+# 99999. It only matters when `max_diff` is larger than that, which none of
+# upstream's callers use — but reproducing it keeps the two implementations
+# identical rather than merely equivalent where they are called.
+_MISSING_KEY = -99999
+
 
 # Reference base91 alphabet (the Rust `base91` crate uses the same one).
 _B91_ALPHABET = (
@@ -337,6 +346,58 @@ def decompress_from_base91_cbor(text: str) -> Any:
     Returns whatever the CBOR holds; shaping it is the caller's job.
     """
     return cbor2.loads(decompress_from_base91(text))
+
+
+class ClosestMap:
+    """Nearest-key lookup with a distance cap (Rust's ``MapClosest``).
+
+    Port of ``util.rs::MapClosest``. Its semantics are fussier than "nearest
+    key", and the differences decide real behaviour where it is used — the
+    per-frame lens data, where a wrong answer is a wrong calibration:
+
+    * An exact key wins outright.
+    * Otherwise the **strictly** closer neighbour wins. Two neighbours exactly
+      equidistant from the key give **None**: upstream drops that lookup and
+      the caller falls back to the static value, rather than picking a side.
+    * The cap is strict too — a neighbour exactly ``max_diff`` away does not
+      count.
+    * A missing neighbour on one side is at the sentinel distance above, not
+      at infinity, which is a difference only for caps above ~100000.
+
+    The keys are sorted once on construction. The callers walk a whole clip,
+    so this is one lookup per frame against a map that also has roughly one
+    entry per frame; re-sorting per call would be quadratic.
+    """
+
+    def __init__(self, mapping: dict[int, Any] | None = None) -> None:
+        self._mapping = mapping if mapping is not None else {}
+        self._keys = sorted(self._mapping)
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def __bool__(self) -> bool:
+        return bool(self._keys)
+
+    def get_closest(self, key: int, max_diff: int) -> Any | None:
+        """Value nearest *key* within *max_diff*, or None."""
+        if not self._keys:
+            return None
+        if key in self._mapping:
+            return self._mapping[key]
+
+        index = bisect.bisect_left(self._keys, key)
+        below = self._keys[index - 1] if index > 0 else None
+        above = self._keys[index] if index < len(self._keys) else None
+
+        above_diff = abs(key - (above if above is not None else _MISSING_KEY))
+        below_diff = abs(key - (below if below is not None else _MISSING_KEY))
+
+        if above is not None and above_diff < max_diff and above_diff < below_diff:
+            return self._mapping[above]
+        if below is not None and below_diff < max_diff and below_diff < above_diff:
+            return self._mapping[below]
+        return None
 
 
 def timestamp_at_frame(frame: int, fps: float) -> float:
