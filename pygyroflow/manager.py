@@ -374,13 +374,15 @@ class StabilizationManager:
         sections round-trip untouched through :meth:`save_project`, so a file
         written by a newer Gyroflow is not silently reduced.
         """
-        from pygyroflow.project import GyroflowProject
+        from pygyroflow.project import GyroflowProject, resolve_videofile
 
         proj = GyroflowProject.load(path)
         self.project = proj
         self.input_file.project_file_url = path
         if proj.videofile:
-            self.input_file.url = proj.videofile
+            self.input_file.url = resolve_videofile(
+                proj.videofile, path, proj.image_sequence_start
+            )
         if proj.image_sequence_fps:
             self.input_file.image_sequence_fps = proj.image_sequence_fps
         if proj.image_sequence_start:
@@ -407,28 +409,30 @@ class StabilizationManager:
             self._apply_project_stabilization(stab)
 
         gyro_src = proj.gyro_source
+        # Embedded motion first, transforms after. `load_from_telemetry`
+        # calls `GyroSource.clear()`, which resets the IMU transform — so
+        # applying the project's rotation/lpf before loading the data would
+        # throw it away again.
+        self.gyro.init_from_params(self.params.duration_ms)
+        if self._load_project_motion(proj):
+            log.info(
+                "Project carries its own gyro: %d quaternion(s), %d IMU sample(s)",
+                len(self.gyro.quaternions), len(self.gyro.raw_imu),
+            )
         if gyro_src:
-            t = self.gyro.imu_transforms
-            if "lpf" in gyro_src:
-                t.imu_lpf = float(gyro_src["lpf"] or 0.0)
-            if "mf" in gyro_src:
-                t.imu_mf = int(gyro_src["mf"] or 0)
-            if gyro_src.get("rotation"):
-                t.imu_rotation_angles = tuple(float(v) for v in gyro_src["rotation"])
-            if gyro_src.get("acc_rotation"):
-                t.acc_rotation_angles = tuple(
-                    float(v) for v in gyro_src["acc_rotation"]
-                )
-            if gyro_src.get("imu_orientation"):
-                t.imu_orientation = str(gyro_src["imu_orientation"])
-            if gyro_src.get("gyro_bias"):
-                t.gyro_bias = [float(v) for v in gyro_src["gyro_bias"]]
-            if "integration_method" in gyro_src:
+            self._apply_project_gyro_source(gyro_src)
+            # load_from_telemetry set integration_method from what it loaded;
+            # the project's record of how it was integrated comes after.
+            if len(self.gyro.quaternions) and "integration_method" in gyro_src:
                 self.gyro.integration_method = int(gyro_src["integration_method"])
 
         self.gyro.set_offsets({int(k): float(v) for k, v in proj.offsets.items()})
 
-        self.params.background = tuple(float(v) for v in proj.background_color)
+        # float32 ndarray, not a tuple: `_build_compute_params` copies it with
+        # `.copy()`, which a tuple does not have.
+        self.params.background = np.asarray(
+            proj.background_color, dtype=np.float32
+        )
         self.params.background_mode = proj.background_mode
         self.params.background_margin = proj.background_margin
         self.params.background_margin_feather = proj.background_margin_feather
@@ -456,6 +460,144 @@ class StabilizationManager:
             path, proj.version, len(proj.to_dict()),
         )
 
+    def apply_preset(self, source: str | dict) -> None:
+        """Apply a preset onto the already-loaded clip.
+
+        A Gyroflow preset is a `.gyroflow` whose `videofile` is empty —
+        ``detect_types`` in cli.rs routes exactly that shape to the preset
+        list. `source` may be such a path, an inline JSON object as a string,
+        or an already-parsed dict (upstream's `--preset` accepts a file or
+        the content directly, and rewrites single quotes to double).
+
+        Deliberately *not* applied: `video_info`, and any `offsets`. A preset
+        is meant to be reused across clips, so letting it set the clip's
+        dimensions or its resolved sync offsets would transplant one clip's
+        facts onto another. The render reads the real dimensions from the
+        decoded file anyway, which is why upstream gets away with copying
+        them.
+        """
+        import json
+
+        from pygyroflow.project import GyroflowProject
+
+        if isinstance(source, dict):
+            data = source
+        else:
+            text = str(source)
+            if not text.lstrip().startswith("{"):
+                with open(text, encoding="utf-8") as handle:
+                    text = handle.read()
+            # Strict first; the single-quoted rewrite is only a fallback, so
+            # an apostrophe inside a string value survives.
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                data = json.loads(text.replace("'", '"'))
+
+        proj = GyroflowProject.from_dict(data)
+        if proj.calibration_data:
+            self._apply_project_calibration(proj.calibration_data)
+        if proj.stabilization:
+            self._apply_project_stabilization(proj.stabilization)
+        if proj.gyro_source:
+            self._apply_project_gyro_source(proj.gyro_source)
+
+        if proj.synchronization:
+            # Upstream lands a preset's sync section in the lens profile's
+            # sync_settings (render_queue.rs::update_sync_settings), merged
+            # over whatever the profile already carried.
+            merged = dict(self.lens.sync_settings or {})
+            merged.update(proj.synchronization)
+            self.lens.sync_settings = merged
+
+        if proj.output:
+            project = getattr(self, "project", None)
+            if project is None:
+                project = self.project = GyroflowProject()
+            project.output.update(proj.output)
+
+        log.info(
+            "Applied preset: %s",
+            ", ".join(
+                name
+                for name, section in (
+                    ("calibration_data", proj.calibration_data),
+                    ("stabilization", proj.stabilization),
+                    ("gyro_source", proj.gyro_source),
+                    ("synchronization", proj.synchronization),
+                    ("output", proj.output),
+                )
+                if section
+            )
+            or "no recognised sections",
+        )
+
+    def _load_project_motion(self, proj) -> bool:
+        """Load a project's embedded gyro into the gyro source.
+
+        This is the ``WithGyroData`` / ``WithProcessedData`` case: the project
+        carries its own IMU, so it can be stabilized without the original
+        clip's telemetry (and, for an external ``.gyro``/CSV source, without
+        that file either). ``Simple`` projects carry none and return False.
+
+        Upstream decodes the same four fields into the same struct
+        (``import_gyroflow_data``): ``raw_imu`` and ``quaternions`` as
+        bincode, ``gravity_vectors`` and ``image_orientations`` alongside.
+        """
+        from pygyroflow.gyro_source import FileMetadata
+        from pygyroflow.types.quaternion import Quat64
+        from pygyroflow.types.time_types import TimeIMU
+
+        quats = proj.read_blob("quaternions")
+        raw_imu = proj.read_blob("raw_imu")
+        gravity = proj.read_blob("gravity_vectors")
+        orientations = proj.read_blob("image_orientations")
+        if not (quats or raw_imu or gravity or orientations):
+            return False
+
+        def as_quats(blob):
+            if not blob:
+                return {}
+            return {
+                int(ts): Quat64.from_quaternion(np.asarray(q, dtype=np.float64))
+                for ts, q in blob.items()
+            }
+
+        metadata = FileMetadata(
+            imu_orientation=proj.gyro_source.get("imu_orientation"),
+            raw_imu=[
+                TimeIMU(
+                    timestamp_ms=sample[0],
+                    gyro=sample[1],
+                    accl=sample[2],
+                    magn=sample[3],
+                )
+                for sample in (raw_imu or [])
+            ],
+            quaternions=as_quats(quats),
+            gravity_vectors=(
+                {
+                    int(ts): np.asarray(v, dtype=np.float64)
+                    for ts, v in gravity.items()
+                }
+                if gravity
+                else None
+            ),
+            image_orientations=as_quats(orientations) or None,
+            detected_source=proj.gyro_source.get("detected_source"),
+        )
+        self.gyro.load_from_telemetry(metadata)
+        return True
+
+    def output_options(self) -> dict:
+        """The project's `output` section, for a caller building render options.
+
+        Returns an empty dict when no project has been loaded or created, so
+        `render` options can be merged over it unconditionally.
+        """
+        project = getattr(self, "project", None)
+        return dict(project.output) if project is not None else {}
+
     def _apply_project_calibration(self, calibration_data: dict) -> None:
         """Build a LensProfile from the project's calibration_data."""
         from pygyroflow.lens import LensProfile
@@ -466,6 +608,28 @@ class StabilizationManager:
             log.warning(
                 "Could not load the project's calibration data", exc_info=True
             )
+
+    def _apply_project_gyro_source(self, gyro_src: dict) -> None:
+        """Apply the `gyro_source` section's IMU transforms."""
+        t = self.gyro.imu_transforms
+        if "lpf" in gyro_src:
+            t.imu_lpf = float(gyro_src["lpf"] or 0.0)
+        if "mf" in gyro_src:
+            t.imu_mf = int(gyro_src["mf"] or 0)
+        if gyro_src.get("rotation"):
+            t.imu_rotation_angles = tuple(float(v) for v in gyro_src["rotation"])
+        if gyro_src.get("acc_rotation"):
+            t.acc_rotation_angles = tuple(
+                float(v) for v in gyro_src["acc_rotation"]
+            )
+        if gyro_src.get("imu_orientation"):
+            t.imu_orientation = str(gyro_src["imu_orientation"])
+        if gyro_src.get("gyro_bias"):
+            t.gyro_bias = [float(v) for v in gyro_src["gyro_bias"]]
+        if "integration_method" in gyro_src:
+            self.gyro.integration_method = int(gyro_src["integration_method"])
+        if "sample_index" in gyro_src and gyro_src["sample_index"] is not None:
+            self.gyro.file_load_options.sample_index = int(gyro_src["sample_index"])
 
     def _apply_project_stabilization(self, stab: dict) -> None:
         """Apply the `stabilization` section to params and the smoothing algo."""
@@ -546,18 +710,46 @@ class StabilizationManager:
                 stab["horizon_lock_integration_method"]
             )
 
-    def save_project(self, path: str) -> None:
+    def save_project(self, path: str, project_type: str | None = None) -> None:
         """Write the current state out as a `.gyroflow` project.
 
         Sections the loader kept verbatim are written back unchanged; the
         ones this port owns are rebuilt from live state.
 
+        `project_type` mirrors upstream's `GyroflowProjectType`:
+
+        ``None``
+            Keep whatever payloads the project already carried. The safe
+            default for a load-modify-save round trip.
+        ``"simple"``
+            Drop every embedded motion payload, leaving the settings only —
+            what ``export_gyroflow_data(Simple)`` produces.
+        ``"with_gyro_data"`` / ``"with_processed_data"``
+            Not written yet. They need the `raw_imu` encoder, and a missing
+            `raw_imu` is worse than none: upstream keys its whole compressed
+            branch on whether `raw_imu` is a string, so a project carrying
+            `quaternions` without it loads as empty. These raise rather than
+            emit that.
+
         `app_version` and `date` are stamped from the writer, as upstream's
         `export_gyroflow_data` does — they describe who produced the file,
         so carrying the loaded file's values over would be a false claim.
+
+        Returns:
+            The path actually written. A ``"simple"`` export of a project
+            whose ``videofile`` is empty (i.e. a preset) gets a ``.gyroflow``
+            name; otherwise `path` is used as given.
         """
         import pygyroflow
         from pygyroflow.project import PROJECT_VERSION, GyroflowProject
+
+        if project_type in ("with_gyro_data", "with_processed_data"):
+            raise NotImplementedError(
+                f"project_type={project_type!r} needs the raw_imu and "
+                "file_metadata encoders, which this port does not have yet"
+            )
+        if project_type not in (None, "simple"):
+            raise ValueError(f"Unknown project_type: {project_type!r}")
 
         proj = getattr(self, "project", None) or GyroflowProject()
         self.project = proj
@@ -657,6 +849,9 @@ class StabilizationManager:
         else:
             proj.trim_ranges_ms = []
             proj.trim_start, proj.trim_end = 0.0, 1.0
+
+        if project_type == "simple":
+            proj.strip_motion_payloads()
 
         proj.save(path)
         self.input_file.project_file_url = path
@@ -892,6 +1087,8 @@ class StabilizationManager:
         search_range_ms: float = 500.0,
         use_rs: bool = True,
         progress_callback: Any = None,
+        of_method: int = 2,
+        offset_method: int | None = None,
     ) -> float | None:
         """Auto-synchronize the gyro timeline to the video via optical flow.
 
@@ -957,9 +1154,9 @@ class StabilizationManager:
             camera_matrix=camera_matrix,
             fps=self.params.fps,
             scaled_fps=self.params.get_scaled_fps(),
-            of_method=2,  # DIS: fastest detector
+            of_method=of_method,
             pose_method=0,
-            offset_method=method,
+            offset_method=method if offset_method is None else offset_method,
         )
 
         log.info(

@@ -280,7 +280,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-01 | R | **输出编解码矩阵**。上游 H.264/H.265/AV1/ProRes(6 profile)/DNxHD(8)/CineForm/**EXR 序列**/**PNG 序列**；我们 libx264/libx265/prores_ks(坏)/libaom-av1，另加两个上游没有的（vp9/mpeg4）。**无序列输出**——输入侧做了序列，输出侧仍只有视频 | [实测] |
 | C-02 | R | **逐平面/位深/HDR 管线缺失**。上游按解码器原生格式逐平面处理（NV12/P010/YUV420P10/16、GBRPF32LE、RGB48BE…，`mod.rs:563-651`），按位深设 `pixel_value_limit`；我们 `ffmpeg_processor.py:216` 一律 `to_ndarray("rgb24")` 再编码回 yuv420p。**10/12/16-bit 与浮点输入在稳定化前就被量化到 8bit** | [实测] |
 | C-03 | R | **底层缺像素格式类型**。上游 `pixel_formats.rs` 12 种（含 NV12/P010/AYUV16/RGBAf16/BGRA8 通道交换 + Rec709 full→limited 重映射）；我们 `pixel_formats.py:15-55` 只做 dtype 探测。这是 C-02 的根因 | [报告] |
-| C-04 | R | **trim ranges 渲染时不生效**。`params.trim_ranges` 只有平滑用；`manager.render` 与 `ffmpeg_processor` 完全忽略 → 永远整片渲染。上游 `mod.rs:194-200,278-280` 定位+时间戳重基+`pad_with_black`+`export_trims_separately` | [报告] |
+| C-04 | E | **trim ranges 渲染时不生效**。`params.trim_ranges` 只有平滑用；`manager.render` 与 `ffmpeg_processor` 完全忽略 → 永远整片渲染。上游 `mod.rs:194-200,278-280` 定位+时间戳重基+`pad_with_black`+`export_trims_separately` —— 已实现（`11294ef`） | [实测] |
 | C-05 | R | **帧率控制 / 变速缺失**。上游回调可设 `repeat_times`/`out_timestamp_us`（`mod.rs:460-479`）+ `fps_scale` VFR；我们的回调只读时间戳，`video_speed`/`fps_scale` 渲染时被忽略 | [报告] |
 | C-06 | E | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** —— 已实现（见下），CLI 接线未做 | [实测] |
 | C-07 | E | **容器旋转元数据没读**（见 G-07）—— 已实现（`3aadd0d`） | [实测] |
@@ -381,6 +381,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-07 容器旋转元数据（tkhd 矩阵） | `3aadd0d` | 手工构造 v0/v1 tkhd + 与 `ffmpeg -display_rotation` 三方对齐 |
 | C-01 PNG/EXR 图像序列输出 | `3aadd0d` | 30 帧序列进出帧数一致；EXR 用 `gbrpf32le` |
 | C-06 `.gyroflow` 工程读写 + base91/zlib/bincode/CBOR 编解码 | `1077433` | 两个官方工程 JSON 层往返「缺失键 [] / 变化键 {}」；base91/bincode 与仓库内独立解码器逐字节一致；CBOR 按规范和 nalgebra serde 推导后按位固化 |
+| C-04 渲染时裁剪区间 + 音频同步裁剪 + 逐区间导出 | `11294ef` | 8 组区间组合断言保留帧数与帧内容（帧身份写进画面象限）；输出 pts 相邻差值恒定（无空洞）；回调收到源时间线；带音轨素材裁后音频时长同步变短 |
 
 **实施中新发现的、原清单没有的缺陷**：
 

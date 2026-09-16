@@ -53,6 +53,39 @@ log = logging.getLogger(__name__)
 PROJECT_TITLE = "Gyroflow data file"
 PROJECT_VERSION = 4
 
+
+def resolve_videofile(org_url: str, project_path: str | None, sequence_start: int = 0) -> str:
+    """Rebase a project's stored video path onto the project's own folder.
+
+    A project records an absolute path as it was on the machine that wrote
+    it; move the clip and the project together and the path is stale. Port of
+    ``StabilizationManager::get_new_videofile_url`` (lib.rs): if the recorded
+    path does not exist, look for the same filename next to the project.
+
+    For an image sequence the stored name holds a ``%0Nd`` pattern whose
+    concrete number comes from ``image_sequence_start``. Upstream verifies
+    that concrete frame exists and then returns the *pattern* — which is what
+    the sequence loader wants. Both steps are kept here.
+    """
+    import os
+    import re
+
+    if not org_url or not project_path or os.path.exists(org_url):
+        return org_url
+
+    folder = os.path.dirname(os.path.abspath(project_path))
+    filename = os.path.basename(org_url)
+
+    concrete = filename
+    match = re.search(r"%(\d*)d", filename)
+    if match:
+        width = int(match.group(1) or 1)
+        concrete = filename.replace(match.group(0), f"{sequence_start:0{width}d}")
+
+    if os.path.exists(os.path.join(folder, concrete)):
+        return os.path.join(folder, filename)
+    return org_url
+
 # ``gyro_source`` blobs: base91 + zlib + bincode legacy (util.rs
 # ``compress_to_base91``). These are the ones a "simple" export carries.
 _BINCODE_READERS = {
@@ -309,6 +342,17 @@ class GyroflowProject:
         """
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(_jsonable(self.to_dict()), handle, indent=2, allow_nan=False)
+
+    def strip_motion_payloads(self) -> None:
+        """Drop every embedded motion payload, keeping the settings.
+
+        This is what ``export_gyroflow_data(Simple)`` writes: a project that
+        describes *how* to stabilize but carries no IMU data of its own, and
+        so has to be paired with the original clip (or a separate gyro file)
+        to be usable. Upstream's own presets are this shape.
+        """
+        for name in (*_BINCODE_READERS, *_CBOR_READERS, "file_metadata"):
+            self.gyro_source.pop(name, None)
 
     # ------------------------------------------------------------------
     # Embedded payloads
