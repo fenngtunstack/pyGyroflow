@@ -284,7 +284,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-03 | R | **底层缺像素格式类型**。上游 `pixel_formats.rs` 12 种（含 NV12/P010/AYUV16/RGBAf16/BGRA8 通道交换 + Rec709 full→limited 重映射）；我们 `pixel_formats.py:15-55` 只做 dtype 探测。这是 C-02 的根因 | [报告] |
 | C-04 | E | **trim ranges 渲染时不生效**。`params.trim_ranges` 只有平滑用；`manager.render` 与 `ffmpeg_processor` 完全忽略 → 永远整片渲染。上游 `mod.rs:194-200,278-280` 定位+时间戳重基+`pad_with_black`+`export_trims_separately` —— 已实现（`11294ef`） | [实测] |
 | C-05 | E | **帧率控制 / 变速缺失**。上游回调可设 `repeat_times`/`out_timestamp_us`（`mod.rs:460-479`）+ `fps_scale` VFR；我们的回调只读时间戳，`video_speed`/`fps_scale` 渲染时被忽略 —— 已实现（`6a95077`），两个机制分开：`video_speed` 改帧数、`fps_scale` 只改查询时间戳 | [实测] |
-| C-06 | E | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** —— 读写层与 CLI 接线都已实现（`1077433`、`e7fb663`）；余下只有 `--export-project` 的 2/3 模式（需 `raw_imu`/`file_metadata` 编码器）。**另**：CBOR 编码器此前只有「按规范 + nalgebra serde 推导」的验证，已找到真机 `WithProcessedData` 导出（`DJI_20260507160359_0005_D.gyroflow`，25185 样本）并据此修掉一处浮点宽度错误（`b590c4b`）；`file_metadata` 这一唯一的大块此前无参照，现在也可以它为准 | [实测] |
+| C-06 | E | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** —— 读写层与 CLI 接线都已实现（`1077433`、`e7fb663`）；`file_metadata` 的读与写也已补齐（`ef8801d`），余下只有 `--export-project` 的 2/3 模式（还差 `raw_imu`/`gravity_vectors` 的 bincode 写侧）。**另**：CBOR 编码器此前只有「按规范 + nalgebra serde 推导」的验证，已找到真机 `WithProcessedData` 导出（`DJI_20260507160359_0005_D.gyroflow`，25185 样本）并据此修掉一处浮点宽度错误（`b590c4b`）；`file_metadata` 这一唯一的大块此前无参照，现在也可以它为准 | [实测] |
 | C-07 | E | **容器旋转元数据没读**（见 G-07）—— 已实现（`3aadd0d`） | [实测] |
 | C-08 | R | 无 GPU 解码/编码（上游 `ffmpeg_hw.rs` 412 行 + 各平台 interop）；无 GPU 解码重试阶梯、无像素格式回退 | [报告] |
 | C-09 | R | 渲染健壮性：上游写 `.tmp` 再改名、拷贝容器元数据/timecode、清残留 `%Nd` 文件、保持系统唤醒；我们直接写目标路径、无元数据 | [报告] |
@@ -388,6 +388,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | G-10 视觉角速度信号：中点时间戳 + 失败帧欧拉角插值 + 可选低通 | `0420488` | 中点用 1 ms 等距夹具断言精确值、30fps 用规则断言；缺口按位置加权插值（中点=均值）且首尾不外推；低通使单帧尖峰幅度降到 60% 以下且时间戳不变 |
 | C-05 渲染时变速与 `fps_scale` | `6a95077` | `video_speed` 2.0 出 6/12 帧且留下的正是奇数帧、0.5 出 22 帧、4.0 出 3 帧；`fps_scale=2` 帧数不变且查询时间戳被 spy 证实为 `ts/2`；变速时自动丢弃音轨 |
 | D-01 逐时间戳镜头数据（`lens_positions`/`lens_params`/`digital_zoom`/`invert_asym_lens`）+ `MapClosest`、D-11 逐帧 `camera_diagonal_fovs`、D-07 读出时间按裁切缩放 | `3be3629` | 真素材：`a7s3-sony85mm` 450 包里 200 个带 `0x8005`，每个都是 85.0 mm（15015 条 IMU 行）；`rx100-7-ois-only` 无该标签、map 为空。`ClosestMap` 的等距返回 None、严格 `<` 上限、缺席侧 −99999 哨兵逐条断言；`stretch_lens` 门控与主点重置；`lens_params` 多于一项才逐帧算 FOV |
+| C-06 余下（前半）：`file_metadata` 的 CBOR 编解码 + `WithProcessedData` 工程的载入路径 + readout 方向解析 | `ef8801d` | ciborium 逐字节对照全部 19 个字段（scratch crate 用真 ciborium 0.2.2 生成，`--check` 可一键复查 fixture 是否同步）；**真机工程 1059160 字节整块逐字节往返**（四元数须以原始分量喂编码器，`Quat64` 构造时会归一化，偏差上界 2.2e-16 已单独断言）；另用真工程验证载入后拿到 25185 个四元数、`lens_profile`、`additional_data` 与 readout 时间/方向 |
 | D-08 焦距平滑（两个滤波器 + strength 映射 + fov 补偿 + FOV 缓存键） | `cb606bb` | **与上游 Rust 逐位一致**：上游 `focal_length.rs` 原样拷进临时 crate、只新写 `main()`，22 个用例全 `max_rel = 0.0`；生成脚本复现的驱动脚本与实跑逐字节相同，fixture 明确标注非自生成。接线在恒等陀螺下按 `矩阵[0,0] = fov/相机fx` 的比值断言补偿量本身 |
 
 **实施中新发现的、原清单没有的缺陷**：
@@ -398,6 +399,11 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 - `zooming.get_checksum` 少哈希两个字段。上游 `zooming/mod.rs:91-92` 把 `focal_length_smoothing_enabled` 和 `_strength` 都算进 FOV 缓存键；我们只哈希了 `distortion_coeffs`/尺寸/`max_zoom`/`trim_ranges`/`video_rotation`/`adaptive_zoom_window`。后果是**改了焦距平滑滑块不会让 FOV 缓存失效**——重渲染静默沿用旧变焦，看起来"滑块没反应"。已补齐（`cb606bb`）。
 - **CBOR 浮点宽度写错**。`_cbor_f64` 一律写 8 字节，`ciborium` 却把能在半精度/单精度里精确表示的值写窄。此前只对着 CBOR 规范和 nalgebra 的 serde 推导，没有外部参照，所以没人发现——读侧完全不受影响（cbor2 任何宽度都认），只有拿真字节比才看得出来。在一个真的 `WithProcessedData` 工程上现形：25385 个时间戳差 934 字节。规则按文件反推为「取能精确容下该值的最窄形式，半精度优先于单精度」——反过来的优先级会错 9 个值。已修（`b590c4b`），四个载荷全部逐字节一致。
 - **这条顺带说明此前 C-06 的 CBOR 验证不够**。原验证是「按规范和 nalgebra serde 推导后按位固化」，即自证；真文件证明推导在一个细节上（浮点宽度）是错的。现在有了外部参照。
+
+**做 file_metadata 读取时新发现的两处**（都是拿真机工程跑出来的）：
+
+- **`WithProcessedData` 工程读进来是空的**。`_load_project_motion` 只认 `gyro_source` 里的 bincode 块；真机 1.6.3 导出的那四个字段全是 `null`，陀螺在 `file_metadata`（CBOR）与 `integrated_quaternions`（CBOR）里。实测：一个带 25185 个样本的真工程载入后陀螺数 **0**。此前没发现，是因为手工验证用的参考工程四个字段恰好全是 `null`，"看起来是对的"。已按上游的分支顺序补齐（`ef8801d`）。
+- **`stabilization.frame_readout_direction` 按整数解析，真机写的是枚举名字**。我们写 `ReadoutDirection(int(...))`，真机导出是 `"TopToBottom"`（serde 对 unit enum 的默认行为）→ 解析失败 → 静默回落到默认方向 → **滚动快门按错方向扣**。上游两条都吃（`as_i64` 再 `as_str`）。同处还漏了上游的隐含规则：`frame_readout_time` 为负表示 BottomToTop，且**保留符号**（我们载入时就 `abs()` 了，符号信息丢失）。已一并修（`ef8801d`）。
 
 **做 C-06 时新发现的缺陷**：
 
@@ -456,7 +462,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | B-01/B-02 offset method 0/1 | 两套算法 |
 | B-23 OptimSync 尺度 | **先量新尺度再重标定阈值** |
 | C-02/C-03 位深/HDR 管线 | 需先补像素格式类型 |
-| C-06 余下：CLI 吃工程文件/preset、`file_metadata`/`raw_imu` 写出 | 读写层已就绪，缺接线 |
+| C-06 余下：`--export-project` 2/3 模式 | `file_metadata` 与全部 CBOR 缓存已可写（`ef8801d`），还差 `raw_imu`/`gravity_vectors` 的 bincode 写侧 |
 | C-01 序列输出 | 与已完成的序列输入对称 |
 
 ---
