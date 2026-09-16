@@ -5,11 +5,13 @@ Here we use OpenCV's AKAZE with the same overall pipeline:
 
 1.  Detect keypoints and compute binary descriptors on each frame.
 2.  KNN-match descriptors (k=2).
-3.  Apply Lowe's ratio test (threshold 0.7) to reject ambiguous matches.
+3.  Apply Lowe's ratio test to reject ambiguous matches.
 4.  Return surviving point pairs.
 
-The descriptor threshold is tunable via the constructor; lower values yield
-more keypoints at higher computational cost.
+Constants mirror upstream ``OFAkaze`` (akaze.rs): detector threshold 0.0007,
+at most 200 features, and a Lowe ratio of 0.5. The ratio used to be 0.7
+here, which admits far more ambiguous matches — at 0.5 a match only counts
+when the runner-up is at least twice as far.
 """
 
 from __future__ import annotations
@@ -24,15 +26,24 @@ from pygyroflow.synchronization.optical_flow.base import OpticalFlowDetector
 
 logger = logging.getLogger(__name__)
 
-# Minimum number of matched pairs required to produce a valid result.
+# Upstream's constants (akaze.rs).
+_THRESHOLD = 0.0007
+_MAX_FEATURES = 200
+_LOWES_RATIO = 0.5
+
+# Minimum number of matched pairs required to produce a valid result. This
+# floor is ours, not upstream's (which only requires 2 descriptors on each
+# side); the callers discard results below 10 points anyway.
 _MIN_MATCHES = 10
 
 
 class AKazeDetector(OpticalFlowDetector):
     """AKAZE-based optical flow detector using OpenCV."""
 
-    def __init__(self, threshold: float = 0.001) -> None:
-        self._detector = cv2.AKAZE_create(threshold=threshold)
+    def __init__(self, threshold: float = _THRESHOLD) -> None:
+        self._detector = cv2.AKAZE_create(
+            threshold=threshold, max_points=_MAX_FEATURES
+        )
         self._matcher = cv2.DescriptorMatcher_create(
             cv2.DESCRIPTOR_MATCHER_BRUTEFORCE_HAMMING,
         )
@@ -75,7 +86,7 @@ class AKazeDetector(OpticalFlowDetector):
             if len(m_pair) < 2:
                 continue
             m, n = m_pair
-            if m.distance < 0.7 * n.distance:
+            if m.distance < _LOWES_RATIO * n.distance:
                 good_indices.append((m.queryIdx, m.trainIdx))
 
         if len(good_indices) < _MIN_MATCHES:

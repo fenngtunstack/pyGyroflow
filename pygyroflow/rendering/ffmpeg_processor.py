@@ -301,28 +301,40 @@ class FfmpegProcessor(VideoProcessor):
 
         def decode_loop():
             seq = 0
+            aborted = False
             try:
                 for packet in self._input_container.demux(self._input_stream):
                     if stop.is_set():
+                        aborted = True
                         break
                     if packet.dts is None:
                         continue
                     for frame in packet.decode():
-                        if not _put_unless_failed(decode_q, to_item(frame, seq), fail, stop):
+                        if not _put_unless_failed(
+                            decode_q, to_item(frame, seq), fail, stop
+                        ):
+                            aborted = True
                             return
                         seq += 1
-                # Flush the threaded decoder (trailing buffered frames).
-                for frame in self._input_stream.decode():
-                    if not _put_unless_failed(decode_q, to_item(frame, seq), fail, stop):
-                        return
-                    seq += 1
+                if not aborted:
+                    # Flush the threaded decoder (trailing buffered frames).
+                    for frame in self._input_stream.decode():
+                        if not _put_unless_failed(
+                            decode_q, to_item(frame, seq), fail, stop
+                        ):
+                            aborted = True
+                            return
+                        seq += 1
             except Exception as exc:  # surfaced to the main loop
                 fail.append(exc)
+                aborted = True
             finally:
-                # Drained first so this put cannot block: on the normal path
-                # the queue is already empty, on an aborted one its contents
-                # are stale. The main loop is guaranteed to see _DONE.
-                _drain(decode_q)
+                if aborted:
+                    # The main loop is gone or going: drop what is queued so
+                    # this put cannot block. On the normal path the queue
+                    # still holds frames the main loop has not read yet —
+                    # draining there would silently lose the tail.
+                    _drain(decode_q)
                 decode_q.put(_DONE)
 
         # Encoder failures (a bad pix_fmt, an unavailable encoder) happen on

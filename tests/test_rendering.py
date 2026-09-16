@@ -135,3 +135,50 @@ class TestEncoderFailureSurfaces:
         with pytest.raises(VideoIOError):
             proc.process_frames(lambda img, ts, idx: img)
         proc.close()
+
+
+class TestFrameCountPreserved:
+    """Every decoded frame must reach the encoder.
+
+    The decode, stabilize and encode stages are connected by bounded queues,
+    and the decode thread must not discard queued frames when it finishes —
+    the tail would be lost (a 30-frame sequence came out as 24: exactly the
+    6-deep queue's worth).
+    """
+
+    @staticmethod
+    def _render(src, out, frames):
+        proc = FfmpegProcessor()
+        proc.open_input(str(src))
+        proc.create_output(str(out), 64, 48, 30.0, codec="H.264/AVC")
+        proc.process_frames(lambda img, ts, idx: img)
+        proc.close()
+
+    @staticmethod
+    def _count(path):
+        av = pytest.importorskip("av")
+        with av.open(str(path)) as container:
+            return sum(1 for _ in container.decode(video=0))
+
+    @pytest.mark.parametrize("frames", [1, 5, 6, 7, 30, 61])
+    def test_every_frame_survives(self, tmp_path, frames):
+        src = tmp_path / "in.mp4"
+        _write_source(src, frames=frames)
+        out = tmp_path / "out.mp4"
+        self._render(src, out, frames)
+        assert self._count(out) == frames
+
+    def test_encode_failure_still_reports_after_tail_frames(self, tmp_path, monkeypatch):
+        """The abort path must not be needed to get the frames out."""
+        src = tmp_path / "in.mp4"
+        _write_source(src, frames=30)
+        out = tmp_path / "out.mp4"
+        from pygyroflow.rendering import ffmpeg_processor as mod
+
+        monkeypatch.setitem(mod._PIX_FMT_MAP, "libx264", "xyz12le")
+        proc = FfmpegProcessor()
+        proc.open_input(str(src))
+        proc.create_output(str(out), 64, 48, 30.0, codec="H.264/AVC")
+        with pytest.raises(VideoIOError):
+            proc.process_frames(lambda img, ts, idx: img)
+        proc.close()

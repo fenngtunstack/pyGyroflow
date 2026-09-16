@@ -38,7 +38,9 @@ class DISDetector(OpticalFlowDetector):
     """Dense Inverse Search optical flow using OpenCV."""
 
     def __init__(self) -> None:
-        self._flow = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+        # Upstream uses DISOpticalFlow_PRESET_FAST (opencv_dis.rs); MEDIUM
+        # changes both the flow quality and the cost.
+        self._flow = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
 
     # ------------------------------------------------------------------
     # OpticalFlowDetector interface
