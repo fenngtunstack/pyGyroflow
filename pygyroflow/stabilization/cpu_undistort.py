@@ -21,6 +21,7 @@ Semantics mirrored from upstream ``undistort_coord`` + ``rotate_and_distort``:
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 from numpy.typing import NDArray
@@ -471,3 +472,357 @@ def cpu_undistort(
     if channels == 1 and output.ndim == 2:
         output = output[:, :, np.newaxis]
     return output
+
+
+# ----------------------------------------------------------------------
+# The per-point path
+# ----------------------------------------------------------------------
+#
+# Everything below answers a different question from `cpu_undistort` above: not
+# "what does this output pixel sample?" but "where did this image point end
+# up?". Callers that work in points — the autosync optical-flow sampler, the
+# adaptive-zoom polygon, the STMap exporter — used to do their own, simpler
+# version of this on distorted coordinates, which is why their results
+# disagreed with the render.
+#
+# On precision: upstream runs this family in `f32` (the rotation is converted
+# to a float matrix, and the distortion models take `(f32, f32)`). This port
+# keeps the doubles the rest of its Python side uses. The algorithm and the
+# branch structure are upstream's; the results agree to single precision, not
+# bit for bit.
+
+# What upstream returns for a point that will not converge, instead of
+# raising: its callers drop those points and keep the rest.
+_POINT_FAILURE = (-1000000.0, -1000000.0)
+
+
+def _points_kernel_params(
+    camera_matrix, distortion_coeffs, params, light_refraction_coefficient
+) -> KernelParams:
+    """The minimal KernelParams the distortion models need for one point.
+
+    Deliberately not the full set: upstream builds a fresh one here too, and
+    the models only read the intrinsics, the coefficients and the refraction
+    factor.
+    """
+    import ctypes
+
+    kernel_params = KernelParams()
+    kernel_params.width = int(params.width)
+    kernel_params.height = int(params.height)
+    kernel_params.output_width = int(params.output_width)
+    kernel_params.output_height = int(params.output_height)
+    kernel_params.f = (ctypes.c_float * 2)(
+        float(camera_matrix[0][0]), float(camera_matrix[1][1])
+    )
+    kernel_params.c = (ctypes.c_float * 2)(
+        float(camera_matrix[0][2]), float(camera_matrix[1][2])
+    )
+    coeffs = [float(x) for x in distortion_coeffs]
+    while len(coeffs) < 12:
+        coeffs.append(0.0)
+    kernel_params.k1 = (ctypes.c_float * 4)(*coeffs[0:4])
+    kernel_params.k2 = (ctypes.c_float * 4)(*coeffs[4:8])
+    kernel_params.k3 = (ctypes.c_float * 4)(*coeffs[8:12])
+    kernel_params.light_refraction_coefficient = float(light_refraction_coefficient)
+    return kernel_params
+
+
+def _input_stretch(params) -> tuple[float, float]:
+    """The stretch factors the points are expressed in.
+
+    Read from the static lens, as upstream's ``undistort_points`` does — which
+    is *not* what the image path uses. ``FrameTransform.at_timestamp`` takes
+    the per-frame stretch that ``get_lens_data_at_timestamp`` returns; the
+    points path drops it. The two differ only for a clip whose calibration
+    changes mid-flight, and upstream prefers the static value here, so this
+    does too rather than quietly reconciling them.
+    """
+    lens = params.lens
+    if lens is None:
+        return params.input_horizontal_stretch, params.input_vertical_stretch
+    return (
+        getattr(lens, "input_horizontal_stretch", 1.0) or 1.0,
+        getattr(lens, "input_vertical_stretch", 1.0) or 1.0,
+    )
+
+
+def _apply_mesh(x: float, y: float, mesh, params) -> tuple[float, float]:
+    """Focal-plane distortion, and the full mesh table on top of it.
+
+    Both live in the same buffer and are gated by its first word: a positive
+    header means "this many words of focal-plane table follow", and a value
+    above 10 means a full mesh is present as well. The remapping in and out of
+    the crop area is part of the format, not an implementation detail — the
+    table is indexed by grid cell, not by pixel.
+    """
+    from pygyroflow.util import map_coord
+
+    mesh_size = (mesh[3], mesh[4])
+    origin = (mesh[5], mesh[6])
+    crop_size = (mesh[7], mesh[8])
+
+    if mesh[0] > 0.0 and mesh[int(mesh[0])] > 0.0:
+        offset = int(mesh[0])  # first word = offset to the focal-plane table
+        stabilization_grid = mesh_size[1] / 8.0
+
+        x = map_coord(x, 0.0, float(params.width), origin[0], origin[0] + crop_size[0])
+        y = map_coord(y, 0.0, float(params.height), origin[1], origin[1] + crop_size[1])
+
+        index = int(min(max(math.floor(y / stabilization_grid), 0.0), 7.0))
+        delta = y - stabilization_grid * index
+        x += float(mesh[offset + 4 + index * 2 + 0]) * delta
+        y += float(mesh[offset + 4 + index * 2 + 1]) * delta
+        for j in range(index):
+            x += float(mesh[offset + 4 + j * 2 + 0]) * stabilization_grid
+            y += float(mesh[offset + 4 + j * 2 + 1]) * stabilization_grid
+
+        x = map_coord(x, origin[0], origin[0] + crop_size[0], 0.0, float(params.width))
+        y = map_coord(y, origin[1], origin[1] + crop_size[1], 0.0, float(params.height))
+
+    if mesh[0] > 10.0:
+        from pygyroflow.gyro_source.splines import interpolate_mesh
+
+        x = map_coord(x, 0.0, float(params.width), origin[0], origin[0] + crop_size[0])
+        y = map_coord(y, 0.0, float(params.height), origin[1], origin[1] + crop_size[1])
+
+        new_x, new_y = interpolate_mesh(x, y, (mesh_size[0], mesh_size[1]), mesh)
+
+        x = map_coord(new_x, origin[0], origin[0] + crop_size[0], 0.0, float(params.width))
+        y = map_coord(new_y, origin[1], origin[1] + crop_size[1], 0.0, float(params.height))
+
+    return x, y
+
+
+def _partial_correction(
+    pt, c, f, params, kernel_params, model, digital_lens, lens_correction_amount
+):
+    """Blend the corrected point back toward the uncorrected one.
+
+    Port of the ``lens_correction_amount < 1`` branch: re-distort the corrected
+    point and mix. This is what the "lens correction strength" slider does —
+    at 1 the distortion is fully removed, at 0 the output keeps the original
+    look — and the mixing happens in distorted coordinates, so it cannot be a
+    linear blend of the two endpoints.
+    """
+    stretch_x, stretch_y = _input_stretch(params)
+    out_c = [params.output_width / 2.0, params.output_height / 2.0]
+    if stretch_x > 0.001:
+        out_c[0] /= stretch_x
+    if stretch_y > 0.001:
+        out_c[1] /= stretch_y
+
+    new_pt = ((pt[0] - out_c[0]) / f[0], (pt[1] - out_c[1]) / f[1])
+
+    weight = 1.0
+    refraction = kernel_params.light_refraction_coefficient
+    if refraction != 1.0 and refraction > 0.0:
+        radius = math.sqrt(new_pt[0] ** 2 + new_pt[1] ** 2) / weight
+        sin_theta_d = (radius / math.sqrt(1.0 + radius * radius)) * refraction
+        r_d = sin_theta_d / math.sqrt(1.0 - sin_theta_d * sin_theta_d)
+        if r_d != 0.0:
+            weight *= radius / r_d
+
+    new_pt = model.distort_point(new_pt[0], new_pt[1], weight, kernel_params)
+    new_pt = (new_pt[0] * f[0] + out_c[0], new_pt[1] * f[1] + out_c[1])
+
+    if digital_lens is not None:
+        new_pt = digital_lens.distort_point(new_pt[0], new_pt[1], 1.0, kernel_params)
+        if digital_lens.id() in (
+            "gopro_superview", "gopro6_superview", "gopro_hyperview"
+        ):
+            # Upstream's own comment says this is wrong but works. Kept as-is:
+            # it is what the SuperView/HyperView look is calibrated against.
+            size = (float(params.width), float(params.height))
+            new_pt = (new_pt[0] / size[0] - 0.5, new_pt[1] / size[1] - 0.5)
+            if digital_lens.id() in ("gopro_superview", "gopro6_superview"):
+                new_pt = (new_pt[0] * 0.91, new_pt[1])
+            else:
+                new_pt = (new_pt[0] * 0.81, new_pt[1])
+            new_pt = ((new_pt[0] + 0.5) * size[0], (new_pt[1] + 0.5) * size[1])
+
+    amount = lens_correction_amount
+    return (
+        new_pt[0] * (1.0 - amount) + pt[0] * amount,
+        new_pt[1] * (1.0 - amount) + pt[1] * amount,
+    )
+
+
+def undistort_points(
+    distorted,
+    camera_matrix,
+    distortion_coeffs,
+    rotation,
+    p=None,
+    rot_per_point=None,
+    params=None,
+    lens_correction_amount: float = 1.0,
+    timestamp_ms: float = 0.0,
+    shift_per_point=None,
+    mesh=None,
+) -> list[tuple[float, float]]:
+    """Map image points through the lens into stabilized output coordinates.
+
+    Port of ``cpu_undistort.rs::undistort_points``, which follows OpenCV's
+    ``undistortPoints`` for fisheye and then adds everything Gyroflow needs on
+    top: the digital lens, a focal-plane/mesh correction, the camera's own IBIS
+    and OIS displacement, a per-point rotation for rows exposed at different
+    times, light refraction, and a blend back toward the uncorrected position
+    when the lens correction is dialled down.
+
+    A point that does not converge comes back as ``(-1000000, -1000000)``.
+    """
+    from pygyroflow.keyframes.types import KeyframeType
+    from pygyroflow.stabilization.distortion_models import from_name as model_from_name
+
+    c = (float(camera_matrix[0][2]), float(camera_matrix[1][2]))
+    f = (float(camera_matrix[0][0]), float(camera_matrix[1][1]))
+
+    rr = np.asarray(rotation, dtype=np.float64)
+    if p is not None:
+        rr = np.asarray(p, dtype=np.float64) @ rr
+
+    light_refraction_coefficient = float(params.light_refraction_coefficient)
+    if params.keyframes:
+        value = params.keyframes.value_at_video_timestamp(
+            KeyframeType.LightRefractionCoeff, timestamp_ms
+        )
+        if value is not None:
+            light_refraction_coefficient = float(value)
+
+    kernel_params = _points_kernel_params(
+        camera_matrix, distortion_coeffs, params, light_refraction_coefficient
+    )
+
+    model = model_from_name(params.distortion_model_name or "opencv_fisheye")
+    digital_lens = params.digital_lens
+    stretch_x, stretch_y = _input_stretch(params)
+    result: list[tuple[float, float]] = []
+
+    for index, point in enumerate(distorted):
+        x = float(point[0])
+        y = float(point[1])
+        if stretch_x > 0.001:
+            x *= stretch_x
+        if stretch_y > 0.001:
+            y *= stretch_y
+
+        if digital_lens is not None:
+            moved = digital_lens.undistort_point(x, y, kernel_params)
+            if moved is not None:
+                x, y = moved
+
+        if mesh is not None:
+            x, y = _apply_mesh(x, y, mesh, params)
+
+        if shift_per_point is not None and index < len(shift_per_point):
+            shift = shift_per_point[index]
+            angle = shift[2]
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            x = x - c[0] - shift[3] + shift[0]
+            y = y - c[1] - shift[4] + shift[1]
+            x, y = cos_a * x - sin_a * y + c[0], sin_a * x + cos_a * y + c[1]
+
+        # Normalised units, which is what the distortion models take.
+        pw = ((x - c[0]) / f[0], (y - c[1]) / f[1])
+
+        if rot_per_point is not None and index < len(rot_per_point):
+            point_rotation = np.asarray(rot_per_point[index], dtype=np.float64)
+        else:
+            point_rotation = rr
+
+        pt = model.undistort_point(pw[0], pw[1], kernel_params)
+        if pt is None:
+            result.append(_POINT_FAILURE)
+            continue
+
+        if light_refraction_coefficient != 1.0 and light_refraction_coefficient > 0.0:
+            radius = math.sqrt(pt[0] ** 2 + pt[1] ** 2)
+            if radius != 0.0:
+                sin_theta_d = (radius / math.sqrt(1.0 + radius * radius)) / (
+                    light_refraction_coefficient
+                )
+                r_d = sin_theta_d / math.sqrt(1.0 - sin_theta_d * sin_theta_d)
+                factor = r_d / radius
+                pt = (pt[0] * factor, pt[1] * factor)
+
+        # Reproject through the point's rotation (which the caller has already
+        # folded the output matrix into).
+        projected = point_rotation @ np.array([pt[0], pt[1], 1.0], dtype=np.float64)
+        if projected[2] == 0.0:
+            result.append(_POINT_FAILURE)
+            continue
+        pt = (projected[0] / projected[2], projected[1] / projected[2])
+
+        if lens_correction_amount < 1.0:
+            pt = _partial_correction(
+                pt, c, f, params, kernel_params, model, digital_lens,
+                lens_correction_amount,
+            )
+
+        result.append((float(pt[0]), float(pt[1])))
+
+    return result
+
+
+def undistort_points_with_rolling_shutter(
+    distorted, timestamp_ms: float, frame=None, params=None,
+    lens_correction_amount: float = 1.0, use_fovs: bool = True,
+) -> list[tuple[float, float]]:
+    """Undistort points for one frame, rolling shutter included.
+
+    Port of ``undistort_points_with_rolling_shutter``. This is the entry point
+    most callers want: it asks :func:`at_timestamp_for_points
+    <pygyroflow.stabilization.frame_transform.at_timestamp_for_points>` for the
+    per-point rotations and then runs :func:`undistort_points` with them — each
+    point is rotated by the orientation at *its own* row's exposure, which is
+    the whole reason a fisheye and a rolling shutter interact.
+    """
+    from pygyroflow.stabilization.frame_transform import at_timestamp_for_points
+
+    if not distorted:
+        return []
+
+    camera_matrix, coeffs, _new_k, rotations, shifts, mesh = at_timestamp_for_points(
+        params, distorted, timestamp_ms, frame, use_fovs
+    )
+    return undistort_points(
+        distorted, camera_matrix, coeffs, rotations[0],
+        p=np.eye(3),
+        rot_per_point=rotations,
+        params=params,
+        lens_correction_amount=lens_correction_amount,
+        timestamp_ms=timestamp_ms,
+        shift_per_point=shifts,
+        mesh=mesh,
+    )
+
+
+def undistort_points_for_optical_flow(
+    distorted, timestamp_us: int, params, points_dims: tuple[int, int]
+) -> list[tuple[float, float]]:
+    """Undistort points sampled for optical flow, in the flow's own scale.
+
+    Port of ``undistort_points_for_optical_flow``. The difference from the
+    render path is the *scale*: optical flow runs on a downscaled frame, so the
+    points are expressed against ``points_dims`` while the calibration is
+    against the full frame — the matrix is scaled to match, and no rotation and
+    no stabilization is applied. This is the call that puts the flow's feature
+    points into undistorted coordinates, which the offset search then assumes.
+    """
+    from pygyroflow.stabilization.frame_transform import _get_lens_data_at_timestamp
+
+    image_dim_ratio = points_dims[0] / max(1, params.width)
+
+    camera_matrix, coeffs, _, _, _, _ = _get_lens_data_at_timestamp(
+        params, timestamp_us / 1000.0, False
+    )
+    scaled_k = np.asarray(camera_matrix, dtype=np.float64) * image_dim_ratio
+
+    return undistort_points(
+        distorted, scaled_k, coeffs, np.eye(3),
+        p=None, rot_per_point=None, params=params,
+        lens_correction_amount=1.0, timestamp_ms=timestamp_us / 1000.0,
+        shift_per_point=None, mesh=None,
+    )

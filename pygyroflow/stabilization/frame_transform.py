@@ -26,6 +26,8 @@ from pygyroflow.types.enums import BackgroundMode, Interpolation, ReadoutDirecti
 from pygyroflow.types.kernel_params import KernelParams
 from pygyroflow.types.quaternion import Quat64
 from pygyroflow.gyro_source.source import GyroSource
+from pygyroflow.gyro_source.splines import as_catmull_rom
+from pygyroflow.util import frame_at_timestamp, map_coord
 from pygyroflow.keyframes.types import KeyframeType as KT
 from pygyroflow.stabilization.compute_params import ComputeParams
 
@@ -384,6 +386,189 @@ def _radial_limit_for(model_name: str, distortion_coeffs: list[float]) -> float:
     except Exception:
         return 0.0
     return 0.0 if result is None else float(result)
+
+
+def _points_field(source, name, default=None):
+    """Read a field from a decoded dict or from a dataclass.
+
+    The mesh and IBIS records arrive one of two ways: built by the telemetry
+    parser, or decoded straight out of a project file's CBOR, where this port
+    keeps them as raw dicts because it does not model every nested struct.
+    """
+    if isinstance(source, dict):
+        return source.get(name, default)
+    return getattr(source, name, default)
+
+
+def _sample_spline(spline, position: float) -> np.ndarray:
+    """A curve sample, or zeros outside the control points.
+
+    Zero is what upstream's ``interpolate(...).unwrap_or_default()`` gives,
+    and it is the right answer: no curve means no displacement to apply.
+    """
+    if spline is None:
+        return np.zeros(3)
+    value = spline.interpolate(position)
+    if value is None:
+        return np.zeros(3)
+    return np.asarray(value, dtype=np.float64)
+
+
+def _shift_per_point(params: ComputeParams, points, frame: int):
+    """IBIS and OIS displacement for each point, from the gyro's stab data.
+
+    Port of the ``shifts`` half of ``at_timestamp_for_points``. The splines are
+    expressed in the sensor's own coordinates for the crop area the camera
+    reported, so the row is remapped into that crop before the lookup and the
+    result is scaled back into image pixels.
+
+    Returns None when the frame has no stabilization data — upstream then
+    leaves the shift at zero, which is also what ``unwrap_or_default()`` on a
+    spline outside its range gives.
+    """
+    if not params.camera_stab_data:
+        return None
+    if frame >= len(params.camera_stab_data):
+        return None
+    stab = params.camera_stab_data[frame]
+    if stab is None:
+        return None
+
+    crop_area = _points_field(stab, "crop_area")
+    pixel_pitch = _points_field(stab, "pixel_pitch")
+    if not crop_area or not pixel_pitch:
+        return None
+
+    ibis = as_catmull_rom(_points_field(stab, "ibis_spline"))
+    ois = as_catmull_rom(_points_field(stab, "ois_spline"))
+    if ibis is None and ois is None:
+        return None
+    offset = float(_points_field(stab, "offset", 0.0) or 0.0)
+
+    is_scale = (
+        params.width / float(crop_area[2]) / float(pixel_pitch[0]),
+        params.height / float(crop_area[3]) / float(pixel_pitch[1]),
+    )
+    shifts = []
+    for point in points:
+        sensor_y = map_coord(
+            float(point[1]), 0.0, float(params.height),
+            float(crop_area[1]), float(crop_area[1]) + float(crop_area[3]),
+        )
+        s = _sample_spline(ibis, sensor_y + offset)
+        o = _sample_spline(ois, sensor_y + offset)
+        shifts.append((
+            float(s[0] * is_scale[0]),
+            float(s[1] * is_scale[1]),
+            float(np.deg2rad(s[2] / 1000.0)),
+            float(o[0] * is_scale[0]),
+            float(o[1] * is_scale[1]),
+        ))
+    return shifts
+
+
+def at_timestamp_for_points(
+    params: ComputeParams,
+    points,
+    timestamp_ms: float,
+    frame: int | None = None,
+    use_fovs: bool = True,
+):
+    """Per-point transforms, for callers that sample specific pixels.
+
+    Port of ``FrameTransform::at_timestamp_for_points``. The image path
+    (:meth:`FrameTransform.at_timestamp`) computes one matrix per *row*; this
+    computes one per *point*, at that point's own exposure instant, and adds
+    the IBIS/OIS displacement and mesh correction that only make sense
+    per-pixel.
+
+    Returns ``(scaled_k, distortion_coeffs, new_k, rotations, shifts, mesh)``:
+    the intrinsic matrix the points were captured through, the coefficients,
+    the output matrix, and then three per-point extras that can each be None.
+    """
+    video_rotation = params.video_rotation
+    if params.keyframes:
+        value = params.keyframes.value_at_video_timestamp(KT.VideoRotation, timestamp_ms)
+        if value is not None:
+            video_rotation = value
+
+    if frame is None:
+        frame = frame_at_timestamp(timestamp_ms, params.scaled_fps)
+
+    # The stretch values this returns are deliberately dropped: the points
+    # path uses the lens's static ones below, exactly as upstream does.
+    (camera_matrix, distortion_coeffs, _, _, _, _) = _get_lens_data_at_timestamp(
+        params, timestamp_ms, params.framebuffer_inverted
+    )
+
+    fov = _get_fov(params, frame, use_fovs, timestamp_ms, False) * (
+        _focal_length_fov_compensation(params, frame)
+    )
+    new_k = _get_new_k(params, camera_matrix, fov)
+
+    mesh = None
+    if params.mesh_correction and frame < len(params.mesh_correction):
+        entry = params.mesh_correction[frame]
+        # The first element is the *distorting* mesh — the one that maps the
+        # ideal grid onto what the sensor actually recorded. A project file
+        # decodes this as a two-element list; `mesh_correction` is not modelled
+        # beyond that, so a list is the only shape that reaches here.
+        if isinstance(entry, (list, tuple)) and entry:
+            mesh = entry[0]
+
+    frame_readout_time = _get_frame_readout_time(params, timestamp_ms)
+    is_horizontal = params.frame_readout_direction.is_horizontal()
+    rs_dim = params.width if is_horizontal else params.height
+    row_readout_time = frame_readout_time / rs_dim if rs_dim > 0 else 0.0
+
+    if params.per_frame_time_offsets and 0 <= frame < len(params.per_frame_time_offsets):
+        timestamp_ms = timestamp_ms + params.per_frame_time_offsets[frame]
+
+    start_ts = timestamp_ms - (frame_readout_time / 2.0)
+    image_rotation = np.array(
+        Rotation.from_euler("z", video_rotation * (math.pi / 180.0)).as_matrix(),
+        dtype=np.float64,
+    )
+
+    org_keys = sorted(params.quaternions.keys()) if params.quaternions else None
+
+    def lookup_quat(quats, ts_ms, keys=None):
+        corrected = ts_ms - GyroSource.offset_at_timestamp(
+            params.sync_offsets_adjusted, ts_ms
+        )
+        return _quat_at_timestamp(quats, corrected * 1000.0, keys)
+
+    org_quat_inv = lookup_quat(params.quaternions, timestamp_ms, org_keys).inverse()
+    smoothed_quat = lookup_quat(params.smoothed_quaternions, timestamp_ms)
+
+    # One matrix per point when there is rolling shutter, one for all of them
+    # otherwise — the point's row only matters if rows are exposed at
+    # different times.
+    points_iter = list(points) if abs(frame_readout_time) > 0.0 else [(0.0, 0.0)]
+    rotations = []
+    for point in points_iter:
+        if abs(frame_readout_time) > 0.0:
+            row = float(point[0]) if is_horizontal else float(point[1])
+            quat_time = start_ts + row_readout_time * row
+        else:
+            quat_time = start_ts
+        quat = smoothed_quat * org_quat_inv * lookup_quat(
+            params.quaternions, quat_time, org_keys
+        )
+        r = image_rotation @ quat.to_rotation_matrix()
+        r[0, 1] *= -1.0
+        r[0, 2] *= -1.0
+        r[1, 0] *= -1.0
+        r[2, 0] *= -1.0
+        if params.suppress_rotation:
+            r = np.eye(3, dtype=np.float64)
+        rotations.append(new_k @ r)
+
+    shifts = _shift_per_point(params, points_iter, frame)
+    if params.suppress_rotation and params.frame_readout_time == 0.0:
+        shifts = None
+
+    return camera_matrix, distortion_coeffs, new_k, rotations, shifts, mesh
 
 
 @dataclass

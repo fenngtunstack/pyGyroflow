@@ -2151,6 +2151,10 @@ class StabilizationManager:
         )
 
         metadata = self.gyro.file_metadata
+        from pygyroflow.stabilization.distortion_models import (
+            from_name as lens_model_from_name,
+        )
+
         cp = ComputeParams(
             width=w,
             height=h,
@@ -2211,6 +2215,16 @@ class StabilizationManager:
             digital_zoom=metadata.digital_zoom,
             radial_distortion_limit=radial_limit,
             focal_length_smoothing_strength=self.params.focal_length_smoothing_strength,
+            # Only the points path reads these three; the image path takes its
+            # mesh and IBIS data through the kernel parameters instead.
+            mesh_correction=list(metadata.mesh_correction or []),
+            camera_stab_data=list(metadata.camera_stab_data or []),
+            digital_lens=(
+                lens_model_from_name(lens.digital_lens) if lens.digital_lens else None
+            ),
+            digital_lens_params=(
+                list(lens.digital_lens_params) if lens.digital_lens_params else None
+            ),
             optimal_fov=lens.optimal_fov,
             per_frame_time_offsets=list(
                 getattr(self.gyro.file_metadata, "per_frame_time_offsets", None) or []

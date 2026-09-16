@@ -24,6 +24,8 @@ import bisect
 import math
 from typing import Generic, TypeVar
 
+import numpy as np
+
 T = TypeVar("T")
 
 # From splines.rs: the largest mesh grid the buffer layout can hold.
@@ -40,6 +42,8 @@ __all__ = [
     "BivariateSpline",
     "MAX_GRID_SIZE",
     "MAX_BUFFER_SIZE",
+    "as_catmull_rom",
+    "interpolate_mesh",
 ]
 
 
@@ -267,3 +271,30 @@ def interpolate_mesh(x: float, y: float, size: tuple[float, float], mesh) -> tup
         grid.interpolate(size[0], size[1], mesh, 0, x, y),
         grid.interpolate(size[0], size[1], mesh, 1, x, y),
     )
+
+
+def as_catmull_rom(value) -> CatmullRom | None:
+    """Coerce a stored curve into a :class:`CatmullRom`.
+
+    A curve reaches this port in three shapes and all three are real: an
+    already-built ``CatmullRom``, the ``{"points": [[t, [x, y, z]], ...]}`` map
+    a ``.gyroflow`` file decodes to, and the bare point list. The values are
+    converted to numpy arrays because the interpolation multiplies them by
+    scalars — a Python list would concatenate instead.
+
+    Returns None for an empty or missing curve, which is what upstream's
+    ``interpolate().unwrap_or_default()`` callers treat as zero displacement.
+    """
+    if value is None:
+        return None
+    if isinstance(value, CatmullRom):
+        return value
+
+    points = value.get("points") if isinstance(value, dict) else value
+    if not points:
+        return None
+
+    spline: CatmullRom = CatmullRom()
+    for position, vector in points:
+        spline.add_point(float(position), np.asarray(vector, dtype=np.float64))
+    return spline

@@ -161,6 +161,21 @@ class ComputeParams:
     # FileMetadata.digital_zoom: a crop factor the camera decided on.
     digital_zoom: Optional[float] = None
 
+    # --- Per-frame stabilization data, consumed only by the points path ---
+    # FileMetadata.mesh_correction: one (distorting mesh, undistorting mesh)
+    # pair per frame. The points path reads the first element. Upstream reaches
+    # into the gyro source for these; copying them here keeps FrameTransform
+    # free of a gyro reference, the same way `per_frame_time_offsets` works.
+    mesh_correction: list = field(default_factory=list)
+    # FileMetadata.camera_stab_data: one CameraStabData per frame — the IBIS
+    # and OIS displacement splines plus the crop area they are expressed in.
+    camera_stab_data: list = field(default_factory=list)
+    # The lens's *digital* lens, a second distortion model applied on top of
+    # the optical one (GoPro's SuperView/HyperView stretch). `digital_lens` is
+    # the model, `digital_lens_params` its coefficients.
+    digital_lens: Any = None
+    digital_lens_params: list | None = None
+
     def calculate_camera_fovs(self) -> None:
         """Fill ``camera_diagonal_fovs``, one value per frame.
 

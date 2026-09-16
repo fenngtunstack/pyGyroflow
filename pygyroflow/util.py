@@ -442,6 +442,16 @@ class ClosestMap:
         return None
 
 
+def map_coord(x, in_min, in_max, out_min, out_max):
+    """Linear remap of *x* from one range to another (``util.rs::map_coord``).
+
+    Kept for its exact expression rather than its maths: the subtraction order
+    matters when the two ranges have different widths, because the result is
+    what a mesh correction adds to a pixel coordinate.
+    """
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
+
 def timestamp_at_frame(frame: int, fps: float) -> float:
     """Convert frame index to timestamp in milliseconds.
 
