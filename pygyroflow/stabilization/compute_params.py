@@ -140,3 +140,10 @@ class ComputeParams:
     # (Sony/DJI/RED). Upstream adds offsets[frame] to the video timestamp
     # before the rolling-shutter and quaternion lookups.
     per_frame_time_offsets: list[float] = field(default_factory=list)
+    # Per-frame relaxation of the smoothing (upstream
+    # ComputeParams.smoothing_fov_limit_per_frame). The max-zoom feedback
+    # loop fills it: where the required crop would exceed the zoom limit,
+    # smoothing is relaxed instead of exceeding it. Consumed by
+    # DefaultAlgo/PlainSmoothing as a multiplier on max_velocity.
+    smoothing_fov_limit_per_frame: list[float] = field(default_factory=list)
+    video_speed_affects_zooming_limit: bool = True

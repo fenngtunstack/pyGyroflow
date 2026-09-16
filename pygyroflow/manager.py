@@ -451,7 +451,13 @@ class StabilizationManager:
                   compute_params=cp)
 
     def recompute_adaptive_zoom(self) -> None:
-        """Recompute adaptive zoom FOVs."""
+        """Recompute adaptive zoom FOVs, then enforce the max-zoom limit."""
+        self._smoothing_fov_limit_per_frame = []
+        self._recompute_zoom_once()
+        self._apply_max_zoom_limit()
+
+    def _recompute_zoom_once(self) -> list[float]:
+        """One adaptive-zoom pass; returns the FOVs it produced."""
         from pygyroflow.zooming import calculate_fovs, ZoomMethod
 
         cp = self._build_compute_params()
@@ -459,7 +465,7 @@ class StabilizationManager:
         fps = self.params.get_scaled_fps()
 
         if frames <= 0 or fps <= 0:
-            return
+            return []
 
         timestamps = [(i, i * 1000.0 / fps) for i in range(frames)]
 
@@ -469,6 +475,79 @@ class StabilizationManager:
         lens_fov_adj = self.lens.optimal_fov or 1.0
         self.params.set_fovs(fovs, lens_fov_adj)
         self.params.minimal_fovs = minimal_fovs
+        return list(fovs)
+
+    def _apply_max_zoom_limit(self) -> None:
+        """Relax smoothing where the required crop would exceed max zoom.
+
+        Mirrors upstream's loop in ``StabilizationManager::recompute_adaptive_zoom``:
+        when a frame needs more crop than the zoom limit allows, smoothing is
+        relaxed for that frame instead (through
+        ``ComputeParams.smoothing_fov_limit_per_frame``) and both stages are
+        re-run, up to ``max_zoom_iterations`` times with progressively looser
+        thresholds. Without it ``max_zoom`` was carried around and never used:
+        the crop was whatever the zoom estimator asked for.
+        """
+        max_zoom_param = self.params.max_zoom or 0.0
+        max_zoom_iters = int(self.params.max_zoom_iterations or 0)
+        frames = self.params.frame_count
+        fps = self.params.get_scaled_fps()
+        if frames <= 0 or fps <= 0:
+            return
+
+        keyframes = self.keyframes
+        keyed = keyframes.get_keyframes(KeyframeType.MaxZoom) if keyframes else None
+        max_zoom_max = (
+            max((kf.value for kf in keyed.values()), default=max_zoom_param)
+            if keyed
+            else max_zoom_param
+        )
+        if max_zoom_max <= 50.0 or max_zoom_iters <= 0:
+            return
+
+        out_w = self.params.output_size[0] or self.params.size[0]
+        scaling_factor = self.params.size[0] / max(1, out_w)
+        thresholds = (0.95, 0.9, 0.85, 0.8)
+
+        limit = [1.0] * len(self.params.fovs)
+        for iteration in range(max_zoom_iters):
+            any_above_limit = False
+            for i, fov in enumerate(self.params.fovs):
+                ts = i * 1000.0 / fps
+                zoom_limit = (
+                    _keyframed_or(keyframes, KeyframeType.MaxZoom, ts, max_zoom_param)
+                    / 100.0
+                )
+                if self.params.video_speed_affects_zooming_limit and (
+                    self.params.video_speed != 1.0
+                    or keyframes.is_keyframed(KeyframeType.VideoSpeed)
+                ):
+                    vid_speed = abs(
+                        _keyframed_or(
+                            keyframes, KeyframeType.VideoSpeed, ts,
+                            self.params.video_speed,
+                        )
+                    )
+                    zoom_limit *= min(1.0 + (vid_speed - 1.0) / 4.0, 1.8)
+
+                fov_limit = 1.0 / (zoom_limit * scaling_factor) if zoom_limit else 0.0
+                if fov_limit and fov < fov_limit:
+                    any_above_limit = True
+                    limit[i] *= min(
+                        fov / fov_limit,
+                        thresholds[min(iteration, len(thresholds) - 1)],
+                    )
+
+            if not any_above_limit:
+                if iteration == 0:
+                    limit = []  # never any conflict: leave smoothing alone
+                break
+
+            self._smoothing_fov_limit_per_frame = limit
+            self.recompute_smoothing()
+            self._recompute_zoom_once()
+
+        self._smoothing_fov_limit_per_frame = limit
 
     def recompute_undistortion(self) -> None:
         """Prepare GPU/CPU undistortion pipeline for rendering."""
@@ -1319,6 +1398,10 @@ class StabilizationManager:
             video_speed=self.params.video_speed,
             video_speed_affects_smoothing=self.params.video_speed_affects_smoothing,
             video_speed_affects_zooming=self.params.video_speed_affects_zooming,
+            video_speed_affects_zooming_limit=self.params.video_speed_affects_zooming_limit,
+            smoothing_fov_limit_per_frame=list(
+                getattr(self, "_smoothing_fov_limit_per_frame", None) or []
+            ),
             framebuffer_inverted=self.params.framebuffer_inverted,
             trim_ranges=list(self.params.trim_ranges),
             calib_width=lens.calib_dimension["w"],

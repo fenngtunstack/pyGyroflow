@@ -443,7 +443,10 @@ class DefaultAlgo(SmoothingAlgorithm):
                     else 1.0
                 )
 
-            if frame in fov_limit_per_frame:
+            # Indexed by frame, like upstream's Vec::get(frame). Using
+            # `in` here tested list *membership*, so the per-frame limit
+            # was only ever applied by accident.
+            if frame < len(fov_limit_per_frame):
                 fov_ratio *= fov_limit_per_frame[frame]
 
             max_vel = [MAX_VELOCITY, MAX_VELOCITY, MAX_VELOCITY]

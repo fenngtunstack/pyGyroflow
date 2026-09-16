@@ -144,7 +144,10 @@ class PlainSmoothing(SmoothingAlgorithm):
         for ts in trimmed:
             scale = 1.0
             frame = int(round(ts / 1000.0 * scaled_fps))
-            if frame in fov_limit_per_frame:
+            # Indexed by frame, like upstream's Vec::get(frame). Using
+            # `in` here tested list *membership*, so the per-frame limit
+            # was only ever applied by accident.
+            if frame < len(fov_limit_per_frame):
                 scale *= fov_limit_per_frame[frame]
             scalers[ts] = scale
 
