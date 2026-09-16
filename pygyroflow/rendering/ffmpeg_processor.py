@@ -123,6 +123,59 @@ def split_range_ms(
     return [(start * duration_ms, end * duration_ms) for start, end in ranges]
 
 
+class FrameRateControl:
+    """How many output frames each input frame produces.
+
+    Port of upstream's ``rate_control`` in the ``is_speed_changed`` branch of
+    ``rendering/mod.rs``. It is how ``video_speed`` reaches the output at all:
+    a speed above 1 drops frames (the clip plays faster, and stays the same
+    duration at the same nominal fps), below 1 duplicates them (slow motion).
+
+    The arithmetic is upstream's, including its phase: the first input frame
+    of a speed-changed render is always dropped, because ``ramped`` starts at
+    0 and the gate is ``ramped < final + interval/2``. That is a choice of
+    *which* frames survive, not of how many.
+
+    ``speed`` is a float, or a callable ``timestamp_ms -> float`` for a
+    keyframed speed. ``None`` disables the whole thing.
+    """
+
+    def __init__(self, fps: float, speed=None) -> None:
+        self._speed = speed
+        self._interval_us = int(round(1_000_000.0 / fps)) if fps > 0 else 33_333
+        self._prev_real_us = 0.0
+        self._ramped_us = 0.0
+        self._final_us = 0.0
+
+    @property
+    def active(self) -> bool:
+        return self._speed is not None
+
+    def repeats(self, timestamp_ms: float) -> int:
+        """Output copies for the frame at *timestamp_ms*; 0 means drop it."""
+        if self._speed is None:
+            return 1
+        speed = self._speed(timestamp_ms) if callable(self._speed) else self._speed
+        if not speed or speed <= 0.0:
+            speed = 1.0
+
+        real_us = timestamp_ms * 1000.0
+        current_us = (real_us - self._prev_real_us) / speed
+        self._ramped_us += current_us
+        self._prev_real_us = real_us
+
+        # interval/2 because the frame we want sits in the middle of its
+        # output slot, not at the end of it (upstream's comment).
+        if self._ramped_us < self._final_us + self._interval_us / 2.0:
+            return 0
+
+        repeats = 1
+        if current_us / self._interval_us >= 1.5:
+            repeats = max(1, int(round(current_us / self._interval_us)))
+        self._final_us += self._interval_us * repeats
+        return repeats
+
+
 def output_path_for_range(path: str, index: int) -> str:
     """``out.mp4`` -> ``out-002.mp4`` for the *index*-th trim range (1-based).
 
@@ -333,6 +386,7 @@ class FfmpegProcessor(VideoProcessor):
         self,
         callback: FrameCallback,
         ranges_ms: list[tuple[float | None, float | None]] | None = None,
+        speed=None,
     ) -> None:
         """Decode all frames, apply *callback*, encode to output.
 
@@ -354,6 +408,11 @@ class FfmpegProcessor(VideoProcessor):
         and *original* index. That is deliberate: the stabilization transform
         for a frame has to come from where it sat in the source timeline, not
         from its position in the trimmed output.
+
+        *speed* turns on :class:`FrameRateControl` — a float, or a callable
+        ``timestamp_ms -> float`` for a keyframed speed. Frames it drops are
+        never handed to the callback; frames it duplicates are handed over
+        once and written out several times.
         """
         import av  # type: ignore[import-untyped]
 
@@ -377,6 +436,7 @@ class FfmpegProcessor(VideoProcessor):
         ranges = list(ranges_ms or [])
         range_idx = 0
         skipped = 0
+        rate_control = FrameRateControl(fallback_fps, speed)
 
         # Three-stage pipeline: decode thread -> stabilize (this thread) ->
         # encode thread. Both C stages release the GIL (PyAV / numpy /
@@ -485,14 +545,26 @@ class FfmpegProcessor(VideoProcessor):
                     if start is not None and timestamp_ms < start:
                         skipped += 1
                         continue
+                repeats = rate_control.repeats(timestamp_ms)
+                if repeats == 0:
+                    skipped += 1
+                    continue
                 processed = callback(img, timestamp_ms, input_index)
                 # Ensure uint8 for encoding.
                 if processed.dtype != np.uint8:
                     processed = np.clip(processed, 0, 255).astype(np.uint8)
-                if not _put_unless_failed(encode_q, processed, fail):
-                    pipeline_error = fail[0]
+                # A duplicate is the same array written again, which is what
+                # upstream's repeat_times does — the encoder reads it once per
+                # copy and nothing mutates it in between.
+                failed = False
+                for _ in range(repeats):
+                    if not _put_unless_failed(encode_q, processed, fail):
+                        pipeline_error = fail[0]
+                        failed = True
+                        break
+                if failed:
                     break
-                self._frame_index += 1
+                self._frame_index += repeats
         except BaseException as exc:
             pipeline_error = exc
             raise
@@ -522,9 +594,10 @@ class FfmpegProcessor(VideoProcessor):
 
         log.info("Processed %d frames", self._frame_index)
         if skipped:
+            detail = f"{len(ranges)} range(s)" if ranges else "video speed"
             log.info(
-                "Trim: kept %d of %d decoded frame(s) across %d range(s)",
-                self._frame_index, self._frame_index + skipped, len(ranges),
+                "Dropped %d of %d decoded frame(s) (%s)",
+                skipped, skipped + self._frame_index, detail,
             )
 
     def copy_audio(

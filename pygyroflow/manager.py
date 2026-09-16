@@ -1749,6 +1749,46 @@ class StabilizationManager:
 
         proc.create_output(output_path, out_w, out_h, fps, codec=codec, bitrate=bitrate)
 
+        # --- Frame-rate scaling and video speed (C-05) ---
+        # These are different things doing different jobs, and conflating
+        # them is the easy mistake. `fps_scale` compresses the timeline the
+        # frames are *looked up* on — a 240 fps recording written into a
+        # 60 fps container — so it changes which transform a frame gets but
+        # not how many frames there are: upstream divides `timestamp_us` by
+        # the scale before every lookup. `video_speed` changes the frame
+        # *count*, which upstream drives through `rate_control`.
+        #
+        # This runs before the output streams exist, so a speed-changed
+        # render never declares an audio track it will not fill (upstream
+        # clears the audio codec the same way, for the same reason).
+        fps_scale = self.params.fps_scale
+        video_speed = self.params.video_speed
+        speed_keyframed = self.keyframes.is_keyframed(KeyframeType.VideoSpeed)
+
+        def speed_at(timestamp_ms: float) -> float:
+            return _keyframed_or(
+                self.keyframes, KeyframeType.VideoSpeed, timestamp_ms, video_speed
+            )
+
+        if video_speed != 1.0 or speed_keyframed:
+            speed = speed_at
+            log.info(
+                "Video speed %.3f%s: frames will be %s",
+                video_speed,
+                " (keyframed)" if speed_keyframed else "",
+                "dropped" if video_speed > 1.0 else "duplicated",
+            )
+            if options.get("audio", True):
+                log.warning(
+                    "Video speed is not 1.0; dropping audio (upstream does "
+                    "the same)"
+                )
+                options = {**options, "audio": False}
+        else:
+            speed = None
+        if fps_scale:
+            log.info("fps_scale %.4f: frame lookups use timestamp / scale", fps_scale)
+
         # Audio streams must be added before the first packet is muxed (the
         # container header is written on first mux); packets are copied
         # after the video pass.
@@ -1789,7 +1829,8 @@ class StabilizationManager:
             # Use the real decode timestamp (pts) from the demuxer — covers
             # variable frame rate videos. FfmpegProcessor already falls back
             # to frame-index timing when pts is missing.
-            transform = self.get_frame_transform(timestamp_ms, frame_idx, compute_params=render_cp)
+            lookup_ms = timestamp_ms / fps_scale if fps_scale else timestamp_ms
+            transform = self.get_frame_transform(lookup_ms, frame_idx, compute_params=render_cp)
 
             if gpu_backend is not None:
                 # Patch kernel params for GPU shader requirements
@@ -1818,7 +1859,7 @@ class StabilizationManager:
 
             return cpu_undistort(frame_data, transform, interpolation=interp_index)
 
-        proc.process_frames(stabilize_frame, ranges_ms=ranges_ms)
+        proc.process_frames(stabilize_frame, ranges_ms=ranges_ms, speed=speed)
 
         # Copy audio packets through the streams prepared before the video
         # pass. Previously the output was always silent. The same ranges
