@@ -18,6 +18,7 @@ from pygyroflow.stabilization.distortion_models import (
     Insta360Model,
     SonyModel,
     GoProSuperviewModel,
+    GoPro6SuperviewModel,
     GoProHyperviewModel,
     DigitalStretchModel,
 )
@@ -33,6 +34,7 @@ _MODEL_NAMES = [
     "insta360",
     "sony",
     "gopro_superview",
+    "gopro6_superview",
     "gopro_hyperview",
     "digital_stretch",
 ]
@@ -69,6 +71,7 @@ class TestFromName:
         ("insta360", Insta360Model),
         ("sony", SonyModel),
         ("gopro_superview", GoProSuperviewModel),
+        ("gopro6_superview", GoPro6SuperviewModel),
         ("gopro_hyperview", GoProHyperviewModel),
         ("digital_stretch", DigitalStretchModel),
     ])
@@ -84,8 +87,20 @@ class TestFromName:
 class TestDistortUndistortRoundtrip:
     """distort -> undistort should recover the original point (within tolerance)."""
 
-    # Models that cannot handle zero coefficients (division by zero in implementation)
-    _ZERO_COEFF_SKIP = {"poly3", "digital_stretch", "gopro_hyperview", "gopro_superview"}
+    # Two reasons a model has no "roundtrip with zero coefficients" case:
+    # the digital lenses ignore the coefficients entirely (the stretch always
+    # applies, and their inverse is a fixed-point iteration rather than a
+    # closed form), and they are driven by pixel coordinates against a frame
+    # size, so the (0.3, -0.2) probe below sits on the frame's edge where the
+    # inversion's cap binds. digital_stretch divides by its coefficients.
+    # gopro_superview and gopro6_superview have their own reference fixtures.
+    _ZERO_COEFF_SKIP = {
+        "poly3",
+        "digital_stretch",
+        "gopro_hyperview",
+        "gopro_superview",
+        "gopro6_superview",
+    }
 
     @pytest.mark.parametrize("name", _MODEL_NAMES)
     def test_roundtrip_identity_coeffs(self, name):
@@ -132,7 +147,12 @@ class TestDistortUndistortRoundtrip:
 
 class TestWGSLFunctions:
     # These models use digital_undistort_point/digital_distort_point instead
-    _DIGITAL_MODELS = {"gopro_superview", "gopro_hyperview", "digital_stretch"}
+    _DIGITAL_MODELS = {
+        "gopro_superview",
+        "gopro6_superview",
+        "gopro_hyperview",
+        "digital_stretch",
+    }
 
     @pytest.mark.parametrize("name", _MODEL_NAMES)
     def test_wgsl_contains_required_functions(self, name):

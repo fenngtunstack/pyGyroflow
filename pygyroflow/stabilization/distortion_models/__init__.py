@@ -12,6 +12,7 @@ Supported models:
   - insta360         Insta360 (UCM + Brown-Conrady)
   - sony             Sony extended angle-based polynomial
   - gopro_superview  GoPro Superview digital stretch
+  - gopro6_superview GoPro6 Superview digital stretch (different polynomial)
   - gopro_hyperview  GoPro Hyperview digital stretch
   - digital_stretch  Simple anisotropic scaling
 """
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 from .base import DistortionModelBase
 from .digital_stretch import DigitalStretchModel
+from .gopro6_superview import GoPro6SuperviewModel
 from .gopro_hyperview import GoProHyperviewModel
 from .gopro_superview import GoProSuperviewModel
 from .insta360 import Insta360Model
@@ -41,6 +43,7 @@ __all__ = [
     "Insta360Model",
     "SonyModel",
     "GoProSuperviewModel",
+    "GoPro6SuperviewModel",
     "GoProHyperviewModel",
     "DigitalStretchModel",
 ]
@@ -55,6 +58,7 @@ _MODEL_REGISTRY: dict[str, type[DistortionModelBase]] = {
     "insta360": Insta360Model,
     "sony": SonyModel,
     "gopro_superview": GoProSuperviewModel,
+    "gopro6_superview": GoPro6SuperviewModel,
     "gopro_hyperview": GoProHyperviewModel,
     "digital_stretch": DigitalStretchModel,
 }
