@@ -51,68 +51,137 @@ def parse_telemetry_file(
     raise TelemetryParseError(f"Unsupported file format: {ext}")
 
 
+def detect_telemetry_format(path: str) -> str:
+    """Name the telemetry format in *path*.
+
+    Returns ``"GoPro"``, ``"DJI"``, ``"Sony"``, ``"Insta360"`` or
+    ``"Unknown"``. The head and tail of the file are enough — see
+    :data:`_DETECT_WINDOW`.
+    """
+    window = _detect_buffer(path)
+    for name, probe in (
+        ("GoPro", _detect_gopro),
+        ("DJI", _detect_dji),
+        ("Sony", _detect_sony),
+        ("Insta360", _detect_insta360),
+    ):
+        if probe(window):
+            return name
+
+    # Nothing in the head/tail. The rtmd track check needs absolute sample
+    # offsets, which only exist in the full file, so retry on that — with the
+    # substring probes deliberately left out, since they are what produced
+    # the false positives in the first place.
+    if _detect_sony_track(_read_all(path)):
+        return "Sony"
+    return "Unknown"
+
+
 def _parse_embedded(
     path: str,
     sample_index: int | None = None,
     video_size: tuple[int, int] = (0, 0),
     fps: float = 0.0,
 ) -> FileMetadata:
-    """Parse embedded telemetry (GoPro GPMF or DJI protobuf).
-
-    Detects the camera brand from the file content and dispatches to the
-    appropriate parser.
-    """
+    """Parse embedded telemetry (GoPro GPMF, DJI protobuf or Sony RTMD)."""
     try:
-        with open(path, "rb") as f:
-            data = f.read()
+        name = detect_telemetry_format(path)
     except OSError as exc:
         log.warning("Cannot read file %s: %s", path, exc)
         return FileMetadata(detected_source="Unknown")
 
-    # Detect GoPro: look for 'gpmd' FourCC tag in MP4 box structure
-    if _detect_gopro(data):
-        return _parse_gopro(data, fps, video_size)
+    if name not in _TELEMETRY_PARSERS:
+        log.warning("Unrecognized telemetry format in %s", path)
+        return FileMetadata(detected_source="Unknown")
 
-    # Detect DJI: look for 'djmd' tag and "CAM meta" handler
-    if _detect_dji(data):
-        return _parse_dji(data, fps, video_size)
-
-    # Detect Sony: RTMD metadata track ('meta' handler + samples starting
-    # with 00 1C, or the Sony XML manufacturer tag)
-    if _detect_sony(data):
-        return _parse_sony(data, fps, video_size)
-
-    # Detect Insta360: extra-info trailer magic at the end of the file
-    if _detect_insta360(data):
-        return _parse_insta360(data, fps, video_size)
-
-    log.warning("Unrecognized telemetry format in %s", path)
-    return FileMetadata(detected_source="Unknown")
+    try:
+        return _TELEMETRY_PARSERS[name](_read_all(path), fps, video_size)
+    except OSError as exc:
+        log.warning("Cannot read file %s: %s", path, exc)
+        return FileMetadata(detected_source="Unknown")
 
 
 # ---------------------------------------------------------------------------
 # Detection helpers
 # ---------------------------------------------------------------------------
 
-def _detect_gopro(data: bytes) -> bool:
-    """Detect GoPro GPMF stream by looking for 'gpmd' codec tag."""
-    return data.find(b"gpmd") >= 0
+# Upstream telemetry-parser reads only the head and the tail of the file for
+# format detection (util::read_beginning_and_end, 5 MB each side below 5 GB —
+# see lib.rs::from_stream_with_options). That bound is load-bearing, not an
+# optimisation: every one of these markers is a fourcc, so the full-file
+# search that was done here before finds them inside compressed video data.
+# On a 470 MB Sony clip 'dvtm' occurs at 201 MB and 'djmd' at 236 MB, both
+# inside the H.264 payload; the parser then called the file DJI, never
+# reached the Sony branch, and returned zero IMU samples — a silently
+# unstabilized output. Every false positive found so far sits outside the
+# window.
+_DETECT_WINDOW = 5 * 1024 * 1024
 
 
-def _detect_dji(data: bytes) -> bool:
-    """Detect DJI metadata stream by looking for 'djmd' codec tag."""
-    return data.find(b"djmd") >= 0 or (data.find(b"dvtm") >= 0 and data.find(b"DJI") >= 0)
+def _read_all(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
 
 
-def _detect_sony(data: bytes) -> bool:
-    """Detect Sony RTMD telemetry.
+def _detect_buffer(path: str) -> bytes:
+    """Head + tail of *path*, mirroring upstream's detection buffer."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        if size > 2 * _DETECT_WINDOW:
+            head = f.read(_DETECT_WINDOW)
+            f.seek(-_DETECT_WINDOW, os.SEEK_END)
+            return head + f.read(_DETECT_WINDOW)
+        return f.read()
 
-    Mirrors upstream telemetry-parser's Sony::detect: either the XML
-    manufacturer tag, or an MP4 metadata track whose samples begin with
-    00 1C (the RTMD length prefix).
+
+def _detect_gopro(buf: bytes) -> bool:
+    """GoPro detection — mirrors ``gopro/mod.rs::GoPro::detect``.
+
+    Three markers, in upstream's order:
+      * ``DEVC`` at offset 0 — a raw GPMF stream;
+      * ``GPMFDEVC`` — the GPMF box header, present when the first sample
+        abuts the box start (Hero6 and later);
+      * ``GoPro MET`` — the gpmd track's handler name in the moov ``hdlr``.
+
+    The third is the one that catches the older bodies: Hero5/Session/Karma
+    files contain no ``GPMFDEVC`` at all, and matching on the bare ``gpmd``
+    codec tag (as this did) both missed nothing and caught everything —
+    ``gpmd`` also occurs at 33 MB inside an H.264 stream.
     """
-    if data.find(b'manufacturer="Sony"') >= 0:
+    return (
+        buf[:4] == b"DEVC"
+        or buf.find(b"GPMFDEVC") >= 0
+        or buf.find(b"GoPro MET") >= 0
+    )
+
+
+def _detect_dji(buf: bytes) -> bool:
+    """DJI detection — mirrors ``dji/mod.rs::Dji::detect``.
+
+    ``djmd`` on its own is not evidence: it appears by chance in compressed
+    video (issue-44-12 carries it at 236 MB). Upstream requires the metadata
+    track's handler name next to it.
+    """
+    if buf.find(b"djmd") >= 0 and (
+        buf.find(b"DJI meta") >= 0 or buf.find(b"CAM meta") >= 0
+    ):
         return True
+    # DJI flight-log CSV: Clock:Tick + IMU_ATTI(0):gyroX
+    return buf.find(b"Clock:Tick") >= 0 and buf.find(b"IMU_ATTI(0):gyroX") >= 0
+
+
+def _detect_sony(buf: bytes) -> bool:
+    """Sony detection — mirrors ``sony/mod.rs::Sony::detect``."""
+    return buf.find(b'manufacturer="Sony"') >= 0
+
+
+def _detect_sony_track(data: bytes) -> bool:
+    """Fallback for Sony files without the manufacturer XML.
+
+    Needs absolute sample offsets, hence the full file: it looks for an MP4
+    metadata track tagged ``rtmd`` whose samples begin with the RTMD length
+    prefix ``00 1C``.
+    """
     samples = _mp4_find_data_track_samples(data, "rtmd")
     return bool(samples) and all(
         size > 0x1C and data[offset : offset + 2] == b"\x00\x1c"
@@ -2011,3 +2080,13 @@ def _multiply_quat(
         w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
         w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
     )
+
+
+# Resolved at the bottom of the module: the parser functions it points at are
+# defined below _parse_embedded.
+_TELEMETRY_PARSERS = {
+    "GoPro": _parse_gopro,
+    "DJI": _parse_dji,
+    "Sony": _parse_sony,
+    "Insta360": _parse_insta360,
+}
