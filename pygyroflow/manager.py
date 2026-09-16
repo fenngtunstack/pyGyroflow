@@ -1020,7 +1020,8 @@ class StabilizationManager:
         bitrate = options.get("bitrate", 0)
         use_gpu = options.get("use_gpu", False)
         # Upstream Gyroflow interpolation indices: 0 Bilinear / 1 Bicubic /
-        # 2 Lanczos4 (their default) / 3-6 EWA (fallback to Lanczos4 here).
+        # 2 Lanczos4 (their default) / 3-6 EWA (implemented, but ~10x the CPU
+        # cost of Lanczos4 — see pygyroflow/stabilization/ewa.py).
         interp_index = int(options.get("interpolation", 2))
 
         proc = FfmpegProcessor()

@@ -20,15 +20,40 @@ Semantics mirrored from upstream ``undistort_coord`` + ``rotate_and_distort``:
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 from numpy.typing import NDArray
 
-from pygyroflow.stabilization.frame_transform import FrameTransform
 from pygyroflow.stabilization.distortion_models import from_name as model_from_name
+from pygyroflow.stabilization.ewa import EWA_FILTERS, ewa_sample, map_jacobian
+from pygyroflow.stabilization.frame_transform import FrameTransform
 from pygyroflow.types.kernel_params import KernelParams
 
 # KernelParamsFlags::HORIZONTAL_RS (1 << 4)
 _HORIZONTAL_RS_FLAG = 16
+
+_log = logging.getLogger(__name__)
+_ewa_warned = False
+
+
+def _warn_ewa_cost_once() -> None:
+    """EWA is a per-tap gather in NumPy — say so before someone renders 4K.
+
+    Measured on this machine (identity map with a 4% zoom-out, kernel radius
+    3): 16-23 s per 1080p frame and 49-154 s per 4K frame, against ~2 s for
+    Lanczos4 *including* the map build.  It is correct, but the CPU path is
+    not where it belongs — upstream runs EWA in a fragment shader.
+    """
+    global _ewa_warned
+    if not _ewa_warned:
+        _ewa_warned = True
+        _log.warning(
+            "EWA interpolation on the CPU path is a NumPy per-tap gather and costs "
+            "roughly an order of magnitude more than Lanczos4 (measured: 16-23 s per "
+            "1080p frame, 49-154 s per 4K frame). Use it for stills or verification; "
+            "render with lanczos4."
+        )
 
 # Cached output coordinate grids, keyed by (height, width). np.mgrid for a
 # 1080p grid costs ~60ms; building it per frame is pure waste.
@@ -242,8 +267,8 @@ def cpu_undistort(
         transform: FrameTransform with matrices and kernel_params.
         interpolation: Upstream Gyroflow interpolation index —
             0 = Bilinear, 1 = Bicubic, 2 = Lanczos4 (upstream default),
-            3-6 = EWA variants (no OpenCV equivalent, fall back to
-            Lanczos4).
+            3-6 = EWA (RobidouxSharp/Robidoux/Mitchell/Catmull-Rom), which
+            is implemented here rather than approximated with Lanczos4.
 
     Returns:
         Stabilized output frame, shape (output_H, output_W, C).
@@ -335,6 +360,16 @@ def cpu_undistort(
 
     src_x, src_y, valid = _rotate_and_distort(xs, ys, m, kp, model, ibis_active=ibis_any)
 
+    # EWA needs the Jacobian of this map, and it has to be measured before the
+    # background-mode extension below: a repeated or mirrored region is flat,
+    # which would collapse the ellipse into its degenerate case.  Upstream
+    # differentiates the mapping analytically-ish (forward differences at the
+    # pixel); here the map is already materialised, so central differences of
+    # the same map give the same thing for free.
+    ewa_jac = None
+    if int(interpolation) in EWA_FILTERS:
+        ewa_jac = map_jacobian(src_x, src_y, valid)
+
     # Background modes (upstream semantics: repeat clamps to a 3px margin,
     # mirror reflects around it)
     bg_mode = kp.background_mode
@@ -382,16 +417,16 @@ def cpu_undistort(
     if channels == 1:
         border = border[0]
 
+    if ewa_jac is not None:
+        # EWA (indices 3-6) is not expressible as an OpenCV remap: the kernel
+        # is stretched by the local Jacobian, so it needs its own gather.
+        _warn_ewa_cost_once()
+        return ewa_sample(frame, src_x, src_y, ewa_jac, valid, int(interpolation), border)
+
     interp_flags = {
         0: cv2.INTER_LINEAR,
         1: cv2.INTER_CUBIC,
         2: cv2.INTER_LANCZOS4,
-        # EWA (3-6): OpenCV has no elliptical weighted average; Lanczos4
-        # is the closest available kernel.
-        3: cv2.INTER_LANCZOS4,
-        4: cv2.INTER_LANCZOS4,
-        5: cv2.INTER_LANCZOS4,
-        6: cv2.INTER_LANCZOS4,
     }
     interp_flag = interp_flags.get(int(interpolation), cv2.INTER_LANCZOS4)
 

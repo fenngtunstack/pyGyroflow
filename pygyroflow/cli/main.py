@@ -110,9 +110,13 @@ def main() -> None:
     parser.add_argument(
         "--interpolation",
         default="lanczos4",
-        choices=["bilinear", "bicubic", "lanczos4"],
+        choices=["bilinear", "bicubic", "lanczos4",
+                 "ewa-robidoux-sharp", "ewa-robidoux", "ewa-mitchell", "ewa-catmull-rom"],
         help="Resampling interpolation (default lanczos4, matches upstream "
-             "Gyroflow; EWA variants fall back to Lanczos4)",
+             "Gyroflow). The ewa-* filters stretch the kernel with the local "
+             "Jacobian, which is what you want when the stabilization "
+             "minifies — but on the CPU path each is a per-tap NumPy gather "
+             "and costs ~10x Lanczos4 (measured 16-23 s per 1080p frame)",
     )
     parser.add_argument(
         "--calibrate",
@@ -263,7 +267,15 @@ def main() -> None:
                     "bitrate": args.bitrate,
                     "use_gpu": args.gpu,
                     "audio": not args.no_audio,
-                    "interpolation": {"bilinear": 0, "bicubic": 1, "lanczos4": 2}[args.interpolation],
+                    "interpolation": {
+                        "bilinear": 0,
+                        "bicubic": 1,
+                        "lanczos4": 2,
+                        "ewa-robidoux-sharp": 3,
+                        "ewa-robidoux": 4,
+                        "ewa-mitchell": 5,
+                        "ewa-catmull-rom": 6,
+                    }[args.interpolation],
                 },
             )
             log.info("Done: %s", output)

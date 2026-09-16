@@ -145,8 +145,8 @@ pygyroflow/
 ├── keyframes/                # Layer 1: 3 文件, 650 行
 ├── gyro_source/              # Layer 1: 4 文件, 744 行
 ├── smoothing/                # Layer 2: 7 文件, 1910 行
-├── stabilization/            # Layer 2: 15 文件, 2917 行
-│   └── distortion_models/    #           1970 行
+├── stabilization/            # Layer 2: 18 文件, 3917 行
+│   └── distortion_models/    #           2433 行
 ├── zooming/                  # Layer 2: 3 文件, 695 行
 ├── synchronization/          # Layer 3: 16 文件, 2292 行
 ├── gpu/                      # Layer 3: 5 文件 + shaders, 539 行
@@ -156,7 +156,7 @@ pygyroflow/
 ├── calibration/              # Layer 4: 2 文件, 818 行
 ├── stmap/                    # Layer 4: 2 文件, 522 行
 ├── gui/                      # Layer 5: 7 文件, 963 行
-├── cli/                      # Layer 5: 2 文件, 374 行
+├── cli/                      # Layer 5: 2 文件, 386 行
 ├── manager.py                # 协调器, 1571 行
 └── ...                       # 其他辅助模块
 ```

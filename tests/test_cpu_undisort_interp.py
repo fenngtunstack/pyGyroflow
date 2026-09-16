@@ -2,9 +2,10 @@
 """Tests for cpu_undistort interpolation support (upstream index semantics).
 
 0 = Bilinear, 1 = Bicubic, 2 = Lanczos4 (upstream default), 3-6 = EWA
-(fallback to Lanczos4). The bilinear path keeps BORDER_CONSTANT semantics;
-wider kernels replicate the edge and paint invalid / out-of-frame pixels
-with the background colour afterwards.
+(RobidouxSharp/Robidoux/Mitchell/Catmull-Rom). The bilinear path keeps
+BORDER_CONSTANT semantics; wider kernels replicate the edge and paint invalid
+/ out-of-frame pixels with the background colour afterwards. The EWA filters
+have their own tests in ``test_ewa.py``; here we only check the dispatch.
 """
 
 from __future__ import annotations
@@ -81,12 +82,60 @@ class TestInterpolation:
         lanczos = cpu_undistort(frame, ft, interpolation=2)
         np.testing.assert_array_equal(default, lanczos)
 
-    def test_ewa_indices_fall_back_to_lanczos4(self):
+    def test_ewa_indices_use_their_own_sampler(self):
+        """3-6 must not silently alias Lanczos4 any more."""
         frame = _textured_frame()
         ft = _identity_transform()
         ref = cpu_undistort(frame, ft, interpolation=2)
+
         for idx in (3, 4, 5, 6):
-            np.testing.assert_array_equal(cpu_undistort(frame, ft, interpolation=idx), ref)
+            out = cpu_undistort(frame, ft, interpolation=idx)
+            assert out.shape == ref.shape
+            assert out.dtype == ref.dtype
+            assert not np.array_equal(out, ref), f"interpolation {idx} fell back to Lanczos4"
+
+        # the four filters are genuinely different kernels
+        outputs = [cpu_undistort(frame, ft, interpolation=i) for i in (3, 4, 5, 6)]
+        for i in range(4):
+            for j in range(i + 1, 4):
+                assert not np.array_equal(outputs[i], outputs[j])
+
+    def test_ewa_preserves_a_constant_frame(self):
+        """Normalisation: a flat frame must survive the weighted average.
+        The border carries the same value in every channel so the deliberate
+        background bleed cannot masquerade as a weight error (a negative-lobe
+        kernel legitimately overshoots at a discontinuity)."""
+        frame = np.full((48, 64, 3), 77, np.uint8)
+        ft = _identity_transform()
+        for c in (0, 1, 2):
+            ft.kernel_params.background[c] = 77.0 / 255.0
+
+        for idx in (3, 4, 5, 6):
+            out = cpu_undistort(frame, ft, interpolation=idx)
+            np.testing.assert_array_equal(out, frame)
+
+    def test_ewa_output_does_not_wrap_at_the_edges(self):
+        """The border bleed can push a weighted sum past the dtype range;
+        wrapping would turn frame edges into speckle."""
+        frame = np.full((48, 64, 3), 250, np.uint8)
+        ft = _identity_transform()  # background (0, 255, 0)
+
+        for idx in (3, 4, 5, 6):
+            out = cpu_undistort(frame, ft, interpolation=idx)
+            # no channel may jump from ~250 down to black
+            assert out[:, :, 0].min() > 100
+            assert out[:, :, 2].min() > 100
+
+    def test_ewa_invalid_pixels_get_the_background(self):
+        frame = _textured_frame()
+        ft = _identity_transform(r_limit=0.01)
+        ft.kernel_params.translation2d[0] = 0.5
+
+        for idx in (3, 4, 5, 6):
+            out = cpu_undistort(frame, ft, interpolation=idx)
+            assert out[:, :, 0].max() == 0
+            assert out[:, :, 1].min() == 255
+            assert out[:, :, 2].max() == 0
 
     def test_invalid_pixels_get_background_in_wide_kernel_path(self):
         # r_limit so small everything is invalid -> both paths must paint
