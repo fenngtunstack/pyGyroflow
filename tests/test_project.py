@@ -6,13 +6,14 @@ Two classes of check live here.
 The first is self-contained, and leans on the *other* decoder already in this
 repo (`tests/decode_gyroflow_project.py`). That one was written independently
 and validated against real Gyroflow output, so agreement between it and
-`pygyroflow.util` is stronger evidence than either agreeing with itself. Where
-no independent implementation exists (the CBOR payloads) the byte layout is
-pinned against the CBOR specification instead.
+`pygyroflow.util` is stronger evidence than either agreeing with itself.
 
 The second class runs against the real reference projects in the shared
 test-video directory. Those tests skip when the directory is absent, so the
-suite still passes on a clean checkout.
+suite still passes on a clean checkout. One of them is a full
+`WithProcessedData` export from real Gyroflow 1.6.3, which is what the CBOR
+encoders are checked against byte for byte — before it was found, that layout
+was only pinned against the CBOR specification.
 """
 
 from __future__ import annotations
@@ -63,9 +64,22 @@ _REFERENCE_PROJECTS = [
     _REFERENCE_DIR / "extra-03-GoPro-Hero-6.gyroflow",
     _REFERENCE_DIR / "extra-09-GoPro-Hero5-Session.gyroflow",
 ]
+# A real Gyroflow 1.6.3 `WithProcessedData` export: 25185 IMU samples, all the
+# CBOR caches, and a 1 MB `file_metadata` blob. The two projects above carry
+# `null` for every motion payload, so only this one can check the encoders
+# against bytes Gyroflow actually wrote.
+_PROCESSED_PROJECT = (
+    pathlib.Path("/home/ft/workspace/PreReserach/msGyroFlow")
+    / "DJI_20260507160359_0005_D.gyroflow"
+)
 _have_references = all(p.is_file() for p in _REFERENCE_PROJECTS)
+_have_processed_project = _PROCESSED_PROJECT.is_file()
 requires_references = pytest.mark.skipif(
     not _have_references, reason="reference .gyroflow files not present"
+)
+requires_processed_project = pytest.mark.skipif(
+    not _have_processed_project,
+    reason="reference WithProcessedData project not present",
 )
 
 
@@ -224,11 +238,16 @@ class TestBincodePayloads:
 
 
 class TestCborPayloads:
-    """The layout is derived from nalgebra's serde impls (``Unit`` ->
-    ``Quaternion`` -> ``Vector4`` is a plain 4-element sequence), so the
-    encoder emits ``{int: [4 floats]}`` with 8-byte floats. Pinned by hand
-    against the CBOR spec, since there is no second implementation to defer
-    to for the write side."""
+    """The quaternion layout comes from nalgebra's serde impls (``Unit`` ->
+    ``Quaternion`` -> ``Vector4`` is a plain 4-element sequence), so the map
+    is ``{int: [4 floats]}``.
+
+    The float *width* is not free choice. ciborium writes the shortest form a
+    value survives exactly — half before single before double — so the encoder
+    has to as well or the bytes differ. Read off a real Gyroflow 1.6.3 export
+    (see TestAgainstARealGyroflowProject); the cases below pin the rule
+    including the half-before-single order, which is the non-obvious part.
+    """
 
     def test_quat_map_byte_layout(self):
         raw = encode_cbor_quat_map({1: (0.0, 0.0, 0.0, 1.0)})
@@ -236,26 +255,55 @@ class TestCborPayloads:
             b"\xa1"                       # map, 1 entry
             b"\x01"                       # key 1
             b"\x84"                       # array, 4 items
-            + (b"\xfb" + struct.pack(">d", 0.0)) * 3
-            + b"\xfb" + struct.pack(">d", 1.0)
+            + (b"\xf9" + struct.pack(">e", 0.0)) * 3
+            + b"\xf9" + struct.pack(">e", 1.0)
         )
         assert raw == expected
-        assert len(raw) == 39
+        assert len(raw) == 15
 
     def test_f64_list_byte_layout(self):
+        """0.5 and -2.0 are both exact halves, so both go out as ``0xf9``."""
         raw = encode_cbor_f64_list([0.5, -2.0])
         assert raw == (
             b"\x82"
-            + b"\xfb" + struct.pack(">d", 0.5)
-            + b"\xfb" + struct.pack(">d", -2.0)
+            + b"\xf9" + struct.pack(">e", 0.5)
+            + b"\xf9" + struct.pack(">e", -2.0)
         )
 
-    def test_floats_are_never_the_short_form(self):
-        """cbor2 would emit a float16 for 1.0; ciborium does not, and the
-        bytes have to match."""
+    def test_integers_and_halves_take_the_half_form(self):
         raw = encode_cbor_f64_list([1.0, 0.0, -0.0])
-        assert len(raw) == 1 + 3 * 9
-        assert raw.count(b"\xfb") == 3
+        assert len(raw) == 1 + 3 * 3
+        assert raw.count(b"\xf9") == 3
+
+    @pytest.mark.parametrize(
+        "value,prefix,code",
+        [
+            (66.5, b"\xf9", ">e"),        # in the reference file as a half
+            (2738.0, b"\xf9", ">e"),
+            (578.375, b"\xfa", ">f"),     # single-exact but not half-exact
+            (0.1, b"\xfb", ">d"),         # exact in neither
+            (1e300, b"\xfb", ">d"),       # beyond single range
+        ],
+    )
+    def test_the_shortest_exact_form_wins(self, value, prefix, code):
+        raw = encode_cbor_f64_list([value])
+        assert raw == b"\x81" + prefix + struct.pack(code, value)
+
+    def test_a_half_wins_over_a_single_when_both_are_exact(self):
+        """The order that the reference file settled: 2738.0 is single-exact
+        *and* half-exact, and Gyroflow wrote the half."""
+        assert encode_cbor_f64_list([2738.0])[1:2] == b"\xf9"
+
+    def test_a_failed_narrowing_falls_through_to_the_next_width(self):
+        """No exception escapes: an out-of-range value just lands on f64."""
+        assert encode_cbor_f64_list([1e300])[1:2] == b"\xfb"
+        assert encode_cbor_f64_list([-1e300])[1:2] == b"\xfb"
+
+    def test_nan_is_not_shortened(self):
+        """The exactness test is a comparison, and NaN never compares equal —
+        so it stays in the widest form instead of silently changing bits."""
+        raw = encode_cbor_f64_list([float("nan")])
+        assert raw[1:2] == b"\xfb"
 
     def test_keys_are_sorted(self):
         raw = encode_cbor_quat_map({9: (0.0, 0.0, 0.0, 1.0), 2: (1.0, 0.0, 0.0, 0.0)})
@@ -288,6 +336,160 @@ class TestCborPayloads:
             decode_cbor_f64_list(cbor2.dumps({"a": 1}))
         with pytest.raises(ValueError):
             decode_cbor_quat_map(cbor2.dumps([1, 2]))
+
+
+def _cbor_head(buf, k):
+    """Parse one CBOR head; returns (major, argument, next_index)."""
+    first = buf[k]
+    major, ai = first >> 5, first & 0x1F
+    if ai < 24:
+        return major, ai, k + 1
+    if ai == 24:
+        return major, buf[k + 1], k + 2
+    if ai == 25:
+        return major, struct.unpack_from(">H", buf, k + 1)[0], k + 3
+    if ai == 26:
+        return major, struct.unpack_from(">I", buf, k + 1)[0], k + 5
+    if ai == 27:
+        return major, struct.unpack_from(">Q", buf, k + 1)[0], k + 9
+    raise AssertionError(f"unsupported additional info {ai}")
+
+
+def _cbor_float_widths(raw, is_map):
+    """The float header widths of a CBOR payload, in order, by walking it.
+
+    Substring counting cannot answer this: ``0xf9`` is a perfectly ordinary
+    byte inside an 8-byte float's payload, so ``raw.count(b"\\xf9")`` is
+    meaningless. Widths are 3/5/9 bytes after the header byte.
+    """
+    widths = []
+    major, count, k = _cbor_head(raw, 0)
+    assert major == (5 if is_map else 4), major
+
+    def read_floats(idx, how_many):
+        for _ in range(how_many):
+            assert raw[idx] >> 5 == 7, hex(raw[idx])
+            width = raw[idx] & 0x1F
+            assert width in (25, 26, 27), hex(raw[idx])
+            widths.append(width)
+            idx += {25: 3, 26: 5, 27: 9}[width]
+        return idx
+
+    for _ in range(count):
+        if is_map:
+            _, _, k = _cbor_head(raw, k)          # key: any integer
+            array_major, items, k = _cbor_head(raw, k)
+            assert array_major == 4, array_major
+            k = read_floats(k, items)
+        else:
+            k = read_floats(k, count)
+            break
+    assert k == len(raw), (k, len(raw))
+    return widths
+
+
+def _shortest_float_width(value):
+    """The narrowest CBOR float form holding *value* exactly (25/26/27)."""
+    for width, code in ((25, ">e"), (26, ">f")):
+        if struct.unpack(code, struct.pack(code, value))[0] == value:
+            return width
+    return 27
+
+
+# ----------------------------------------------------------------------
+# The CBOR encoders against real Gyroflow output
+# ----------------------------------------------------------------------
+
+
+@requires_processed_project
+class TestAgainstARealGyroflowProject:
+    """Decode a real export's payloads, re-encode, require the same bytes.
+
+    This is the only external check the *write* side of these codecs has. A
+    round trip through our own decoder would pass even if encoder and decoder
+    shared a wrong assumption; Gyroflow's own output cannot.
+
+    What it caught: every float was written 8 bytes wide. ciborium narrows to
+    half or single precision whenever the value survives it exactly, which is
+    most of a timestamp list — 934 bytes out of 225734 in the smaller one.
+    Decoding was never affected (any width parses), so the bug was invisible
+    until real bytes were compared.
+    """
+
+    @pytest.fixture(scope="class")
+    def payloads(self):
+        data = _reference_data(_PROCESSED_PROJECT)
+        return data["gyro_source"]
+
+    @pytest.mark.parametrize(
+        "name,decoder,encoder",
+        [
+            ("adaptive_zoom_fovs", decode_cbor_f64_list, encode_cbor_f64_list),
+            ("synced_imu_timestamps", decode_cbor_f64_list, encode_cbor_f64_list),
+            (
+                "synced_imu_timestamps_with_per_frame_offset",
+                decode_cbor_f64_list,
+                encode_cbor_f64_list,
+            ),
+            ("integrated_quaternions", decode_cbor_quat_map, encode_cbor_quat_map),
+        ],
+    )
+    def test_payload_round_trips_byte_for_byte(
+        self, payloads, name, decoder, encoder
+    ):
+        raw = decompress_from_base91(payloads[name])
+        assert encoder(decoder(raw)) == raw
+
+    def test_the_values_survive_the_round_trip(self, payloads):
+        raw = decompress_from_base91(payloads["synced_imu_timestamps"])
+        values = decode_cbor_f64_list(raw)
+        assert len(values) == 25185
+        assert decode_cbor_f64_list(encode_cbor_f64_list(values)) == values
+
+    def test_the_real_export_uses_narrow_floats(self, payloads):
+        """If this ever stops holding, the width fix has been undone — the
+        byte-for-byte test would still pass on a file that avoided the
+        narrow forms by luck."""
+        raw = decompress_from_base91(payloads["synced_imu_timestamps"])
+        widths = _cbor_float_widths(raw, is_map=False)
+        counts = {w: widths.count(w) for w in (25, 26, 27)}
+        assert counts == {25: 9, 26: 220, 27: 24956}
+
+    def test_the_quaternion_map_is_all_doubles(self, payloads):
+        """The counterpart, from the same file: not one half or single
+        appears here, because no quaternion component in this clip is
+        exactly representable in one. So the encoder cannot be "always
+        narrow" either."""
+        raw = decompress_from_base91(payloads["integrated_quaternions"])
+        widths = _cbor_float_widths(raw, is_map=True)
+        assert len(widths) == 4 * 25185
+        assert set(widths) == {27}
+
+    def test_gyroflows_width_is_the_shortest_exact_form_for_every_value(
+        self, payloads
+    ):
+        """The rule, checked against the file rather than against itself.
+
+        This is what makes ``_cbor_f64`` correct rather than merely
+        self-consistent: for all 25185 values Gyroflow chose the narrowest
+        form that holds the value, with half preferred over single where both
+        are exact.
+        """
+        raw = decompress_from_base91(payloads["synced_imu_timestamps"])
+        widths = _cbor_float_widths(raw, is_map=False)
+        values = decode_cbor_f64_list(raw)
+        assert len(widths) == len(values) == 25185
+        assert all(
+            width == _shortest_float_width(value)
+            for width, value in zip(widths, values)
+        )
+
+    def test_narrow_values_reencode_as_halves(self):
+        """The values read out of the reference as ``0xf9``, and the rule
+        that puts them back there."""
+        assert encode_cbor_f64_list([66.5])[1:2] == b"\xf9"
+        assert encode_cbor_f64_list([2738.0])[1:2] == b"\xf9"
+        assert encode_cbor_f64_list([578.375])[1:2] == b"\xfa"
 
 
 # ----------------------------------------------------------------------

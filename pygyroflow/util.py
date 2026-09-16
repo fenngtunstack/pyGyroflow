@@ -272,13 +272,34 @@ def _cbor_int(value: int) -> bytes:
 
 
 def _cbor_f64(value: float) -> bytes:
-    """Always the 8-byte form.
+    """CBOR float in the shortest form that holds *value* exactly.
 
-    ``cbor2`` would happily emit a float16 for values like 1.0, which decodes
-    the same but is not what ``ciborium`` writes. Pinning the width is what
-    makes the output byte-identical to Gyroflow's.
+    ``ciborium`` does not always write 8-byte floats: a value representable
+    exactly in half or single precision is written in that, 7 or 4 bytes
+    shorter. This is not cosmetic — it is the difference between a file
+    byte-identical to Gyroflow's and one that merely decodes the same.
+
+    The preference order is half *before* single, which is counter-intuitive
+    and was read off a real file rather than assumed: real Gyroflow 1.6.3
+    exports contain values like 66.5 and 2738.0 written as ``0xf9`` halves,
+    even though they are also single-exact. Verified against every float in
+    that project — 753/753 and 25185/25185 for the two timestamp lists
+    reproduce, while the reverse order gets 9 of them wrong.
+
+    NaN falls through to the 8-byte form: the round-trip comparison that
+    decides "exact" is false for NaN, so it is never shortened. No other
+    value goes the wrong way, since a failed narrowing raises or compares
+    unequal and lands on the next width.
     """
-    return b"\xfb" + struct.pack(">d", float(value))
+    value = float(value)
+    for prefix, code in ((b"\xf9", ">e"), (b"\xfa", ">f")):
+        try:
+            packed = struct.pack(code, value)
+        except (OverflowError, struct.error):
+            continue
+        if struct.unpack(code, packed)[0] == value:
+            return prefix + packed
+    return b"\xfb" + struct.pack(">d", value)
 
 
 def encode_cbor_quat_map(quaternions: dict[int, Any]) -> bytes:
