@@ -331,3 +331,37 @@ python -m pygyroflow ..\GX010045.MP4 -o out.mp4 --smoothness 0.5   # 真实视�
 - 排查矩阵：second_pass（排除，默认开）/ 缩放裁切差（0.92-1.20 搜索无收敛尖峰，MAD 32→29，排除主因）/ **帧偏移 +3 帧**（官方第100帧最佳匹配我们第103帧；官方成片 990 帧 vs 我们 1019 帧，差 29 帧待解释——官方 1.1.0 时代的 trim 或帧处理差异）
 - 剩余差异来源：平滑轨迹细节、编码差（官方 x265 63Mbps vs 我们 H.264）、重采样核、逐帧 fov 微差——每项贡献几个 dB，合计即 18 vs 30dB 的差距
 - **结论**：像素级逐帧等价（PSNR>30dB）当前不成立；但稳定质量同级（像素抖动 0.55/2.84 vs 官方 0.34/2.77、中段反超）。PSNR 对稳定渲染是极严苛度量——稳定后的画面残余变换微小差异会指数放大到像素域。工具落地后任何管线改动可复跑此对照量化影响。
+
+
+## 2026-09-16 镜头库同步机制（P4 清单第一项）
+
+**问题**: 镜头档案库是打包时烤进 `resources/camera_presets/profiles.cbor.gz` 的快照——上游 `gyroflow/lens_profiles` 更新后，用户只能等下一个 pygyroflow 版本。而镜头标定是"新机型发布 → 社区标定 → 上游合并"的快节奏数据，快照滞后直接表现为新机器回退默认内参。
+
+**上游机制**（`src/core/lens_profile_database.rs::load_all`）: 先加载 `data_dir()/lens_profiles`（用户目录），再加载内置资源；若用户目录里已含 `.cbor.gz` 则内置资源**跳过**（`bundle_loaded` 标志），否则两者合并（`map` 按 key 去重、先到者胜）。
+
+**实现**:
+
+1. **`pygyroflow/lens/sync.py`**（新增，Python 标准库，无新依赖）——两个同步源：
+   - `update`（默认）：从 `releases/latest/download/profiles.cbor.gz` 拉预编译包。上游的 Release workflow 就是 `compress.rs` 遍历仓库产出 cbor 并挂到 `v<CI run_number>` 标签上，所以**发布号 == 包里的 `__version`**，版本比对不需要额外协议。
+   - `clone`：`git clone --depth 1 / pull --ff-only` 原始 JSON 仓库（9810 个文件），用于钉住某个 commit、离线镜像或做两版 diff。
+   - 命令：`python -m pygyroflow.lens.sync {status,check,update,clone} [--dir D] [--force] [--quiet]`，输出 JSON；网络失败一律返回 `{"ok": false, "error": ...}` 而非抛栈。
+   - **下载原子化**：先落 `<file>.tmp<pid>`，验证能解压且 `__version` 可读，再 `os.replace` 就位。中断的下载不可能留下半截包——这是"同步工具把用户数据搞坏"的唯一真实风险点。
+   - sidecar `sync.json` 记录 version/sha256/size/url/时间戳。
+
+2. **`LensProfileDatabase` 接用户目录**（`database.py`）——搜索顺序 `用户 release 目录 → 用户 git checkout 目录 → 内置快照`，取**第一个存在且非空**的源加载（对应上游"只加载一个 bundle"语义）。
+   - **空目录不遮蔽**：旧代码 `if os.path.isdir(c): load_from_directory(c); break` 在目录存在但为空时也会 `break`——用户只要 `mkdir` 一下那个路径就会静默丢掉全部 12409 条档案。现在要求非空才认。
+   - **key 改为相对路径**：旧代码把绝对路径当 key，同一份档案从 cbor 加载 key 是 `GoPro/x.json`、从目录加载 key 是 `/abs/.../GoPro/x.json`，两者无法去重；改为 `relpath` 后与 `compress.rs` 写进 cbor 的 key 完全一致。
+   - 需要合并自定义档案时走 `load_all(extra_dirs=[...])`（显式目录先加载且不终止搜索）。
+
+**验证**:
+- 327 passed, 5 skipped（新增 34 个测试 `tests/test_lens_sync.py`：版本读取/损坏包/空目录遮蔽/key 去重/优先级/更新比对/原子写/失败不留残file/git 缺失/CLI 退出码）
+- **发布包与内置快照 sha256 完全一致**（`5b913669…`，1514864 字节）——同步目标与出厂数据同源，`update` 是真·原地升级路径
+- **key 集合逐一对齐**：原始 JSON 仓库（9810 文件）与 cbor 包各自加载后 key 集合**完全相同**（12409 == 12409，双向差集均为 0）——两源可互换、可叠加
+- 真实网络路径跑通：`update` 下载 v41、`clone` 拿到 886fc61/9810 文件、二次 `clone` 走 pull 分支
+- 优先级实测：`XDG_DATA_HOME` 指向同步目录后 `load_all()` 得 12409 条 / version 41，与默认路径一致
+
+**已知限制**:
+- 全局单源语义：`sync clone` 之后若同时存在 release 包，release 包优先、checkout 不被读取（`--dir` 可显式指定）。合并两源需 `extra_dirs`。
+- 目录源完整性未校验：被中断的 `git clone` 若留下非空残目录，会遮蔽内置快照（`git clone` 自身失败会清理目标目录，风险低但未加固）。
+- 内置快照版本 41 与上游当前 latest 相同（2026-07-28 发布）——本次同步机制上线时数据本就是最新的，收益体现在**下一次**上游更新。
+- 上游 `compatible_settings` 里的 `sync_settings` 合并在 Python 版 `get_all_matching_profiles` 中未实现（与本次改动无关，逐行核对时发现）。

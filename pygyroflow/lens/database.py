@@ -18,6 +18,69 @@ from pygyroflow.lens.profile import LensProfile
 
 logger = logging.getLogger(__name__)
 
+CBOR_BUNDLE_NAME = "profiles.cbor.gz"
+
+
+def default_lens_profile_dir() -> str:
+    """User-writable lens profile directory.
+
+    Follows the XDG base-dir spec (``$XDG_DATA_HOME``, falling back to
+    ``~/.local/share``) so that synced profiles live outside the installed
+    package and survive upgrades.
+    """
+    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+    base = xdg if xdg else os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "pygyroflow", "lens_profiles")
+
+
+def default_git_checkout_dir() -> str:
+    """Default target of a raw-repository checkout (``sync clone``).
+
+    A sibling of the release dir rather than a subdirectory of it: a git
+    working tree is not a drop-in replacement for the bundle dir (which holds
+    a single ``profiles.cbor.gz``), and a clone needs an empty destination.
+    """
+    return default_lens_profile_dir() + "_repo"
+
+
+def bundled_lens_profile_dirs() -> list[str]:
+    """Candidate locations of the profiles shipped inside the package.
+
+    The bundled copy is a snapshot taken when the package was built; it is
+    the fallback when the user has not synced a newer database.  The upward
+    walk covers source checkouts of the surrounding Rust workspace, where
+    ``profiles.cbor.gz`` lives next to the Python package.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    dirs = [os.path.join(here, "..", "resources", "camera_presets")]
+
+    parent = os.path.normpath(os.path.join(here, "..", "..", ".."))
+    for _ in range(3):
+        if os.path.isfile(os.path.join(parent, "resources", CBOR_BUNDLE_NAME)):
+            dirs.append(os.path.join(parent, "resources"))
+            break
+        if os.path.isdir(os.path.join(parent, "resources", "camera_presets")):
+            dirs.append(os.path.join(parent, "resources", "camera_presets"))
+            break
+        parent = os.path.dirname(parent)
+
+    return [os.path.normpath(d) for d in dirs]
+
+
+def lens_profile_search_paths() -> list[str]:
+    """Ordered search path: user data dirs first, bundled snapshot last.
+
+    Mirrors upstream ``load_all`` — user data wins on key collisions, and
+    exactly one source ends up loaded.  The release bundle and the git
+    checkout are both user data; the bundle comes first because it is the
+    one a plain ``sync update`` produces.
+    """
+    return [
+        default_lens_profile_dir(),
+        default_git_checkout_dir(),
+        *bundled_lens_profile_dirs(),
+    ]
+
 
 class LensProfileDatabase:
     """Collection of lens profiles with search capabilities.
@@ -95,8 +158,19 @@ class LensProfileDatabase:
     def load_from_directory(self, directory: str) -> None:
         """Recursively load ``.json`` profiles from *directory*.
 
-        ``.gyroflow`` project files are loaded as stub profiles (name only,
-        no calibration data).  ``.cbor.gz`` bundles are also detected.
+        The relative path (``"GoPro/foo.json"``) is passed as the key stem —
+        the same string the prebuilt ``profiles.cbor.gz`` stores for that file,
+        since the bundle is built by walking the repo from its root.  Profiles
+        that carry an explicit ``identifier`` are keyed by it instead (see
+        :meth:`_load_single_profile`), so a raw clone of the upstream
+        ``lens_profiles`` repo and the bundled snapshot end up with *identical*
+        key sets and dedupe against each other.  ``path_to_file`` keeps the
+        absolute path so profiles stay reloadable from disk.
+
+        ``.gyroflow`` project files are loaded as stub profiles (name only, no
+        calibration data).  A ``.cbor.gz`` bundle found in the tree is loaded
+        instead of the loose JSON files.  Hidden directories (``.git``) are
+        skipped.
         """
         directory = os.path.abspath(directory)
         if not os.path.isdir(directory):
@@ -104,15 +178,19 @@ class LensProfileDatabase:
             return
 
         bundle_loaded = False
-        for root, _dirs, files in os.walk(directory):
+        for root, dirs, files in os.walk(directory):
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
             for fname in sorted(files):
-                fpath = os.path.join(root, fname).replace("\\", "/")
+                if fname.startswith("."):
+                    continue
+                fpath = os.path.join(root, fname)
+                key = os.path.relpath(fpath, directory).replace(os.sep, "/")
 
                 if fname.endswith(".gyroflow"):
                     stub = LensProfile()
                     stub.name = Path(fname).stem
                     stub.path_to_file = fpath
-                    self._insert(fname, stub)
+                    self._insert(key, stub)
                     continue
 
                 if fname.endswith(".json"):
@@ -127,7 +205,7 @@ class LensProfileDatabase:
                     except json.JSONDecodeError as exc:
                         logger.error("Invalid JSON in %s: %s", fpath, exc)
                         continue
-                    self._load_single_profile(data, fpath)
+                    self._load_single_profile(data, key, path_to_file=fpath)
 
                 elif not bundle_loaded and fname.endswith(".cbor.gz"):
                     self.load_from_cbor(fpath)
@@ -137,32 +215,40 @@ class LensProfileDatabase:
         self.loaded = True
 
     def load_all(self, extra_dirs: list[str] | None = None) -> None:
-        """Convenience: load from the bundled CBOR file and then from extra dirs.
+        """Load every profile source, in priority order.
 
-        Mirrors the Rust ``load_all`` priority order:
-        1. User data directory (``extra_dirs``)
-        2. Application ``camera_presets/`` directory
+        Mirrors the Rust ``load_all``:
+        1. Explicit ``extra_dirs`` (all of them, in order)
+        2. The user data dir (:func:`default_lens_profile_dir`)
+        3. The snapshot bundled with the package
+
+        Steps 2 and 3 load the *first* source that exists and is non-empty,
+        matching upstream's "exactly one bundle" rule.  An empty user dir
+        therefore never shadows the bundled profiles.
         """
-        if extra_dirs:
-            for d in extra_dirs:
-                self.load_from_directory(d)
+        for d in extra_dirs or []:
+            self.load_from_directory(d)
 
-        # Try to find a profiles.cbor.gz in common locations
-        candidates = [
-            # bundled with the package (pygyroflow/resources/camera_presets)
-            os.path.join(os.path.dirname(__file__), "..", "resources", "camera_presets"),
-            os.path.join(os.path.dirname(__file__), "..", "..", "resources", "camera_presets"),
-            os.path.join(os.path.dirname(__file__), "..", "..", "camera_presets"),
-            os.path.join(os.path.dirname(__file__), "..", "..", "lens_profiles"),
-        ]
-        for c in candidates:
-            cbor_path = os.path.join(c, "profiles.cbor.gz")
-            if os.path.isfile(cbor_path):
-                self.load_from_cbor(cbor_path)
+        for candidate in lens_profile_search_paths():
+            if self._load_first_available(candidate):
                 break
-            if os.path.isdir(c):
-                self.load_from_directory(c)
-                break
+
+        self.loaded = True
+
+    def _load_first_available(self, candidate: str) -> bool:
+        """Load the CBOR bundle (preferred) or the JSON tree at *candidate*.
+
+        Returns True when something was loaded.  An existing but empty
+        directory returns False so the next candidate gets a chance.
+        """
+        cbor_path = os.path.join(candidate, CBOR_BUNDLE_NAME)
+        if os.path.isfile(cbor_path):
+            self.load_from_cbor(cbor_path)
+            return True
+        if os.path.isdir(candidate) and os.listdir(candidate):
+            self.load_from_directory(candidate)
+            return True
+        return False
 
     # ------------------------------------------------------------------ #
     #  Query                                                               #
@@ -263,8 +349,15 @@ class LensProfileDatabase:
     #  Internal helpers                                                    #
     # ------------------------------------------------------------------ #
 
-    def _load_single_profile(self, data: Any, fname: str) -> None:
-        """Parse a single profile dict and insert it (with compatible copies)."""
+    def _load_single_profile(self, data: Any, fname: str, path_to_file: str | None = None) -> None:
+        """Parse a single profile dict and insert it (with compatible copies).
+
+        *fname* is the key stem: profiles that declare an ``identifier`` are
+        keyed by it, the rest fall back to *fname* — which is the path relative
+        to the source root, matching what the CBOR bundle records.  It doubles
+        as the default ``path_to_file``; *path_to_file* overrides it when the
+        profile came from a directory scan, preserving the absolute location.
+        """
         if not isinstance(data, dict):
             return
         try:
@@ -273,7 +366,7 @@ class LensProfileDatabase:
             logger.error("Error parsing lens profile %s: %s", fname, exc)
             return
 
-        profile.path_to_file = fname
+        profile.path_to_file = path_to_file if path_to_file is not None else fname
         for derived in profile.get_all_matching_profiles():
             key = derived.identifier if derived.identifier else fname
             self._insert(key, derived)
