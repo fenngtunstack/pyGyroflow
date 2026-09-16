@@ -284,7 +284,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-03 | R | **底层缺像素格式类型**。上游 `pixel_formats.rs` 12 种（含 NV12/P010/AYUV16/RGBAf16/BGRA8 通道交换 + Rec709 full→limited 重映射）；我们 `pixel_formats.py:15-55` 只做 dtype 探测。这是 C-02 的根因 | [报告] |
 | C-04 | E | **trim ranges 渲染时不生效**。`params.trim_ranges` 只有平滑用；`manager.render` 与 `ffmpeg_processor` 完全忽略 → 永远整片渲染。上游 `mod.rs:194-200,278-280` 定位+时间戳重基+`pad_with_black`+`export_trims_separately` —— 已实现（`11294ef`） | [实测] |
 | C-05 | E | **帧率控制 / 变速缺失**。上游回调可设 `repeat_times`/`out_timestamp_us`（`mod.rs:460-479`）+ `fps_scale` VFR；我们的回调只读时间戳，`video_speed`/`fps_scale` 渲染时被忽略 —— 已实现（`6a95077`），两个机制分开：`video_speed` 改帧数、`fps_scale` 只改查询时间戳 | [实测] |
-| C-06 | E | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** —— 读写层与 CLI 接线都已实现（`1077433`、`e7fb663`）；`file_metadata` 的读与写也已补齐（`ef8801d`），余下只有 `--export-project` 的 2/3 模式（还差 `raw_imu`/`gravity_vectors` 的 bincode 写侧）。**另**：CBOR 编码器此前只有「按规范 + nalgebra serde 推导」的验证，已找到真机 `WithProcessedData` 导出（`DJI_20260507160359_0005_D.gyroflow`，25185 样本）并据此修掉一处浮点宽度错误（`b590c4b`）；`file_metadata` 这一唯一的大块此前无参照，现在也可以它为准 | [实测] |
+| C-06 | E | **`.gyroflow` 工程文件读写完全没有**。官方工程里 `gyro_source.file_metadata`/`integrated_quaternions`/`smoothed_quaternions`/`adaptive_zoom_fovs`/`synced_imu_timestamps` 全是 base91+压缩 CBOR 大块（实测 753 帧的工程）。仅 `tests/decode_gyroflow_project.py` 有只读解码器。**这是 CLI 不能吃工程文件/preset 的原因** —— 读写层与 CLI 接线都已实现（`1077433`、`e7fb663`）；`file_metadata` 的读与写也已补齐（`ef8801d`），`--export-project` 的 2/3 模式也已实现（`9772a50`）——**此前的判断「还差 `raw_imu` 编码器」本身是错的**：上游从来不写那几个 bincode 字段，非 Simple 分支只写 `file_metadata` 一块，所以它一就位 2/3 就齐了。**另**：CBOR 编码器此前只有「按规范 + nalgebra serde 推导」的验证，已找到真机 `WithProcessedData` 导出（`DJI_20260507160359_0005_D.gyroflow`，25185 样本）并据此修掉一处浮点宽度错误（`b590c4b`）；`file_metadata` 这一唯一的大块此前无参照，现在也可以它为准 | [实测] |
 | C-07 | E | **容器旋转元数据没读**（见 G-07）—— 已实现（`3aadd0d`） | [实测] |
 | C-08 | R | 无 GPU 解码/编码（上游 `ffmpeg_hw.rs` 412 行 + 各平台 interop）；无 GPU 解码重试阶梯、无像素格式回退 | [报告] |
 | C-09 | R | 渲染健壮性：上游写 `.tmp` 再改名、拷贝容器元数据/timecode、清残留 `%Nd` 文件、保持系统唤醒；我们直接写目标路径、无元数据 | [报告] |
@@ -389,6 +389,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-05 渲染时变速与 `fps_scale` | `6a95077` | `video_speed` 2.0 出 6/12 帧且留下的正是奇数帧、0.5 出 22 帧、4.0 出 3 帧；`fps_scale=2` 帧数不变且查询时间戳被 spy 证实为 `ts/2`；变速时自动丢弃音轨 |
 | D-01 逐时间戳镜头数据（`lens_positions`/`lens_params`/`digital_zoom`/`invert_asym_lens`）+ `MapClosest`、D-11 逐帧 `camera_diagonal_fovs`、D-07 读出时间按裁切缩放 | `3be3629` | 真素材：`a7s3-sony85mm` 450 包里 200 个带 `0x8005`，每个都是 85.0 mm（15015 条 IMU 行）；`rx100-7-ois-only` 无该标签、map 为空。`ClosestMap` 的等距返回 None、严格 `<` 上限、缺席侧 −99999 哨兵逐条断言；`stretch_lens` 门控与主点重置；`lens_params` 多于一项才逐帧算 FOV |
 | C-06 余下（前半）：`file_metadata` 的 CBOR 编解码 + `WithProcessedData` 工程的载入路径 + readout 方向解析 | `ef8801d` | ciborium 逐字节对照全部 19 个字段（scratch crate 用真 ciborium 0.2.2 生成，`--check` 可一键复查 fixture 是否同步）；**真机工程 1059160 字节整块逐字节往返**（四元数须以原始分量喂编码器，`Quat64` 构造时会归一化，偏差上界 2.2e-16 已单独断言）；另用真工程验证载入后拿到 25185 个四元数、`lens_profile`、`additional_data` 与 readout 时间/方向 |
+| C-06 余下（后半）：`--export-project` 2/3 模式 | `9772a50` | 真机工程：3 模式导出的 `synced_imu_timestamps` 与该工程原本导出**逐值相同**（25185 项），验证的是派生公式本身；2/3 产物都能被没见过原片的新 manager 载入并取回 25185 个四元数；CLI 侧 subprocess 跑真命令行验 2 与 3 |
 | D-08 焦距平滑（两个滤波器 + strength 映射 + fov 补偿 + FOV 缓存键） | `cb606bb` | **与上游 Rust 逐位一致**：上游 `focal_length.rs` 原样拷进临时 crate、只新写 `main()`，22 个用例全 `max_rel = 0.0`；生成脚本复现的驱动脚本与实跑逐字节相同，fixture 明确标注非自生成。接线在恒等陀螺下按 `矩阵[0,0] = fov/相机fx` 的比值断言补偿量本身 |
 
 **实施中新发现的、原清单没有的缺陷**：
@@ -462,7 +463,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | B-01/B-02 offset method 0/1 | 两套算法 |
 | B-23 OptimSync 尺度 | **先量新尺度再重标定阈值** |
 | C-02/C-03 位深/HDR 管线 | 需先补像素格式类型 |
-| C-06 余下：`--export-project` 2/3 模式 | `file_metadata` 与全部 CBOR 缓存已可写（`ef8801d`），还差 `raw_imu`/`gravity_vectors` 的 bincode 写侧 |
+| C-06 余下 | ~~已完成~~（`ef8801d`、`9772a50`）：读写两向、三种模式、真机逐字节对照；余下的只有 `raw_imu`/`gravity_vectors` 的 bincode **写**侧——上游自己也不写，可继续不做 |
 | C-01 序列输出 | 与已完成的序列输入对称 |
 
 ---
