@@ -352,6 +352,27 @@ def decode_cbor_f64_list(data: bytes) -> list[float]:
     return [float(v) for v in loaded]
 
 
+def encode_cbor_optional_f64_list(values: list[float | None]) -> bytes:
+    """CBOR ``Vec<Option<f64>>``, as the focal length curves store it.
+
+    A frame whose focal length the camera never reported is a ``null`` in the
+    array, not a zero — the two are different things here, and a curve padded
+    with zeros would divide the compensation ratio by zero-length optics.
+    """
+    out = bytearray(_cbor_head(4, len(values)))
+    for value in values:
+        out += b"\xf6" if value is None else _cbor_f64(float(value))
+    return bytes(out)
+
+
+def decode_cbor_optional_f64_list(data: bytes) -> list[float | None]:
+    """Inverse of :func:`encode_cbor_optional_f64_list`."""
+    loaded = cbor2.loads(data)
+    if not isinstance(loaded, list):
+        raise ValueError(f"expected a CBOR array, got {type(loaded).__name__}")
+    return [None if v is None else float(v) for v in loaded]
+
+
 def compress_to_base91_cbor(data: bytes) -> str:
     """CBOR bytes -> zlib(best) -> base91 (util.rs:compress_to_base91_cbor).
 

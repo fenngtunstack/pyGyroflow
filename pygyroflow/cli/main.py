@@ -35,6 +35,15 @@ log = logging.getLogger(__name__)
 # Upstream's default output suffix; `-t/--suffix` overrides it.
 DEFAULT_SUFFIX = "_stabilized"
 
+# ``--export-project N`` -> the type name ``save_project`` takes. Upstream's
+# ``GyroflowProjectType`` in numeric order (cli.rs parses the same numbers).
+# 0 is "do not export", which never reaches the lookup.
+_PROJECT_TYPE_BY_NUMBER = {
+    1: "simple",
+    2: "with_gyro_data",
+    3: "with_processed_data",
+}
+
 # Keys of a `synchronization` section this port's `synchronize()` understands.
 # The rest still land in `lens.sync_settings` — where upstream keeps them, and
 # where a project save preserves them — they just do not drive the search yet.
@@ -201,11 +210,12 @@ def main() -> None:
         "--export-project",
         type=int,
         default=0,
-        choices=[0, 1],
+        choices=[0, 1, 2, 3],
         metavar="N",
         help="Write a project file instead of rendering. 1 = settings only "
-             "(a reusable preset). Upstream's 2 (with gyro data) and "
-             "3 (with processed data) are not implemented in this port yet",
+             "(a reusable preset); 2 = the above plus the metadata, so it "
+             "loads without the clip's telemetry; 3 = the above plus the "
+             "caches a plugin reads. Matches upstream's GyroflowProjectType",
     )
     parser.add_argument(
         "--smoothness",
@@ -495,7 +505,7 @@ def main() -> None:
                 project_path = project_output_path(output, args.suffix)
                 refuse_to_overwrite(project_path, args.overwrite)
                 mgr.save_project(
-                    project_path, "simple" if args.export_project == 1 else None
+                    project_path, _PROJECT_TYPE_BY_NUMBER[args.export_project]
                 )
                 log.info("Wrote project: %s", project_path)
                 continue

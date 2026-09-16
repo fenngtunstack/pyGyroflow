@@ -464,13 +464,99 @@ class TestSaveProjectTypes:
         assert len(GyroflowProject.load(str(out)).read_blob("quaternions")) == 400
 
     @pytest.mark.parametrize("kind", ["with_gyro_data", "with_processed_data"])
-    def test_unimplemented_types_raise(self, tmp_path, kind):
-        """A project that claims to embed gyro data but does not is worse
-        than one that refuses — upstream keys its whole compressed branch on
-        `raw_imu` being present, so the file would load as empty."""
+    def test_the_motion_bearing_types_embed_the_metadata(self, tmp_path, kind):
+        """Both write `file_metadata`, and the result has to be loadable
+        without the original clip's telemetry — that is the whole point."""
+        from pygyroflow.gyro_source.file_metadata_cbor import decode_file_metadata
+        from pygyroflow.project import GyroflowProject
+        from pygyroflow.util import decompress_from_base91
+
+        clip = tmp_path / "clip.mp4"
+        clip.write_bytes(b"")
+        project = build_project(tmp_path / "p.gyroflow", clip)
+        out = tmp_path / f"{kind}.gyroflow"
+
         mgr = new_manager()
-        with pytest.raises(NotImplementedError):
-            mgr.save_project(str(tmp_path / "x.gyroflow"), kind)
+        mgr.load_project(str(project))
+        mgr.save_project(str(out), kind)
+
+        saved = GyroflowProject.load(str(out))
+        blob = saved.gyro_source.get("file_metadata")
+        assert isinstance(blob, str)
+        metadata = decode_file_metadata(decompress_from_base91(blob))
+        assert metadata.has_motion()
+        assert len(metadata.quaternions) == 400
+
+        # And a fresh manager gets the gyro back out of it.
+        reloaded = new_manager()
+        reloaded.load_project(str(out))
+        assert len(reloaded.gyro.quaternions) == 400
+
+    def test_the_legacy_bincode_blobs_are_dropped(self, tmp_path):
+        """Upstream never writes them; a stale copy sitting beside the
+        metadata it disagrees with is worse than none."""
+        from pygyroflow.project import GyroflowProject
+
+        clip = tmp_path / "clip.mp4"
+        clip.write_bytes(b"")
+        project = build_project(tmp_path / "p.gyroflow", clip)
+        out = tmp_path / "gyro.gyroflow"
+
+        mgr = new_manager()
+        mgr.load_project(str(project))
+        mgr.save_project(str(out), "with_gyro_data")
+
+        saved = GyroflowProject.load(str(out))
+        assert saved.gyro_source.get("quaternions") is None
+
+    def test_only_the_processed_mode_writes_the_caches(self, tmp_path):
+        """Mode 2 and mode 3 differ by exactly the plugin caches; carrying
+        them into a mode-2 export would promise data it does not own."""
+        from pygyroflow.project import GyroflowProject
+
+        cache_names = (
+            "integrated_quaternions", "smoothed_quaternions",
+            "adaptive_zoom_fovs", "synced_imu_timestamps",
+            "synced_imu_timestamps_with_per_frame_offset",
+        )
+        clip = tmp_path / "clip.mp4"
+        clip.write_bytes(b"")
+        project = build_project(tmp_path / "p.gyroflow", clip)
+
+        mgr = new_manager()
+        mgr.load_project(str(project))
+
+        plain = tmp_path / "gyro.gyroflow"
+        mgr.save_project(str(plain), "with_gyro_data")
+        source = GyroflowProject.load(str(plain)).gyro_source
+        assert all(source.get(name) is None for name in cache_names)
+
+        rich = tmp_path / "processed.gyroflow"
+        mgr.save_project(str(rich), "with_processed_data")
+        source = GyroflowProject.load(str(rich)).gyro_source
+        assert all(isinstance(source.get(name), str) for name in cache_names)
+
+    def test_the_synced_timeline_is_the_gyro_timeline(self, tmp_path):
+        """`synced_imu_timestamps` is the quaternion timeline rebased by the
+        sync offsets — with none set, it is the keys in milliseconds."""
+        from pygyroflow.project import GyroflowProject
+        from pygyroflow.util import decode_cbor_f64_list, decompress_from_base91
+
+        clip = tmp_path / "clip.mp4"
+        clip.write_bytes(b"")
+        project = build_project(tmp_path / "p.gyroflow", clip)
+        out = tmp_path / "processed.gyroflow"
+
+        mgr = new_manager()
+        mgr.load_project(str(project))
+        expected = sorted(mgr.gyro.quaternions)
+        mgr.save_project(str(out), "with_processed_data")
+
+        source = GyroflowProject.load(str(out)).gyro_source
+        synced = decode_cbor_f64_list(
+            decompress_from_base91(source["synced_imu_timestamps"])
+        )
+        assert synced == [ts / 1000.0 for ts in expected]
 
     def test_unknown_type_raises(self, tmp_path):
         mgr = new_manager()
@@ -555,6 +641,42 @@ class TestCli:
         data = json.loads(written.read_text())
         assert "quaternions" not in data["gyro_source"]
         assert data["video_info"]["width"] == 64
+
+    @pytest.mark.parametrize("number,expect_caches", [(2, False), (3, True)])
+    def test_export_project_types_two_and_three(self, tmp_path, number, expect_caches):
+        """2 embeds the metadata, 3 the metadata plus the plugin caches.
+
+        Run through the real CLI, and the result re-loaded into a *fresh*
+        manager that never saw the clip: that is what "carries its own gyro"
+        has to mean.
+        """
+        from pygyroflow.manager import StabilizationManager
+        from pygyroflow.project import GyroflowProject
+
+        clip = tmp_path / "clip.mp4"
+        write_clip(clip)
+        project = build_project(tmp_path / "p.gyroflow", clip)
+
+        result = run_cli(
+            project, "-o", tmp_path / "out.mp4",
+            "--codec", "H.264/AVC", "--no-autosync",
+            "--export-project", str(number),
+        )
+        assert result.returncode == 0, result.stderr
+
+        written = tmp_path / "out.gyroflow"
+        saved = GyroflowProject.load(str(written))
+        assert isinstance(saved.gyro_source.get("file_metadata"), str)
+        assert saved.gyro_source.get("quaternions") is None
+
+        caches = ("integrated_quaternions", "synced_imu_timestamps")
+        for name in caches:
+            present = isinstance(saved.gyro_source.get(name), str)
+            assert present is expect_caches, name
+
+        reloaded = StabilizationManager()
+        reloaded.load_project(str(written))
+        assert len(reloaded.gyro.quaternions) == 400
 
     def test_preset_flag_changes_the_saved_settings(self, tmp_path):
         clip = tmp_path / "clip.mp4"

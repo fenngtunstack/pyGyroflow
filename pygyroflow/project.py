@@ -41,12 +41,14 @@ from pygyroflow.gyro_source.file_metadata_cbor import (  # noqa: F401  (codec ta
 from pygyroflow.util import (
     compress_to_base91,
     decode_cbor_f64_list,
+    decode_cbor_optional_f64_list,
     decode_cbor_quat_map,
     decode_imu_list,
     decode_quat_map,
     decode_vec3_map,
     decompress_from_base91,
     encode_cbor_f64_list,
+    encode_cbor_optional_f64_list,
     encode_cbor_quat_map,
     encode_f64_list,
     encode_quat_map,
@@ -107,8 +109,8 @@ _CBOR_READERS = {
     "adaptive_zoom_fovs": decode_cbor_f64_list,
     "synced_imu_timestamps": decode_cbor_f64_list,
     "synced_imu_timestamps_with_per_frame_offset": decode_cbor_f64_list,
-    "focal_lengths": decode_cbor_f64_list,
-    "smoothed_focal_lengths": decode_cbor_f64_list,
+    "focal_lengths": decode_cbor_optional_f64_list,
+    "smoothed_focal_lengths": decode_cbor_optional_f64_list,
     # The whole FileMetadata struct. Not a plain value like the others: it
     # decodes to a FileMetadata, which is the payload a WithGyroData /
     # WithProcessedData project keeps its IMU in.
@@ -123,8 +125,8 @@ _BLOB_WRITERS = {
     "adaptive_zoom_fovs": encode_cbor_f64_list,
     "synced_imu_timestamps": encode_cbor_f64_list,
     "synced_imu_timestamps_with_per_frame_offset": encode_cbor_f64_list,
-    "focal_lengths": encode_cbor_f64_list,
-    "smoothed_focal_lengths": encode_cbor_f64_list,
+    "focal_lengths": encode_cbor_optional_f64_list,
+    "smoothed_focal_lengths": encode_cbor_optional_f64_list,
     "file_metadata": encode_file_metadata,
 }
 

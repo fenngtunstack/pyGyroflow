@@ -803,12 +803,20 @@ class StabilizationManager:
         ``"simple"``
             Drop every embedded motion payload, leaving the settings only —
             what ``export_gyroflow_data(Simple)`` produces.
-        ``"with_gyro_data"`` / ``"with_processed_data"``
-            Not written yet. They need the `raw_imu` encoder, and a missing
-            `raw_imu` is worse than none: upstream keys its whole compressed
-            branch on whether `raw_imu` is a string, so a project carrying
-            `quaternions` without it loads as empty. These raise rather than
-            emit that.
+        ``"with_gyro_data"``
+            Embed the metadata as a CBOR ``file_metadata`` blob, so the
+            project can be re-loaded without the original clip's telemetry.
+        ``"with_processed_data"``
+            The above plus the caches a plugin reads —
+            ``integrated_quaternions``, ``smoothed_quaternions``,
+            ``adaptive_zoom_fovs``, the two ``synced_imu_timestamps*``
+            timelines and the focal length curves.
+
+        Upstream never writes the ``gyro_source.quaternions``/``raw_imu``/
+        ``gravity_vectors`` blobs in any mode; they are legacy fields it only
+        reads (``import_gyroflow_data`` even removes them after loading), so
+        modes 2 and 3 drop any old copy rather than leave one to disagree with
+        the metadata written beside it.
 
         `app_version` and `date` are stamped from the writer, as upstream's
         `export_gyroflow_data` does — they describe who produced the file,
@@ -822,12 +830,7 @@ class StabilizationManager:
         import pygyroflow
         from pygyroflow.project import PROJECT_VERSION, GyroflowProject
 
-        if project_type in ("with_gyro_data", "with_processed_data"):
-            raise NotImplementedError(
-                f"project_type={project_type!r} needs the raw_imu and "
-                "file_metadata encoders, which this port does not have yet"
-            )
-        if project_type not in (None, "simple"):
+        if project_type not in (None, "simple", "with_gyro_data", "with_processed_data"):
             raise ValueError(f"Unknown project_type: {project_type!r}")
 
         proj = getattr(self, "project", None) or GyroflowProject()
@@ -872,7 +875,10 @@ class StabilizationManager:
                 if isinstance(e, dict) and "name" in e and "value" in e
             ],
             "frame_readout_time": abs(p.frame_readout_time),
-            "frame_readout_direction": int(p.frame_readout_direction),
+            # The variant name, not its number: serde writes a unit enum that
+            # way and a real export shows `"TopToBottom"`. The reader accepts
+            # both, but a file we write should look like one Gyroflow writes.
+            "frame_readout_direction": p.frame_readout_direction.name,
             "adaptive_zoom_window": p.adaptive_zoom_window,
             "adaptive_zoom_center_offset": list(p.adaptive_zoom_center_offset),
             "adaptive_zoom_method": p.adaptive_zoom_method,
@@ -931,10 +937,125 @@ class StabilizationManager:
 
         if project_type == "simple":
             proj.strip_motion_payloads()
+        elif project_type in ("with_gyro_data", "with_processed_data"):
+            processed = project_type == "with_processed_data"
+            self._embed_motion_payloads(proj, keep_processed=processed)
+            if processed:
+                self._embed_processed_payloads(proj)
 
         proj.save(path)
         self.input_file.project_file_url = path
         log.info("Saved project %s", path)
+
+    def _project_file_metadata(self):
+        """The FileMetadata to embed in a project, from live state.
+
+        Upstream writes `compress_to_base91_cbor(&*file_metadata)` — the gyro
+        source's own metadata, whose `quaternions` field holds what the project
+        should be able to re-load. Here that is `self.gyro.quaternions`, the
+        integrated set: it is what a real export carries (in
+        `DJI_20260507160359_0005_D.gyroflow` the two maps are identical), and
+        it is what makes the file self-sufficient, since `has_motion()` is what
+        a loader keys on.
+        """
+        from pygyroflow.gyro_source import FileMetadata
+
+        source = self.gyro.file_metadata
+        return FileMetadata(
+            imu_orientation=source.imu_orientation,
+            raw_imu=list(source.raw_imu),
+            quaternions=dict(self.gyro.quaternions) or dict(source.quaternions),
+            gravity_vectors=source.gravity_vectors,
+            image_orientations=source.image_orientations,
+            detected_source=source.detected_source,
+            frame_readout_time=source.frame_readout_time,
+            frame_readout_direction=source.frame_readout_direction,
+            frame_rate=source.frame_rate,
+            camera_identifier=source.camera_identifier,
+            lens_profile=source.lens_profile,
+            lens_positions=dict(source.lens_positions),
+            lens_params=dict(source.lens_params),
+            digital_zoom=source.digital_zoom,
+            has_accurate_timestamps=source.has_accurate_timestamps,
+            additional_data=dict(source.additional_data or {}),
+            per_frame_time_offsets=list(source.per_frame_time_offsets),
+            camera_stab_data=list(source.camera_stab_data),
+            mesh_correction=list(source.mesh_correction),
+        )
+
+    def _embed_motion_payloads(self, proj, keep_processed: bool = False) -> None:
+        """Write the `file_metadata` blob (modes 2 and 3).
+
+        Upstream's non-Simple export does exactly this one insert; the
+        `gyro_source.quaternions`/`raw_imu`/`gravity_vectors` blobs are
+        *legacy* fields it only ever reads, so any old copy of them is dropped
+        rather than left to disagree with the metadata beside it.
+
+        The processed caches are dropped as well unless *keep_processed*: they
+        are what separates mode 3 from mode 2, and the loader keeps unmodelled
+        sections verbatim, so a mode-2 export of a project loaded from a mode-3
+        file would otherwise carry them along.
+        """
+        from pygyroflow.project import _BINCODE_READERS, _CBOR_READERS
+
+        metadata = self._project_file_metadata()
+        proj.write_blob("file_metadata", metadata)
+        for name in _BINCODE_READERS:
+            proj.gyro_source.pop(name, None)
+        if not keep_processed:
+            for name in _CBOR_READERS:
+                if name != "file_metadata":
+                    proj.gyro_source.pop(name, None)
+
+    def _embed_processed_payloads(self, proj) -> None:
+        """Write the caches a plugin reads (mode 3).
+
+        ``synced_imu_timestamps`` is the gyro timeline rebased onto the video's
+        by the sync offsets, so a plugin can line the two up without redoing
+        the sync. The ``_with_per_frame_offset`` twin subtracts the per-frame
+        timestamp correction back off, which is the timeline the samples were
+        actually captured on. Both are computed the way lib.rs does, frame
+        index and ``ceil`` included.
+        """
+        params = self.params
+        metadata = self._project_file_metadata()
+        # `params.fovs` verbatim, empty included: recomputing the adaptive zoom
+        # is the caller's job, and writing a made-up single value in its place
+        # would be worse than writing none.
+        fovs = list(params.fovs or [])
+
+        synced = []
+        synced_final = []
+        readout_half = abs(params.frame_readout_time) / 2.0
+        scaled_fps = params.get_scaled_fps()
+        for timestamp_us in sorted(self.gyro.quaternions):
+            timestamp_ms = timestamp_us / 1000.0
+            timestamp_ms += self.gyro.offset_at_gyro_timestamp(timestamp_ms)
+            synced.append(timestamp_ms)
+
+            # `ceil` and the frame index, straight from lib.rs. A frame index
+            # past the end has no offset to subtract, so it contributes none.
+            frame = math.ceil((timestamp_ms - readout_half) * scaled_fps / 1000.0)
+            correction = (
+                metadata.per_frame_time_offsets[frame]
+                if 0 <= frame < len(metadata.per_frame_time_offsets)
+                else 0.0
+            )
+            synced_final.append(timestamp_ms - correction)
+
+        proj.write_blob("integrated_quaternions", dict(self.gyro.quaternions))
+        proj.write_blob("smoothed_quaternions", dict(self.gyro.smoothed_quaternions))
+        proj.write_blob("adaptive_zoom_fovs", fovs)
+        proj.write_blob("synced_imu_timestamps", synced)
+        proj.write_blob(
+            "synced_imu_timestamps_with_per_frame_offset", synced_final
+        )
+        for name, curve in (
+            ("focal_lengths", params.focal_lengths),
+            ("smoothed_focal_lengths", params.smoothed_focal_lengths),
+        ):
+            if curve:
+                proj.write_blob(name, [v for v in curve])
 
     def recompute_smoothing(self) -> None:
         """Recompute smoothed quaternions.
