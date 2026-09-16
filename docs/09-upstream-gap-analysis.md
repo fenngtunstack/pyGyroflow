@@ -266,8 +266,8 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | B-20 | D | Almeida 的最终取逆方向与上游相反（`almeida.py:200-202` 返回相机旋转，`almeida.rs:34-36` 返回点旋转）。两者相对差一个逆——**所有 Almeida 推导出的欧拉角符号相反**。另 `_CameraK` 只有 K，无畸变/无逐帧内参 | [报告] |
 | B-21 | D | 方法 0 配置未复刻：上游用 LMEDS/prob 0.999/threshold 1e-5/maxIters 4000/focal 1e5（`find_essential_mat.rs:34-42`）；我们用 RANSAC/1.0px/真实 K（`eight_point.py:20-22`）。且我们的 method 0 与 method 2 **是同一个函数**（`__init__.py:79-98`），上游不是 | [报告] |
 | B-22 | D | 单应方法：上游 `find_homography_ext(RANSAC, 0.001, 2000, 0.999)` + 按 **max|t|²** 选分解（`find_homography.rs:38-52`）；我们 `cv2.findHomography(RANSAC, 5.0px)` + **取 `Rs[0]`** | [报告] |
-| B-23 | R | **OptimSync 幅度公式尺度不同**。`optimsync.py:129` `np.abs(np.fft.rfft(chunk))`（真幅度）；上游 `optimsync.rs:98-101` `|a+reverse(a)| = 2|Re(FFT)|`。下游阈值（rank<50、nlfunc 450/650、0.1）是按上游尺度标定的 → 判据失效 | [实测] |
-| B-24 | R | **OptimSync 缺低运动分支**。上游 `mf_max < 50.0` 时切 `(lf+mf)/penalty`（`optimsync.rs:134-148`）；我们恒走正常公式 | [报告] |
+| B-23 | R | **OptimSync 频谱公式不同**。`optimsync.py:129` 用 `np.abs(np.fft.rfft(chunk))`（模长）；上游 `optimsync.rs:98-101` 是 `zip(cm, cm.rev()).take(n/2).map(a+b).norm()`，即 bin k = `cm[k] + cm[n-1-k]`，对实信号 = `cm[k] + conj(cm[k+1])` —— **相邻两 bin 的带相位求和**。下游阈值（rank<50、450/650、0.1）按折返尺度标定 → 用模长等于换了尺度。**注：本条初稿写作「2·|Re(FFT)|」是错的**，已用 rustfft 参照程序推翻（参照向量 bin2：折返 11.58 vs 模长 0.56） | [实测] |
+| B-24 | R | **OptimSync 缺低运动分支**。上游 `mf_max < 50.0` 时切 `(lf+mf)/penalty`（`optimsync.rs:134-148`）；我们恒走正常公式。慢速平移的能量全在 2Hz 以下，正常公式会把它罚没，结果是选不出任何同步点 | [实测] |
 | B-25 | D | OptimSync 返回**已裁**的 rank（`:219`，就地清零于 `:177-189`）；上游返回未裁的 `rank_clone` | [报告] |
 | B-26 | D | 多同步点窗口筛选用陀螺时间戳去筛**视频**帧（`manager.py:684`）。偏移量级相对 ±500ms 窗口可忽略，但两套时间线混用。**（子代理报的"键落在错误时间线"不成立——`points_ms` 来自 `OptimusSync(ts_ms,...)`，`ts_ms` 在 `manager.py:664` 明确取自 gyro_data）** | [实测] |
 | B-27 | D | 上游同步期 `keyframes.clear()` + `lens_correction_amount = 1.0`（`autosync.rs:86-89`）；我们无强制校正也无关键帧抑制 | [报告] |
@@ -353,6 +353,43 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | E-17 | 相机标识符的 GoPro tag（EISA/EISE/VFOV/ZFOV/PRJT）、RED fps=0、hero12/13→11、runcam/caddx 默认值、镜头别名表 | 逐条一致 |
 | E-18 | `calculate_fovs` 策略选择（空/静态 `<-0.9`/动态 `>0.0001`/禁用） | 一致 |
 | E-19 | GoPro method-0 mounting 旋转（实测恒定 20.5°±0.40°，逐帧差 0.043°） | **实测证明非缺口** |
+
+---
+
+## 修复进展（2026-09-16）
+
+第一、二部分里已落地的项，按提交顺序（P0 全部完成）：
+
+| 项 | 提交 | 验证 |
+|---|---|---|
+| G-01 编码异常上抛 + 按 codec 选 pix_fmt | `f2a71d0` | 三种 codec 端到端出文件；用 xyz12le 复现同一 EINVAL 并断言抛 VideoIOError |
+| 同上的连带：解码线程正常结束不再丢尾部帧 | `b50cffa` | 1/5/6/7/30/61 帧逐一断言输出帧数 == 输入帧数 |
+| G-02 遥测检测改结构性标记 + 首尾有界窗口 | `44eb067` | 77 个素材全量：Sony 29→32、GoPro 24→28、DJI 4→1 |
+| G-03 IMU 变换/滤波三连 | `6925eb8` | bias 跨 load 存活、raw_imu 不再被清空、两个滤波器首次真正工作 |
+| G-15 Sony 畸变哈希字节一致 | `12f2eb6` | rustfft 同款 Rust 参照程序，双方 CRC 均 `906280fe` |
+| G-08 + D-02 + D-04 地平线锁单次施加、顺序对齐、additional_rotation 接线 | `8c1963b` | 锁恰好调用一次（spy）；5° 旋转使校正量移动 sin(2.5°) |
+| G-04 GPU 插值核真正到达 shader（含 pipeline 缓存 key） | `cd705a0` | GPU 2 vs 8 锐度比 1.56x；三个核与 CPU 对应项差 ≤2 级 |
+| G-05 gyro_export stab 语义 | `8c1963b` | 写出的值等于平滑朝向、不等于校正量 |
+| B-10 AKAZE 常数、B-11 DIS preset | `b50cffa` | 常数逐项对照 akaze.rs / opencv_dis.rs |
+| B-03 rs-sync `−readout/2` 与 90% 搜索半径门 | `8c1963b` | 5 项算术测试 |
+| D-03 optimal_fov、D-12 framebuffer_inverted、B-12 per_frame_time_offsets | `8c1963b` | 逐项断言字段生效且不误伤相邻项 |
+| B-23/B-24 OptimSync 折返公式 + 低运动分支 | `f2e05ce` | rustfft 参照逐值比对（<1e-5） |
+| D-19/D-20 关键帧 clear 语义与时间缩放 | `f2e05ce` | provider 收到的时间只缩放一次 |
+| D-09/D-21/D-22/D-23 缩放与平滑四小项 | `f2e05ce` | 关键帧透传、窗口下限、迭代次数、帧索引取整 |
+| A-11 get_checksum 补齐字段集 | `f2e05ce` | 11 项参数逐一断言影响哈希 |
+| D-05 max-zoom 反馈回路（此前 max_zoom 完全无效） | `bfb11d9` | max_zoom=110 时限制 0.3946 且 fovs 随之变化；130 不触发 |
+
+**实施中新发现的、原清单没有的缺陷**：
+
+- `default_algo`/`plain` 用 `if frame in fov_limit_per_frame:` 读逐帧限制——对 list 是**值成员测试**，浮点限制值永远不匹配，限制实际从未生效（`bfb11d9`）。
+- `gpu/backend.py` 的 pipeline 缓存 key 只哈希 shader 源码、不含 pipeline 常量，某个畸变模型首次建出的 kernel 会被整个进程复用（`cd705a0`）。
+- 测试夹具 `tests/test_e2e.py` 的合成 GoPro mp4 的 `hdlr` 只有裸 `gpmd`，而真机是 `mhlr`/`meta` + Pascal 串 `GoPro MET`（`12f2eb6`）。
+
+**原清单中经复核被推翻的结论**：
+
+- B-23 初稿写"上游 = `2·|Re(FFT)|`"，错。实为 `cm[k] + cm[n-1-k]`（相邻 bin 带相位求和），已用 rustfft 参照程序推翻。
+- B-26 初稿说"多同步点键落在错误时间线（视频而非陀螺）"，不成立。已降级为"窗口筛选用错时间线、量级可忽略"。
+- D-03 初稿把"FrameTransform 的 fov 与 ui_fov 接反"当成候选缺陷，复核后确认我们的接线与上游一致（`frame_transform.rs:319` 收渲染 fov、`:337` 收 UI fov）。
 
 ---
 
