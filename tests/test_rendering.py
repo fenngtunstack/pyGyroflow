@@ -182,3 +182,85 @@ class TestFrameCountPreserved:
         with pytest.raises(VideoIOError):
             proc.process_frames(lambda img, ts, idx: img)
         proc.close()
+
+class TestImageSequenceOutput:
+    """Still-image sequence output (PNG / EXR).
+
+    The input side has accepted image sequences for a while; the output side
+    only ever produced video. FFmpeg's image2 muxer takes a printf pattern
+    and writes one file per frame, which is what the sequence options use.
+    """
+
+    @staticmethod
+    def _render(tmp_path, codec, pattern, frames=5):
+        src = tmp_path / "in.mp4"
+        _write_source(src, frames=frames)
+        out = tmp_path / pattern
+        out.parent.mkdir(parents=True, exist_ok=True)
+        proc = FfmpegProcessor()
+        proc.open_input(str(src))
+        proc.create_output(str(out), 64, 48, 30.0, codec=codec)
+        proc.process_frames(lambda img, ts, idx: img)
+        proc.close()
+        return out.parent
+
+    @pytest.mark.parametrize(
+        "codec,pattern,extension",
+        [
+            ("PNG Sequence", "seq/f_%04d.png", ".png"),
+            ("EXR Sequence", "seq/f_%04d.exr", ".exr"),
+        ],
+    )
+    def test_writes_one_file_per_frame(self, tmp_path, codec, pattern, extension):
+        directory = self._render(tmp_path, codec, pattern)
+        files = sorted(p.name for p in directory.iterdir())
+        # image2 numbers from 1 by default.
+        assert files == [f"f_{i:04d}{extension}" for i in range(1, 6)]
+
+    @pytest.mark.parametrize(
+        "codec,pattern",
+        [
+            ("PNG Sequence", "seq/f_%04d.png"),
+            ("EXR Sequence", "seq/f_%04d.exr"),
+        ],
+    )
+    def test_written_frames_are_readable_images(self, tmp_path, codec, pattern):
+        directory = self._render(tmp_path, codec, pattern)
+        first = sorted(directory.iterdir())[0]
+        av = pytest.importorskip("av")
+        with av.open(str(first)) as container:
+            frame = next(container.decode(video=0))
+            assert (frame.width, frame.height) == (64, 48)
+
+    def test_missing_printf_pattern_is_rejected(self, tmp_path):
+        src = tmp_path / "in.mp4"
+        _write_source(src)
+        proc = FfmpegProcessor()
+        proc.open_input(str(src))
+        with pytest.raises(VideoIOError, match="printf pattern"):
+            proc.create_output(
+                str(tmp_path / "plain.png"), 64, 48, 30.0, codec="PNG Sequence"
+            )
+        proc.close()
+
+    def test_sequence_output_prepares_no_audio(self, tmp_path):
+        src = tmp_path / "in.mp4"
+        _write_source(src)
+        (tmp_path / "seq").mkdir()
+        proc = FfmpegProcessor()
+        proc.open_input(str(src))
+        proc.create_output(
+            str(tmp_path / "seq" / "f_%04d.png"), 64, 48, 30.0, codec="PNG Sequence"
+        )
+        proc.prepare_audio()  # no-op for image2
+        proc.process_frames(lambda img, ts, idx: img)
+        proc.copy_audio()  # no-op too
+        proc.close()
+
+    def test_exr_is_written_as_float(self, tmp_path):
+        directory = self._render(tmp_path, "EXR Sequence", "seq/f_%04d.exr")
+        first = sorted(directory.iterdir())[0]
+        assert first.stat().st_size > 0
+        av = pytest.importorskip("av")
+        with av.open(str(first)) as container:
+            assert container.streams.video[0].codec_context.pix_fmt == "gbrpf32le"

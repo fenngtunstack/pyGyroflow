@@ -41,8 +41,13 @@ def main() -> None:
     parser.add_argument(
         "--codec",
         default="H.265/HEVC",
-        choices=["H.264/AVC", "H.265/HEVC", "ProRes"],
-        help="Output codec (default: H.265/HEVC)",
+        choices=[
+            "H.264/AVC", "H.265/HEVC", "ProRes",
+            "PNG Sequence", "EXR Sequence",
+        ],
+        help="Output codec (default: H.265/HEVC). The sequence options write "
+             "one file per frame and need a printf pattern in -o "
+             "(e.g. 'out/frame_%%05d.png'); EXR is written as 32-bit float",
     )
     parser.add_argument(
         "--fps",
@@ -249,8 +254,19 @@ def main() -> None:
             mgr.recompute_blocking()
 
             # Determine output path
+            is_sequence_out = args.codec in ("PNG Sequence", "EXR Sequence")
             if args.output:
                 output = args.output
+            elif is_sequence_out:
+                import os as _os
+
+                extension = "png" if args.codec == "PNG Sequence" else "exr"
+                directory = _os.path.join(
+                    _os.path.dirname(_os.path.abspath(path)),
+                    sequence_output_stem(path) + "_stabilized",
+                )
+                _os.makedirs(directory, exist_ok=True)
+                output = _os.path.join(directory, f"frame_%05d.{extension}")
             elif info.get("image_sequence"):
                 output = sequence_output_stem(path) + "_stabilized.mp4"
             else:

@@ -165,7 +165,26 @@ class StabilizationManager:
 
         self.init_from_video_data(duration_ms, fps, frame_count, (width, height))
 
+
         sequence = video_info.get("image_sequence")
+
+        # Container display rotation. A phone or action camera stores it in
+        # the tkhd matrix and the player applies it at playback; ignoring it
+        # renders portrait footage on its side. Upstream reads it with
+        # av_display_rotation_get and folds it in as (360 - rotation) % 360
+        # (render_queue.rs). Image sequences and stills have no container.
+        if sequence is None:
+            from pygyroflow.rendering.container_metadata import (
+                read_display_rotation,
+            )
+
+            rotation = read_display_rotation(path)
+            if rotation:
+                self.params.video_rotation = (360.0 - rotation) % 360.0
+                log.info(
+                    "Container display rotation %.1f deg -> video_rotation %.1f",
+                    rotation, self.params.video_rotation,
+                )
         if sequence is not None:
             self.input_file.image_sequence_fps = fps
             self.input_file.image_sequence_start = sequence.start_number

@@ -31,6 +31,14 @@ _CODEC_MAP: dict[str, str] = {
 # Default codec when an unknown name is given.
 _DEFAULT_CODEC = "libx265"
 
+# Still-image sequence output. The value is (encoder, pixel format); the
+# muxer is FFmpeg's image2, which writes one file per frame using the
+# "%0Nd" pattern in the output path. Audio does not apply.
+_SEQUENCE_CODECS: dict[str, tuple[str, str]] = {
+    "PNG Sequence": ("png", "rgb24"),
+    "EXR Sequence": ("exr", "gbrpf32le"),
+}
+
 # Pixel format per encoder.  Encoders are not interchangeable here: prores_ks
 # only accepts 10-bit 4:2:2 (yuv422p10le), and hardcoding yuv420p for every
 # codec makes avcodec_open2 fail with EINVAL.  The 8-bit encoders are happy
@@ -101,6 +109,7 @@ class FfmpegProcessor(VideoProcessor):
         self._frame_index: int = 0
         self._audio_pairs: list = []
         self._output_codec_name: str | None = None
+        self._output_is_sequence: bool = False
 
     # ------------------------------------------------------------------
     # VideoProcessor interface
@@ -208,19 +217,34 @@ class FfmpegProcessor(VideoProcessor):
         if self._input_container is None:
             raise VideoIOError("No input is open; call open_input() first")
 
-        codec_name = _CODEC_MAP.get(codec, _DEFAULT_CODEC)
-        self._output_codec_name = codec_name
-        self._output_container = av.open(path, mode="w")
+        sequence = _SEQUENCE_CODECS.get(codec)
+        self._output_is_sequence = sequence is not None
         from fractions import Fraction
         fps_frac = Fraction(fps).limit_denominator(100000)
+
+        if sequence is not None:
+            codec_name, pix_fmt = sequence
+            if "%" not in path:
+                raise VideoIOError(
+                    f"{codec} output needs a printf pattern in the output "
+                    f"path (e.g. 'frames/out_%05d.png'), got: {path}"
+                )
+        else:
+            codec_name = _CODEC_MAP.get(codec, _DEFAULT_CODEC)
+            pix_fmt = _PIX_FMT_MAP.get(codec_name, "yuv420p")
+
+        self._output_codec_name = codec_name
+        self._output_container = av.open(
+            path, mode="w", format="image2" if sequence is not None else None
+        )
         self._output_stream = self._output_container.add_stream(
             codec_name, rate=fps_frac
         )
         self._output_stream.width = width
         self._output_stream.height = height
-        self._output_stream.pix_fmt = _PIX_FMT_MAP.get(codec_name, "yuv420p")
+        self._output_stream.pix_fmt = pix_fmt
 
-        profile = _ENCODER_PROFILE.get(codec_name)
+        profile = _ENCODER_PROFILE.get(codec_name) if sequence is None else None
         if profile is not None:
             try:
                 self._output_stream.codec_context.profile = profile
@@ -244,6 +268,9 @@ class FfmpegProcessor(VideoProcessor):
         """
         if self._input_container is None or self._output_container is None:
             raise VideoIOError("Both input and output must be opened first")
+        if self._output_is_sequence:
+            # image2 has no audio stream to attach.
+            return
 
         from pygyroflow.rendering.audio_resampler import prepare_audio_streams
 
