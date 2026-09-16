@@ -13,6 +13,7 @@ Gyroflow v1.6.3 Python 完整移植版——视频防抖库。
 | [05-验证方案](05-verification.md) | 四级验证策略、Rust-Python 黄金对比、测试矩阵 |
 | [06-测试报告](06-test-report.md) | 测试结果、数值一致性数据、缺陷修复记录 |
 | [07-优化成果报告](07-optimization-report.md) | 多轮审计、正确性修复、bit-exact 真值对照、性能向量化成果与遗留 |
+| [09-上游对照差异清单](09-upstream-gap-analysis.md) | 对上游 Rust 源码的全模块逐条对照（缺口/差异/等价三分），含证据等级与优先级 |
 
 ## 架构图
 
