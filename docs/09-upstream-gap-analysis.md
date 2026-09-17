@@ -429,6 +429,9 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 
 **做 D-06 时新发现的缺陷**：
 
+- **姿态估计的 method 0 跑的是 method 2 的代码，而 `estimate_essential_matrix` 根本没人调**。上游 `estimate_pose/mod.rs:27-35` 是 `0=PoseFindEssentialMat, 1=PoseAlmeida, 2=PoseEightPoint, 3=PoseFindHomography`，未知值**回落到 Almeida**。本移植 `estimate_pose/__init__.py:45-47` 把 0 映射成 `"essential_matrix"`，但 `estimate_rotation` 里 0 和 2 的**实现是同一个函数** `estimate_pose_eight_point`；`estimate_essential_matrix` 在包外只被 `__init__.py` 的 `__all__` 导出，`estimate_rotation` 从不调用它——即**默认 method（manager 三处都传 `pose_method=0`）跑的是 method 2 的代码**。而两边的 method 2 也不是一回事：上游 `eight_point.rs` 是 ARRSAC 八点法（阈值 1e-10/1e-8/1e-6，作用在归一化坐标上），移植用的是 `cv2.findEssentialMat(p1,p2,K,RANSAC,1.0)` + `recoverPose`（阈值 1.0 **像素**）。ARRSAC 在 OpenCV 里没有对应物，所以 method 2 要忠实地移植得自己实现 ARRSAC——这条先记下，未动。
+- **姿态估计的点没做畸变校正**（同上一批的根因）。上游 `find_essential_mat.rs:25-26` 与 `eight_point.rs:26-27` 都先 `undistort_points_for_optical_flow(pts, ts, params, size)`；本移植两个估计器都直接吃原始像素点。这与 Almeida 那条同类，但影响更大——它是**默认 method** 的路径。
+
 - **HyperView 的 x 多项式，y² 耦合项写在乘法外面**（`e229f05`）。上游 `uv.0 * (P(x²) + y2*-0.1086027)`，移植写成 `uv.0 * (P(x²)) + y2*-0.1086027`——差一个因子 x，所以两者在**竖直中线**上相同、离开就分岔，写成加项时看代码完全正常。是模块自己带的 WGSL 文本（照抄上游的）把它出卖了：同一文件里两处自相矛盾。实测 `x == width/2` 那一列上游返回原列不变，移植漂出 6.7 px（相对 7e-3）。前向 `undistort_point` 同样受影响。
 - **HyperView 的逆迭代被移植自造了收敛保护**（`e229f05`）。上游 12 步、无保护；移植 20 步 + 发散重置，连 WGSL 也被改成 20（而 docstring 仍声称与 Gyroflow 的 WGSL 完全一致）。量了整帧（1920x1080，8 px 采样）：上游 NaN 9.0%、跑满 12 步未收敛 52%；移植 NaN 0%、11% 重置回「拉伸过但没求逆」的输入——那个重置的语义其实是**把数码镜头整个跳过**。两种都不好，选择改回上游：移植的目的是与 Gyroflow 一致，自造一个更"稳"的版本会让每次 HyperView 对比都对不上而原因看不出来。**上游这个逆迭代本身是坏的**（多数帧不收敛），记为上游性质而非我们的偏差。
 - **Almeida 姿态估计的 `delta` 缺了整段透镜反演**（`034d033`，见下方 D-06 余下行）。原 docstring 的理由「上游把透镜校正是关了的」是错的：`init` 设 `compute_params.lens_correction_amount = 0`，但 `delta` 给 `undistort_points` 的 `lens_correction_amount` 参数传的是**字面量 1.0**，所以它设的字段不决定分支。而且即便混合真跑了，0 的语义是「保留原始观感」= 之后再施加一次前向畸变，不是跳过。
@@ -479,7 +482,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | 项 | 说明 |
 |---|---|
 | D-06 `at_timestamp_for_points`/`undistort_points*` 逐点家族 | ~~家族本身~~ 已实现（`c7cbf1f`） |
-| **D-06 余下** 其余调用方换用逐点家族 | `zooming/fov_iterative.py` **已换**（`538c8af`）：`_undistort_points_simple` 整份删除，改调 `undistort_points_with_rolling_shutter`；工作副本改成全量克隆，逐帧镜头数据与逐帧 stab 数据随之到位。`synchronization/estimate_pose/almeida.py` **已换**（`034d033`）：`_CameraK` 现在持有 `ComputeParams` 与时间戳，`delta` 走镜头反演；`params` 可省（省则退回旧的针孔行为），manager 侧新增 `_build_sync_compute_params()` 喂给 `AutosyncProcess`，贯通 `PoseEstimator` → `estimate_rotation`。**还剩三处**：`find_offset/rs_sync.py`、`find_offset/visual_features.py`、`estimate_pose/` 下的 eight_point/essential/homography（上游用 `undistort_points_for_optical_flow`）。`visual_features` 是 offset 搜索的特征点来源，`rs_sync` 是卷帘快门分支，这两处最值得接着做 |
+| **D-06 余下** 其余调用方换用逐点家族 | `zooming/fov_iterative.py` **已换**（`538c8af`）：`_undistort_points_simple` 整份删除，改调 `undistort_points_with_rolling_shutter`；工作副本改成全量克隆，逐帧镜头数据与逐帧 stab 数据随之到位。`synchronization/estimate_pose/almeida.py` **已换**（`034d033`）：`_CameraK` 现在持有 `ComputeParams` 与时间戳，`delta` 走镜头反演；`params` 可省（省则退回旧的针孔行为），manager 侧新增 `_build_sync_compute_params()` 喂给 `AutosyncProcess`，贯通 `PoseEstimator` → `estimate_rotation`。**还剩三处**：`find_offset/rs_sync.py`、`find_offset/visual_features.py`、`estimate_pose/` 下的 eight_point/essential/homography（上游用 `undistort_points_for_optical_flow`）。`visual_features` 是 offset 搜索的特征点来源，`rs_sync` 是卷帘快门分支，这两处最值得接着做。**另**：这条牵出的姿态估计 method 0/2 错配与缺畸变校正（见上「新发现的缺陷」）**是同一族问题的重点**，默认 method 就是 0，要修得先决定 method 2 的 ARRSAC 怎么办 |
 | D-08 焦距平滑 | ~~整文件移植~~ 已实现（`cb606bb`），但需要 `lens_params` 写入侧才能上真机 |
 | D-05 max-zoom 反馈回路 | 需加字段 + 循环 |
 | D-09 自适应缩放关键帧 | 传 params 即可恢复大半 |
