@@ -90,7 +90,7 @@
 - **P3-1 VQF 初始航向对齐**: 结构完整（1072 行完整移植），仅初始航向差 ~24°（max_err 0.34，xfail 跟踪）。两个 xfail 中性价比最高。
 - **P3-2 complementary 论文版重写**: Python 是 8 行简化版镜像 vs Rust 论文 V1/V2（600 行），需按 "Keeping a Good Attitude" 重写。
 - **P3-3 GPU 全 0 三根因**: ① coeffs 插值表恒全 0（`backend.py:270-275`，shader 双线性权重全 0）② `pixel_value_limit` 从未设置（wgsl `min(sum, 0)` 恒黑）③ `output_stride` 默认 0（所有行覆写第 0 行）。另有 CPU fallback 函数签名错误（`backend.py:349-366`，一调用就 TypeError）。代码级可修，最终验证需真实 GPU（本机仅 llvmpipe）。
-- **P3-4 fov_iterative 接入畸变模型**: `_undistort_points_simple` 无镜头畸变（docstring 自认），鱼眼镜头自适应 zoom 会留黑边/过度裁切。
+- **P3-4 fov_iterative 接入畸变模型** [x]（2026-09-17）: 分两步。畸变模型本身早已补进那份本地副本，但副本仍缺逐点 IBIS 位移、mesh/焦平面校正、数码镜头和 `lens_correction_amount < 1` 的混合，内参也是手工重算的（变焦镜头的逐帧标定到不了这里）。D-06 的逐点家族落地后（`c7cbf1f`、`6b7b84e`），`_undistort_points_simple` 整份删除，改调上游的 `undistort_points_with_rolling_shutter`；`zooming/__init__.py` 的工作副本从逐字段构造改成 `dataclasses.replace` 全量克隆（否则新字段照旧会被漏掉）。实测（合成夹具，静态缩放单一数值）：IBIS 位移 60/40 px 使 FOV 从 0.9963 降到 0.9354，mesh 使其降到 0.1740，数码镜头与鱼眼系数同样改变结果——这些在旧实现里**全部无影响**。
 
 ## P4 — 覆盖面与产品化（按需排期）
 

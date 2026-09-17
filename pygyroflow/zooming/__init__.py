@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import struct
 from typing import Optional
@@ -48,63 +49,29 @@ def calculate_fovs(
     if not timestamps:
         return ([], [])
 
-    # Work on a copy with original dimensions for FOV estimation
-    params = ComputeParams(
-        width=compute_params.width,
-        height=compute_params.height,
-        output_width=compute_params.width,  # Use input dims for FOV estimation
+    # Work on a copy with original dimensions for FOV estimation.
+    #
+    # Upstream clones the whole ComputeParams (zooming/mod.rs) and then
+    # overrides a handful of fields. Building the copy field by field instead
+    # meant every field nobody remembered to list fell back to its default —
+    # the keyframe manager and the sync-offset map were the two that bit, and
+    # the points path adds a third family: the per-frame lens maps and the
+    # per-frame stabilization data, which `at_timestamp_for_points` reads.
+    # `dataclasses.replace` copies everything and lets the overrides be
+    # explicit, so the next field added to ComputeParams cannot be silently
+    # dropped here.
+    params = dataclasses.replace(
+        compute_params,
+        # FOV is estimated against the *input* dimensions: this pass answers
+        # "how much do I have to crop to have no black border", before any
+        # output scaling exists.
+        output_width=compute_params.width,
         output_height=compute_params.height,
-        frame_count=compute_params.frame_count,
-        video_rotation=compute_params.video_rotation,
-        scaled_fps=compute_params.scaled_fps,
-        scaled_duration_ms=compute_params.scaled_duration_ms,
-        quaternions=compute_params.quaternions,
-        smoothed_quaternions=compute_params.smoothed_quaternions,
-        # Upstream clones the whole ComputeParams (zooming/mod.rs), so the
-        # keyframe manager and the sync-offset map come along. Dropping them
-        # here meant FovIterative saw an empty KeyframeManager: every
-        # keyframed zooming parameter (ZoomingCenterX/Y, ZoomingSpeed,
-        # LensCorrectionStrength, VideoRotation...) was silently ignored.
-        keyframes=compute_params.keyframes,
-        sync_offsets_adjusted=dict(compute_params.sync_offsets_adjusted),
-        per_frame_time_offsets=list(compute_params.per_frame_time_offsets),
-        fovs=[],  # Clear for fresh computation
+        # Cleared for a fresh computation, and reset so the estimate is not
+        # scaled by a previous run's zoom.
+        fovs=[],
         minimal_fovs=[],
-        fov_scale=1.0,  # Reset to neutral
-        fov_overview=compute_params.fov_overview,
-        show_safe_area=compute_params.show_safe_area,
-        max_zoom=compute_params.max_zoom,
-        max_zoom_iterations=compute_params.max_zoom_iterations,
-        camera_matrix=compute_params.camera_matrix.copy(),
-        distortion_coeffs=list(compute_params.distortion_coeffs),
-        distortion_model_name=compute_params.distortion_model_name,
-        lens_correction_amount=compute_params.lens_correction_amount,
-        light_refraction_coefficient=compute_params.light_refraction_coefficient,
-        frame_readout_time=compute_params.frame_readout_time,
-        frame_readout_direction=compute_params.frame_readout_direction,
-        background=compute_params.background.copy(),
-        background_mode=compute_params.background_mode,
-        background_margin=compute_params.background_margin,
-        background_margin_feather=compute_params.background_margin_feather,
-        adaptive_zoom_window=compute_params.adaptive_zoom_window,
-        adaptive_zoom_center_offset=compute_params.adaptive_zoom_center_offset,
-        adaptive_zoom_method=compute_params.adaptive_zoom_method,
-        additional_rotation=compute_params.additional_rotation,
-        additional_translation=compute_params.additional_translation,
-        video_speed=compute_params.video_speed,
-        video_speed_affects_smoothing=compute_params.video_speed_affects_smoothing,
-        video_speed_affects_zooming=compute_params.video_speed_affects_zooming,
-        framebuffer_inverted=compute_params.framebuffer_inverted,
-        suppress_rotation=compute_params.suppress_rotation,
-        trim_ranges=list(compute_params.trim_ranges),
-        fov_algorithm_margin=compute_params.fov_algorithm_margin,
-        horizontal_stretch=compute_params.horizontal_stretch,
-        calib_width=compute_params.calib_width,
-        calib_height=compute_params.calib_height,
-        input_horizontal_stretch=compute_params.input_horizontal_stretch,
-        input_vertical_stretch=compute_params.input_vertical_stretch,
-        focal_length=compute_params.focal_length,
-        radial_distortion_limit=compute_params.radial_distortion_limit,
+        fov_scale=1.0,
     )
 
     # The actual output dimensions (for aspect ratio calculation)

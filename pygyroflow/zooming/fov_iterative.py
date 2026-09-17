@@ -4,10 +4,25 @@ Port of Gyroflow's fov_iterative.rs. Computes the minimum FOV scale factor
 for each frame that avoids black borders, using a polygon contraction approach:
 
   1. Sample 31x31 points around the input image border
-  2. Undistort these points (with rolling shutter correction)
+  2. Undistort these points, rolling shutter included
   3. Find the nearest undistorted edge point to the image center
-  4. Refine with interpolation around the nearest point (5 iterations)
+  4. Refine with interpolation around the nearest point, four times
   5. Calculate minimal FOV from the nearest edge distance
+
+Step 2 used to be a local reimplementation, ``_undistort_points_simple``,
+which applied the rotation and (later) the distortion model but nothing else:
+no per-point IBIS/OIS displacement, no mesh or focal-plane correction, no
+digital lens, and no ``lens_correction_amount < 1`` blend. Upstream calls
+``undistort_points_with_rolling_shutter`` here, which does all of it, and that
+is what this now calls — the polygon is the input to the zoom decision, so a
+coordinate that is wrong by the whole of the IBIS displacement is a crop that
+is wrong by the same amount.
+
+A second consequence of dropping the local copy: the intrinsics now come from
+``get_lens_data_at_timestamp`` rather than from ``params.camera_matrix``
+rescaled by hand. That is what makes a zoom lens' per-frame calibration reach
+this path at all, and it is why the working ``ComputeParams`` copy in
+``zooming/__init__.py`` has to carry the per-frame lens maps.
 """
 
 from __future__ import annotations
@@ -15,11 +30,29 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-import numpy as np
-from numpy.typing import NDArray
-
+from pygyroflow.keyframes.types import KeyframeType as KT
 from pygyroflow.stabilization.compute_params import ComputeParams
-from pygyroflow.stabilization.frame_transform import _quat_at_timestamp
+from pygyroflow.stabilization.cpu_undistort import (
+    undistort_points_with_rolling_shutter,
+)
+
+
+def _shift_by_zoom_center(
+    polygon: list[tuple[float, float]],
+    zoom_cx: float,
+    zoom_cy: float,
+    input_dim: tuple[float, float],
+) -> list[tuple[float, float]]:
+    """Move the polygon by the (normalised) zoom centre.
+
+    Applied to the *undistorted* coordinates, in image pixels: it relocates
+    the rectangle the FOV search is centred on, not the camera. Upstream does
+    this inline after both undistort calls in ``find_fov``.
+    """
+    return [
+        (x - zoom_cx * input_dim[0], y - zoom_cy * input_dim[1])
+        for x, y in polygon
+    ]
 
 
 def _points_around_rect(
@@ -101,158 +134,6 @@ def _interpolate_points(
     return result
 
 
-def _undistort_points_simple(
-    points: list[tuple[float, float]],
-    timestamp_ms: float,
-    frame: int,
-    params: ComputeParams,
-    lens_correction_amount: float,
-) -> list[tuple[float, float]]:
-    """Simplified point undistortion for FOV calculation.
-
-    Applies the stabilization rotation to each point, without full
-    lens distortion model. For the FOV algorithm we only need the
-    approximate rotated positions, not pixel-perfect coordinates.
-
-    Args:
-        points: Input pixel coordinates.
-        timestamp_ms: Frame timestamp.
-        frame: Frame index.
-        params: Compute parameters.
-        lens_correction_amount: Lens correction strength (unused here but
-            kept for API compatibility).
-
-    Returns:
-        Rotated/transformed point coordinates.
-    """
-    if not points:
-        return []
-
-    # Get rotation quaternion for this timestamp.
-    # smoothed_quaternions stores the CORRECTION (sm^-1 * org, set in
-    # manager.recompute_smoothing mirroring upstream gyro_source.rs).
-    # Consume it exactly like FrameTransform: correction * org_c^-1 * org_row,
-    # which without rolling shutter reduces to the correction itself.
-    # Pre-sorted keys are cached on the params object — this function runs
-    # per frame per zoom iteration and each lookup otherwise re-sorts all
-    # quaternion timestamps (O(N log N) per call).
-    ts_us = timestamp_ms * 1000.0
-    if params.quaternions:
-        if params._fov_org_keys is None:
-            params._fov_org_keys = sorted(params.quaternions.keys())
-        org_c = _quat_at_timestamp(params.quaternions, ts_us, params._fov_org_keys)
-    else:
-        org_c = _quat_at_timestamp(params.quaternions, ts_us)
-    if params._fov_smoothed_keys is None:
-        params._fov_smoothed_keys = (
-            sorted(params.smoothed_quaternions.keys()) if params.smoothed_quaternions else None
-        )
-    correction = _quat_at_timestamp(params.smoothed_quaternions, ts_us, params._fov_smoothed_keys)
-    combined_quat = correction * org_c.inverse() * org_c
-    rot_matrix = combined_quat.to_rotation_matrix()
-
-    # Camera intrinsics (scaled from calibration to video resolution like
-    # FrameTransform._get_lens_data_at_timestamp)
-    fx = params.camera_matrix[0, 0]
-    fy = params.camera_matrix[1, 1]
-    cx = params.camera_matrix[0, 2]
-    cy = params.camera_matrix[1, 2]
-
-    calib_w = params.calib_width if params.calib_width > 0 else params.width
-    calib_h = params.calib_height if params.calib_height > 0 else params.height
-    if calib_w > 0 and calib_h > 0:
-        ratio_x = params.width / calib_w
-        ratio_y = params.height / calib_h
-        fx *= ratio_x
-        fy *= ratio_y
-        cx *= ratio_x
-        cy *= ratio_y
-
-    # Full lens undistortion (upstream fov_iterative drives
-    # undistort_points_with_rolling_shutter -> undistort_points, which runs
-    # the distortion model's inverse — the old pinhole-only projection
-    # miscomputed the polygon on fisheye lenses).
-    import ctypes as _ctypes
-    import numpy as _np
-
-    from pygyroflow.stabilization.distortion_models import from_name as _dm_from_name
-    from pygyroflow.types.kernel_params import KernelParams as _KP
-
-    kp = _KP()
-    kp.width = params.width
-    kp.height = params.height
-    kp.output_width = params.width
-    kp.output_height = params.height
-    kp.f = (_ctypes.c_float * 2)(float(fx), float(fy))
-    kp.c = (_ctypes.c_float * 2)(float(cx), float(cy))
-    k_floats = [float(x) for x in params.distortion_coeffs][:12]
-    k_floats += [0.0] * (12 - len(k_floats))
-    kp.k1 = (_ctypes.c_float * 4)(*k_floats[0:4])
-    kp.k2 = (_ctypes.c_float * 4)(*k_floats[4:8])
-    kp.k3 = (_ctypes.c_float * 4)(*k_floats[8:12])
-    kp.input_horizontal_stretch = params.input_horizontal_stretch
-    kp.input_vertical_stretch = params.input_vertical_stretch
-    kp.light_refraction_coefficient = params.light_refraction_coefficient
-
-    model = _dm_from_name(params.distortion_model_name)
-
-    pxs = _np.array([p[0] for p in points], dtype=_np.float64)
-    pys = _np.array([p[1] for p in points], dtype=_np.float64)
-    pw_x = (pxs - cx) / fx
-    pw_y = (pys - cy) / fy
-
-    ux, uy = model.undistort_points(pw_x, pw_y, kp)
-    ok = ~( _np.isnan(ux) | _np.isnan(uy) )
-
-    # Light refraction on the undistorted point (upstream applies it after
-    # undistort_point in undistort_points)
-    lrc = params.light_refraction_coefficient
-    if lrc != 1.0 and lrc > 0.0:
-        r = _np.sqrt(ux * ux + uy * uy)
-        with _np.errstate(divide="ignore", invalid="ignore"):
-            sin_theta_d = (r / _np.sqrt(1.0 + r * r)) / lrc
-            r_d = sin_theta_d / _np.sqrt(_np.maximum(1.0 - sin_theta_d * sin_theta_d, 1e-12))
-            factor = _np.where(r > 0.0, r_d / r, 1.0)
-        ux = ux * factor
-        uy = uy * factor
-
-    # Rolling shutter: per-point rotation at the point's row time (mirrors
-    # at_timestamp_for_points; the correction stream composes with the org
-    # lookup at each point's exposure time).
-    frt = abs(params.frame_readout_time)
-    result: list[tuple[float, float]] = []
-    for idx in range(len(points)):
-        if not ok[idx]:
-            result.append((-1e6, -1e6))
-            continue
-        if frt > 0.0 and params.quaternions:
-            if params.frame_readout_direction.is_horizontal():
-                row = pxs[idx]
-                rs_dim = params.width
-            else:
-                row = pys[idx]
-                rs_dim = params.height
-            row_time = timestamp_ms - frt / 2.0 + (frt / rs_dim) * row if rs_dim > 0 else timestamp_ms
-            org_row = _quat_at_timestamp(params.quaternions, row_time * 1000.0, params._fov_org_keys)
-            # Same three-factor composition as FrameTransform: C * org_c^-1 * org_row
-            # (org_c cancels to correction only when row_time == center time).
-            q = combined_quat * org_c.inverse() * org_row
-            r_m = q.to_rotation_matrix()
-        else:
-            r_m = rot_matrix
-
-        vec = r_m @ _np.array([ux[idx], uy[idx], 1.0])
-        if vec[2] <= 0.0:
-            result.append((-1e6, -1e6))
-            continue
-        # Upstream projects through new_k * r; with fov = 1.0 and equal
-        # input/output dims (zooming runs before fovs exist), new_k == K.
-        result.append((float(vec[0] / vec[2] * fx + cx),
-                       float(vec[1] / vec[2] * fy + cy)))
-
-    return result
-
-
 class FovIterative:
     """Iterative FOV calculator using polygon contraction.
 
@@ -304,17 +185,45 @@ class FovIterative:
         )
 
         center = (self.input_dim[0] / 2.0, self.input_dim[1] / 2.0)
+        params = self.compute_params
 
-        # Use constant keyframe values for now (no per-frame keyframe lookup)
-        zoom_cx = self.compute_params.adaptive_zoom_center_offset[0]
-        zoom_cy = self.compute_params.adaptive_zoom_center_offset[1]
-        lens_corr = self.compute_params.lens_correction_amount
-        kv = (zoom_cx, zoom_cy, lens_corr)
+        # The three keyframed inputs to _find_fov are looked up per frame only
+        # when at least one of them is actually keyframed; otherwise every
+        # frame gets the same static triple and the lookups would be pure
+        # overhead. Upstream's branch (fov_iterative.rs:42-58) is the same,
+        # except that it also needs the distinction to keep the parallel map
+        # honest.
+        keyframes = params.keyframes
+        if keyframes and (
+            keyframes.is_keyframed(KT.ZoomingCenterX)
+            or keyframes.is_keyframed(KT.ZoomingCenterY)
+            or keyframes.is_keyframed(KT.LensCorrectionStrength)
+        ):
+            def keyframe_values(ts: float) -> tuple[float, float, float]:
+                def lookup(key: KT, fallback: float) -> float:
+                    value = keyframes.value_at_video_timestamp(key, ts)
+                    return fallback if value is None else value
 
-        fov_values = [
-            self._find_fov(rect, ts, frame, center, kv)
-            for frame, ts in timestamps
-        ]
+                return (
+                    lookup(KT.ZoomingCenterX, params.adaptive_zoom_center_offset[0]),
+                    lookup(KT.ZoomingCenterY, params.adaptive_zoom_center_offset[1]),
+                    lookup(KT.LensCorrectionStrength, params.lens_correction_amount),
+                )
+
+            fov_values = [
+                self._find_fov(rect, ts, frame, center, keyframe_values(ts))
+                for frame, ts in timestamps
+            ]
+        else:
+            kv = (
+                params.adaptive_zoom_center_offset[0],
+                params.adaptive_zoom_center_offset[1],
+                params.lens_correction_amount,
+            )
+            fov_values = [
+                self._find_fov(rect, ts, frame, center, kv)
+                for frame, ts in timestamps
+            ]
 
         # Apply trim ranges
         if ranges:
@@ -351,18 +260,19 @@ class FovIterative:
             FOV scale factor.
         """
         zoom_cx, zoom_cy, lens_corr = keyframe_values
+        input_dim = self.input_dim
 
-        # Undistort border points
-        polygon = _undistort_points_simple(
-            rect, ts, frame, self.compute_params, lens_corr
-        )
-
-        # Apply zoom center offset
-        for i, (x, y) in enumerate(polygon):
-            polygon[i] = (
-                x - zoom_cx * self.input_dim[0],
-                y - zoom_cy * self.input_dim[1],
+        def undistort(points: list[tuple[float, float]]):
+            return _shift_by_zoom_center(
+                undistort_points_with_rolling_shutter(
+                    points, ts, frame, self.compute_params, lens_corr, False
+                ),
+                zoom_cx,
+                zoom_cy,
+                input_dim,
             )
+
+        polygon = undistort(rect)
 
         # Initial search rectangle: very large
         initial = (1e6, 1e6 * self.output_inv_aspect)
@@ -381,14 +291,7 @@ class FovIterative:
                     rect[(nearest_idx + 1) % n],
                 ]
                 distorted = _interpolate_points(relevant, 30)
-                polygon = _undistort_points_simple(
-                    distorted, ts, frame, self.compute_params, lens_corr
-                )
-                for i, (x, y) in enumerate(polygon):
-                    polygon[i] = (
-                        x - zoom_cx * self.input_dim[0],
-                        y - zoom_cy * self.input_dim[1],
-                    )
+                polygon = undistort(distorted)
                 nearest_idx, nearest_rect = self._nearest_edge(
                     polygon, center, nearest_rect
                 )
@@ -399,8 +302,8 @@ class FovIterative:
         fov = (nearest_rect[0] * 2.0 / self.output_dim[0])
         return fov
 
-    @staticmethod
     def _nearest_edge(
+        self,
         polygon: list[tuple[float, float]],
         center: tuple[float, float],
         initial: tuple[float, float],
@@ -422,16 +325,14 @@ class FovIterative:
         best_idx = None
         best_rect = initial
 
-        inv_aspect = initial[1] / initial[0] if initial[0] > 0 else 1.0
-
         for i, (x, y) in enumerate(polygon):
             ap = (abs(x - center[0]), abs(y - center[1]))
             if ap[0] < best_rect[0] and ap[1] < best_rect[1]:
-                if ap[1] > ap[0] * inv_aspect:
+                if ap[1] > ap[0] * self.output_inv_aspect:
                     best_idx = i
-                    best_rect = (ap[1] / inv_aspect, ap[1])
+                    best_rect = (ap[1] / self.output_inv_aspect, ap[1])
                 else:
                     best_idx = i
-                    best_rect = (ap[0], ap[0] * inv_aspect)
+                    best_rect = (ap[0], ap[0] * self.output_inv_aspect)
 
         return best_idx, best_rect
