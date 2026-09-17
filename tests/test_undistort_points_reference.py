@@ -4,21 +4,20 @@
 that each stage is wired in the right order, that the sentinel appears where it
 should. It deliberately does not re-derive the distortion arithmetic. This file
 does the other half — it runs the port against upstream's own
-``cpu_undistort.rs::undistort_points``, compiled verbatim, on 26 cases /
-304 coordinate values.
+``cpu_undistort.rs::undistort_points``, compiled verbatim, on 28 cases /
+644 coordinate values.
 
-That comparison was worth doing. It is what found the three defects recorded in
-``TestTheDeviationsTheReferenceFound`` below, two of which the structural tests
-could not see by construction: one is a crash in a branch whose result the
-structural tests never compared to anything, the other is an ordering mistake
-that a symmetric test cannot detect because both sides of the assertion share
-it.
+That comparison earned its keep. It found four defects; the structural tests
+could not see three of them by construction, because each is either a crash in
+a branch whose result was never compared to anything, or an ordering mistake
+where both sides of a symmetric assertion share the error. They are pinned
+individually in ``TestTheDeviationsTheReferenceFound`` and
+``TestTheHyperviewInversion``.
 
 The fixture's ``expected`` values are upstream's. ``null`` means upstream
 returned NaN — JSON cannot hold a NaN, and a NaN is a *value* here, not a
-missing one: the light-refraction branch divides by a coefficient and can push
-the expression under a square root negative, which Rust's ``f64::sqrt`` turns
-into NaN and which the port now matches.
+missing one: two branches can produce it (a square root of a negative, and the
+HyperView inversion running away), and both are upstream's answers.
 
 Comparison is relative over a 1.0 floor. Upstream computes in f32 and the port
 in f64, so the floor is what keeps a coordinate near the origin from demanding
@@ -50,11 +49,6 @@ with open(_FIXTURE, encoding="utf-8") as _handle:
     _DOC = json.load(_handle)
 _CASES = _DOC["cases"]
 _BY_NAME = {case["name"]: case for case in _CASES}
-
-# The one case where the port deliberately does not match upstream; see
-# `TestTheDeviationsTheReferenceFound`. Excluded here by name rather than by
-# loosening a tolerance, so the exclusion is visible.
-_KNOWN_DEVIATION = "digital_lens_hyperview"
 
 
 class _ExactTimestampKeyframes:
@@ -137,11 +131,6 @@ class TestAgainstUpstreamRust:
 
     @pytest.mark.parametrize("case", _CASES, ids=lambda c: c["name"])
     def test_matches_the_rust(self, case):
-        if case["name"] == _KNOWN_DEVIATION:
-            pytest.skip(
-                "the port's HyperView inverse is guarded and upstream's is not; "
-                "TestTheDeviationsTheReferenceFound pins the difference"
-            )
         got = _run(case)
         expected = case["expected"]
         assert len(got) == len(expected), case["name"]
@@ -168,6 +157,8 @@ class TestAgainstUpstreamRust:
             "identity_no_distortion": "the straight-through path",
             "fisheye_distortion": "a real optical model",
             "opencv_standard_distortion": "the model dispatch is not hardcoded",
+            "sony_distortion": "a long Cartesian expression, as a model",
+            "insta360_distortion": "the other long one",
             "p_is_premultiplied": "rr = p @ rotation",
             "rot_per_point_overrides": "the per-point rotation override",
             "light_refraction_from_params": "the refraction branch",
@@ -178,7 +169,8 @@ class TestAgainstUpstreamRust:
             "mesh_focal_plane_only": "the focal-plane branch",
             "mesh_full": "the full-mesh branch",
             "digital_lens_superview": "the digital lens and its 0.91 factor",
-            "digital_lens_hyperview": "the 0.81 factor and the guard",
+            "digital_lens_hyperview": "the 0.81 factor and the runaway inverse",
+            "digital_lens_hyperview_converging": "the same, where it converges",
             "non_converging_point_returns_sentinel": "the sentinel",
         }
         missing = set(required) - set(_BY_NAME)
@@ -280,82 +272,133 @@ class TestTheDeviationsTheReferenceFound:
         for index in nan_expected:
             assert any(math.isnan(component) for component in got[index])
 
-    def test_the_digital_lens_inversion_is_guarded_where_upstream_is_not(self):
-        """A deliberate, still-live deviation — recorded, not resolved.
+class TestTheHyperviewInversion:
+    """The digital lens whose inverse upstream does not really have.
 
-        The port's GoPro HyperView ``distort_point`` has two additions its
-        upstream does not: 20 fixed-point steps instead of 12, and a reset to
-        the un-inverted input when the iterate leaves [-2, 2]. Upstream does
-        neither, so on this case — the digital lens reached through
-        ``lens_correction_amount < 1`` — it returns NaN for every point while
-        the port returns finite coordinates.
+    Two separate things are pinned here, and they were found separately:
 
-        Both additions make the port more robust and both change output, so
-        removing them is not a bug fix; it is a behaviour change for every
-        HyperView clip, and it is a decision for whoever owns the port rather
-        than a side effect of porting the points family.
-        """
-        case = _BY_NAME[_KNOWN_DEVIATION]
-        assert all(
-            component is None for pair in case["expected"] for component in pair
-        ), "upstream no longer returns NaN here; the deviation is gone"
+    * The coupling term in the x polynomial was outside the multiplication by
+      x in the port and inside it upstream. The reference fixture caught it.
+    * The inversion itself is a substitution that converges over only part of
+      the frame. Upstream caps it at 12 steps with no divergence guard and
+      returns NaN where it runs away; the port now does the same, so the
+      fixture's two HyperView cases agree instead of one being skipped.
+    """
 
-        got = _run(case)
-        assert all(
-            math.isfinite(component) for pair in got for component in pair
-        ), "the port now returns NaN too — the guard was removed"
+    def test_the_y_squared_term_is_inside_the_multiplication(self):
+        """``x * (P + y2*c)``, not ``x * P + y2*c``.
 
-    def test_the_guard_returns_the_uninverted_input(self):
-        """What the port's guard actually does, called directly.
+        The two differ by a factor of x, so they agree on the *vertical*
+        centreline and diverge away from it. Written as an additive term at the
+        end of the expression it looks right and is wrong; upstream and the
+        port's own WGSL text both have it inside, which is what exposed it.
 
-        The reset sets the iterate back to the normalised, aspect-stretched
-        input — the value the inversion started from — so the "answer" is the
-        input passed through, not a pre-image of it. That is exactly why the
-        deviation matters and why it is not obviously visible downstream.
+        Tested at the point where the difference is largest and least
+        ambiguous: x = width/2 makes the corrected x exactly 0 in the correct
+        form, and non-zero in the wrong one.
         """
         from pygyroflow.stabilization.distortion_models import from_name
         from pygyroflow.types.kernel_params import KernelParams
 
-        width, height = 1920, 1080
         kernel_params = KernelParams()
-        kernel_params.width = width
-        kernel_params.height = height
-        kernel_params.output_width = width
-        kernel_params.output_height = height
-
+        kernel_params.width = kernel_params.output_width = 1920
+        kernel_params.height = kernel_params.output_height = 1080
         hyperview = from_name("gopro_hyperview")
-        aspect = 14.0 / 9.0
-        # Chosen because the first fixed-point step leaves [-2, 2]: with the
-        # coefficient set this polynomial grows fast at the frame edge.
-        point = (1960.0, 540.0)
-        result = hyperview.distort_point(point[0], point[1], 1.0, kernel_params)
-        nx = (point[0] / width - 0.5) * aspect
-        ny = point[1] / height - 0.5
-        assert result == pytest.approx(
-            ((nx + 0.5) * width, (ny + 0.5) * height), abs=1e-6
+
+        # (960, 200) is on the centreline and off the horizontal one, so y2 is
+        # non-zero while x is not. With the term inside, the forward map sends
+        # the column's x to exactly 0; with it outside, to -y2 * 0.1086027.
+        for point in ((960.0, 200.0), (960.0, 980.0)):
+            ux, _ = hyperview.undistort_point(point[0], point[1], kernel_params)
+            assert ux == pytest.approx(960.0), f"{point} left the centreline"
+
+    def test_the_fixture_pins_both_outcomes_of_the_inversion(self):
+        """One case where it diverges, one where it converges.
+
+        Without the converging case the HyperView polynomial would only be
+        exercised by a wall of NaN — the failure path would be pinned and the
+        arithmetic would not.
+        """
+        diverging = _BY_NAME["digital_lens_hyperview"]
+        converging = _BY_NAME["digital_lens_hyperview_converging"]
+        assert all(
+            component is None for pair in diverging["expected"] for component in pair
+        )
+        assert all(
+            component is not None
+            for pair in converging["expected"]
+            for component in pair
         )
 
-    def test_the_guarded_output_is_not_a_real_inverse(self):
-        """Why the deviation matters: the guarded point is not a pre-image.
+    def test_the_port_returns_nan_where_upstream_does(self):
+        got = _run(_BY_NAME["digital_lens_hyperview"])
+        assert all(math.isnan(component) for pair in got for component in pair)
 
-        Feeding the port's answer back through the *forward* map does not
-        return the input, so a caller that trusts it gets a plausible-looking
-        wrong coordinate rather than an obviously missing pixel.
+    def test_the_iteration_count_is_upstreams_and_the_shaders(self):
+        """12, in the Python and in the WGSL text, as upstream has it.
+
+        The port carried 20 in the Python *and* in the WGSL, while claiming the
+        WGSL matched Gyroflow exactly. A different count changes where the
+        iteration stops, so it changes the answer wherever it has not
+        converged — which, measured below, is most of the frame.
+        """
+        from pygyroflow.stabilization.distortion_models import from_name, gopro_hyperview
+
+        upstream = "for (var i: i32 = 0; i < 12; i = i + 1)"
+        assert upstream in from_name("gopro_hyperview").wgsl_functions()
+        assert gopro_hyperview._MAX_ITER == 12
+
+    def test_the_inversion_converges_over_a_minority_of_the_frame(self):
+        """The measurement behind reproducing upstream rather than fixing it.
+
+        If upstream's inversion ever becomes something else — fewer NaN, a
+        different cap — this is what notices, and the fixture has to be
+        regenerated alongside it.
+        """
+        import numpy as np
+
+        from pygyroflow.stabilization.distortion_models import from_name
+        from pygyroflow.types.kernel_params import KernelParams
+
+        kernel_params = KernelParams()
+        kernel_params.width = kernel_params.output_width = 1920
+        kernel_params.height = kernel_params.output_height = 1080
+        hyperview = from_name("gopro_hyperview")
+
+        xs, ys = np.meshgrid(
+            np.arange(0.0, 1920.0, 16.0), np.arange(0.0, 1080.0, 16.0)
+        )
+        xs, ys = xs.ravel(), ys.ravel()
+        with np.errstate(over="ignore", invalid="ignore"):
+            dx, dy = hyperview.distort_points(xs, ys, np.ones_like(xs), kernel_params)
+
+        nan_fraction = float(np.isnan(dx).mean())
+        assert 0.03 < nan_fraction < 0.20, (
+            f"NaN fraction moved to {nan_fraction:.1%}; upstream's behaviour "
+            "may have changed and the fixture needs regenerating"
+        )
+        # And the points that are not NaN are mostly not the input either:
+        # the substitution stops wherever it got to.
+        moved = np.abs(dx[~np.isnan(dx)] - xs[~np.isnan(dx)]) > 1.0
+        assert moved.mean() > 0.5
+
+    def test_the_forward_map_still_round_trips_where_it_converges(self):
+        """The check that would have passed while the coupling term was wrong.
+
+        A round trip through ``distort_point`` lands back near the input for
+        the points where the iteration converges — including on the centreline
+        column, where the coupling-term bug lived. That is why the bug needed
+        an external reference rather than a round-trip test.
         """
         from pygyroflow.stabilization.distortion_models import from_name
         from pygyroflow.types.kernel_params import KernelParams
 
-        width, height = 1920, 1080
         kernel_params = KernelParams()
-        kernel_params.width = width
-        kernel_params.height = height
-        kernel_params.output_width = width
-        kernel_params.output_height = height
-
+        kernel_params.width = kernel_params.output_width = 1920
+        kernel_params.height = kernel_params.output_height = 1080
         hyperview = from_name("gopro_hyperview")
-        point = (1960.0, 540.0)
-        guarded = hyperview.distort_point(point[0], point[1], 1.0, kernel_params)
-        # The forward map is `undistort_point`'s inverse; going back through it
-        # recovers the stretched input rather than the point we asked about.
-        back = hyperview.undistort_point(guarded[0], guarded[1], kernel_params)
-        assert back != pytest.approx(point, abs=1.0)
+
+        for point in ((960.0, 600.0), (1200.0, 540.0), (960.0, 980.0)):
+            moved = hyperview.distort_point(point[0], point[1], 1.0, kernel_params)
+            back = hyperview.undistort_point(moved[0], moved[1], kernel_params)
+            assert back == pytest.approx(point, abs=0.05), point

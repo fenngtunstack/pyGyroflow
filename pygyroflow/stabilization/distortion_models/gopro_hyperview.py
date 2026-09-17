@@ -30,14 +30,16 @@ undistort (Hyperview -> Wide):
 distort (Wide -> Hyperview):
   1. Normalise pixel to [-0.5, 0.5]
   2. Multiply x by 14/9 for aspect-ratio stretch
-  3. Fixed-point iteration (up to 20 steps) to invert _hyperview
+  3. Fixed-point iteration (at most 12 steps) to invert _hyperview
   4. Back to pixels
 
-NOTE: The 7th-order polynomial can cause the fixed-point iteration to
-diverge at extreme image edges.  The implementation guards against this
-by clamping the iteration variables.  Gyroflow's SPIR-V version uses a
-different piecewise square-root approach that avoids iteration entirely;
-the polynomial version here is the CPU reference.
+NOTE: that inversion is a substitution, and the 7th-order polynomial makes it
+a contraction over only part of the frame. Where it diverges, upstream returns
+whatever the 12th step produced — often NaN. `_MAX_ITER` below carries the
+measurement. The GPU uses the same substitution.
+Note also that the digital lens runs *after* the optical one, so this maps
+camera pixels rather than rays: a point that leaves the frame here is not an
+error.
 
 Reference: https://github.com/gyroflow/gyroflow/issues/43
 """
@@ -58,24 +60,44 @@ if TYPE_CHECKING:
 # (16/9) / (8/7) = 112/72 = 14/9
 _ASPECT_RATIO = 14.0 / 9.0  # 1.555555555
 
-# Maximum iterations for fixed-point inversion.
-# More than GoPro Superview needs because the 7th-order polynomial
-# has stronger nonlinearity.
-_MAX_ITER = 20
-
-# Guard: if iteration variables exceed this normalised range, reset.
-_DIVERGENCE_LIMIT = 2.0
+# Fixed-point iteration count, from upstream (gopro_hyperview.rs:44 —
+# `for _ in 0..12`) and the same number its WGSL uses.
+#
+# It is not enough. Measured over a whole 1920x1080 frame at 8 px spacing, the
+# substitution converges for only about 47% of the points; the rest run all 12
+# steps and stop wherever they got to, and about 9% come out NaN (the iterate
+# overflows f32 and subtracting two infinities propagates). Upstream behaves
+# the same way — this is not a porting artifact — and the reference fixture
+# (tests/golden/undistort_points.json, case `digital_lens_hyperview`) records
+# it.
+#
+# Reproducing that is deliberate. The port exists to match Gyroflow, and a
+# convergent rewrite here (Newton, bisection, or simply more steps) would make
+# every HyperView comparison disagree for a reason a reader could not see in
+# this file. If the count is ever raised, do it as a *recorded* deviation with
+# the fixture regenerated and the gap analysis updated — not as a quiet local
+# improvement.
+_MAX_ITER = 12
 
 
 def _hyperview(uv: tuple[float, float]) -> tuple[float, float]:
     """Core Hyperview polynomial transform on normalised coords [-0.5, 0.5].
 
     Returns the mapped coordinates (not pixel coords).
+
+    The ``float`` coercions are load-bearing: the inversion below feeds this
+    values that overflow, and on a NumPy scalar that raises a RuntimeWarning on
+    every step. As Python floats the same arithmetic returns ``inf`` and then
+    ``nan`` silently, which is what the inversion wants — the NaN is a result
+    here, not an accident. The coercion is exact (widening within the same
+    format).
     """
-    x2 = uv[0] * uv[0]
-    y2 = uv[1] * uv[1]
+    x = float(uv[0])
+    y = float(uv[1])
+    x2 = x * x
+    y2 = y * y
     return (
-        uv[0]
+        x
         * (
             1.5805143
             + x2
@@ -92,9 +114,17 @@ def _hyperview(uv: tuple[float, float]) -> tuple[float, float]:
                     )
                 )
             )
-        )
-        + y2 * -0.1086027,
-        uv[1] * (1.0238225 + y2 * -0.1025671 + x2 * (-0.2639930 + x2 * 0.2979266)),
+            # Inside the multiplication by x, not after it. Written where the
+            # eye expects an additive term, this is `x * (... + y2*c)` and not
+            # `x * (...) + y2*c`; the two differ by a factor of x, so they agree
+            # on the vertical centreline and nowhere else. The port had it
+            # outside until the reference fixture caught it — on the
+            # x == width/2 column upstream returns the column unchanged and the
+            # port drifted off it. The WGSL below carries it inside, which is
+            # what gave the discrepancy away.
+            + y2 * -0.1086027
+        ),
+        y * (1.0238225 + y2 * -0.1025671 + x2 * (-0.2639930 + x2 * 0.2979266)),
     )
 
 
@@ -133,15 +163,19 @@ class GoProHyperviewModel(DistortionModelBase):
     ) -> tuple[float, float]:
         """Wide pixel -> Hyperview pixel.
 
-        Applies the 8:7 -> 16:9 aspect ratio stretch, then uses fixed-point
-        iteration to invert _hyperview().  The 7th-order polynomial can cause
-        divergence at extreme image edges; iteration is guarded by clamping.
+        Applies the 8:7 -> 16:9 aspect ratio stretch, then inverts
+        ``_hyperview`` by substitution. No divergence guard: upstream has none,
+        and the answer it produces where the substitution runs away (frequently
+        NaN — see ``_MAX_ITER``) is the one the reference fixture pins.
         """
         size_w = float(params.width)
         size_h = float(params.height)
 
-        nx = (x / size_w) - 0.5
-        ny = (y / size_h) - 0.5
+        # Python floats, not NumPy scalars: the subtraction below can be
+        # inf - inf, which is a silent NaN for a float and a RuntimeWarning for
+        # a NumPy scalar. See `_hyperview`.
+        nx = (float(x) / size_w) - 0.5
+        ny = (float(y) / size_h) - 0.5
 
         # Apply 8:7 -> 16:9 stretch
         nx = nx * _ASPECT_RATIO
@@ -156,20 +190,21 @@ class GoProHyperviewModel(DistortionModelBase):
                 break
             px -= diff_x
             py -= diff_y
-            # Guard against divergence: reset if overshooting
-            if abs(px) > _DIVERGENCE_LIMIT or abs(py) > _DIVERGENCE_LIMIT:
-                px = nx
-                py = ny
-                break
 
         return ((px + 0.5) * size_w, (py + 0.5) * size_h)
 
     def distort_points(self, xs, ys, zs, params):
         """Vectorized Wide -> Hyperview via masked fixed-point iteration.
 
-        Same guarded inversion of _hyperview as the scalar version; the
-        7th-order polynomial needs more iterations and a tighter reset
-        policy, both mirrored from the scalar loop.
+        The scalar loop with a convergence mask: a point whose difference
+        falls under the epsilon is frozen so later steps cannot move it, which
+        is exactly what the scalar ``break`` does for the whole array at once
+        only if every point has converged. No divergence guard, matching the
+        scalar version and upstream.
+
+        Needs ``np.errstate``: the substitution overflows f32 on the way out of
+        the frame, and the resulting inf-inf is the NaN upstream also
+        produces. Warning about it once per call would drown the log.
         """
         size_w = float(params.width)
         size_h = float(params.height)
@@ -183,14 +218,13 @@ class GoProHyperviewModel(DistortionModelBase):
         py = ny.copy()
         active = np.ones(nx.shape, dtype=bool)
 
-        for _ in range(_MAX_ITER):
-            if not active.any():
-                break
-            x2 = px * px
-            y2 = py * py
-            dp_x = (
-                px
-                * (
+        with np.errstate(over="ignore", invalid="ignore"):
+            for _ in range(_MAX_ITER):
+                if not active.any():
+                    break
+                x2 = px * px
+                y2 = py * py
+                dp_x = px * (
                     1.5805143
                     + x2
                     * (
@@ -205,27 +239,20 @@ class GoProHyperviewModel(DistortionModelBase):
                             )
                         )
                     )
+                    # Inside the multiplication — see `_hyperview`.
+                    + y2 * -0.1086027
                 )
-                + y2 * -0.1086027
-            )
-            dp_y = py * (1.0238225 + y2 * -0.1025671 + x2 * (-0.2639930 + x2 * 0.2979266))
-            diff_x = dp_x - nx
-            diff_y = dp_y - ny
+                dp_y = py * (1.0238225 + y2 * -0.1025671 + x2 * (-0.2639930 + x2 * 0.2979266))
+                diff_x = dp_x - nx
+                diff_y = dp_y - ny
 
-            # Converged: freeze without applying the update
-            active &= ~((np.abs(diff_x) < 1e-6) & (np.abs(diff_y) < 1e-6))
-            if not active.any():
-                break
+                # Converged: freeze without applying the update
+                active &= ~((np.abs(diff_x) < 1e-6) & (np.abs(diff_y) < 1e-6))
+                if not active.any():
+                    break
 
-            px = np.where(active, px - diff_x, px)
-            py = np.where(active, py - diff_y, py)
-
-            # Guard against divergence: reset and freeze
-            bad = active & ((np.abs(px) > _DIVERGENCE_LIMIT) | (np.abs(py) > _DIVERGENCE_LIMIT))
-            if bad.any():
-                px = np.where(bad, nx, px)
-                py = np.where(bad, ny, py)
-                active &= ~bad
+                px = np.where(active, px - diff_x, px)
+                py = np.where(active, py - diff_y, py)
 
         return (px + 0.5) * size_w, (py + 0.5) * size_h
 
@@ -269,7 +296,7 @@ fn digital_distort_point(_uv: vec2<f32>) -> vec2<f32> {
     uv.x = uv.x * 1.555555555;
 
     var P = uv;
-    for (var i: i32 = 0; i < 20; i = i + 1) {
+    for (var i: i32 = 0; i < 12; i = i + 1) {
         let diff = hyperview(P) - uv;
         if (abs(diff.x) < 1e-6 && abs(diff.y) < 1e-6) {
             break;

@@ -459,6 +459,234 @@
       ]
     },
     {
+      "name": "sony_distortion",
+      "params": {
+        "width": 1920,
+        "height": 1080,
+        "output_width": 1920,
+        "output_height": 1080,
+        "light_refraction_coefficient": 1.0,
+        "input_horizontal_stretch": 1.0,
+        "input_vertical_stretch": 1.0,
+        "distortion_model": "sony",
+        "digital_lens": null,
+        "light_refraction_keyframes": []
+      },
+      "distorted": [
+        [
+          960.0,
+          540.0
+        ],
+        [
+          1960.0,
+          540.0
+        ],
+        [
+          960.0,
+          1540.0
+        ],
+        [
+          300.0,
+          200.0
+        ],
+        [
+          1700.0,
+          900.0
+        ]
+      ],
+      "camera_matrix": [
+        [
+          1000.0,
+          0.0,
+          960.0
+        ],
+        [
+          0.0,
+          1000.0,
+          540.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "distortion_coeffs": [
+        0.5,
+        0.02,
+        0.003,
+        0.0004,
+        0.00005,
+        6e-6,
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "p": null,
+      "rot_per_point": null,
+      "lens_correction_amount": 1.0,
+      "timestamp_ms": 0.0,
+      "shift_per_point": null,
+      "mesh": null,
+      "tolerance": 0.00001,
+      "expected": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          -3.9277432,
+          0.0
+        ],
+        [
+          0.0,
+          -3.9277432
+        ],
+        [
+          -4.813117,
+          -2.4794846
+        ],
+        [
+          20.082325,
+          9.76978
+        ]
+      ]
+    },
+    {
+      "name": "insta360_distortion",
+      "params": {
+        "width": 1920,
+        "height": 1080,
+        "output_width": 1920,
+        "output_height": 1080,
+        "light_refraction_coefficient": 1.0,
+        "input_horizontal_stretch": 1.0,
+        "input_vertical_stretch": 1.0,
+        "distortion_model": "insta360",
+        "digital_lens": null,
+        "light_refraction_keyframes": []
+      },
+      "distorted": [
+        [
+          960.0,
+          540.0
+        ],
+        [
+          1960.0,
+          540.0
+        ],
+        [
+          960.0,
+          1540.0
+        ],
+        [
+          300.0,
+          200.0
+        ],
+        [
+          1700.0,
+          900.0
+        ]
+      ],
+      "camera_matrix": [
+        [
+          1000.0,
+          0.0,
+          960.0
+        ],
+        [
+          0.0,
+          1000.0,
+          540.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "distortion_coeffs": [
+        0.2,
+        -0.05,
+        0.01,
+        0.002,
+        -0.001,
+        0.4,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "p": null,
+      "rot_per_point": null,
+      "lens_correction_amount": 1.0,
+      "timestamp_ms": 0.0,
+      "shift_per_point": null,
+      "mesh": null,
+      "tolerance": 0.00001,
+      "expected": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          1.5358672,
+          -0.0024104887
+        ],
+        [
+          0.0011839943,
+          1.5230846
+        ],
+        [
+          -0.9686446,
+          -0.5007321
+        ],
+        [
+          1.1003554,
+          0.53323376
+        ]
+      ]
+    },
+    {
       "name": "ptlens_distortion",
       "params": {
         "width": 1920,
@@ -2634,6 +2862,144 @@
         [
           null,
           null
+        ]
+      ]
+    },
+    {
+      "name": "digital_lens_hyperview_converging",
+      "params": {
+        "width": 1920,
+        "height": 1080,
+        "output_width": 1920,
+        "output_height": 1080,
+        "light_refraction_coefficient": 1.0,
+        "input_horizontal_stretch": 1.0,
+        "input_vertical_stretch": 1.0,
+        "distortion_model": "opencv_fisheye",
+        "digital_lens": "gopro_hyperview",
+        "light_refraction_keyframes": []
+      },
+      "distorted": [
+        [
+          960.0,
+          540.0
+        ],
+        [
+          960.0,
+          600.0
+        ],
+        [
+          960.0,
+          700.0
+        ],
+        [
+          960.0,
+          200.0
+        ],
+        [
+          1200.0,
+          540.0
+        ],
+        [
+          300.0,
+          540.0
+        ],
+        [
+          960.0,
+          100.0
+        ],
+        [
+          960.0,
+          980.0
+        ]
+      ],
+      "camera_matrix": [
+        [
+          1000.0,
+          0.0,
+          960.0
+        ],
+        [
+          0.0,
+          1000.0,
+          540.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "distortion_coeffs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        [
+          1000.0,
+          0.0,
+          960.0
+        ],
+        [
+          0.0,
+          1000.0,
+          540.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "p": null,
+      "rot_per_point": null,
+      "lens_correction_amount": 0.3,
+      "timestamp_ms": 0.0,
+      "shift_per_point": null,
+      "mesh": null,
+      "tolerance": 0.00001,
+      "expected": [
+        [
+          960.0,
+          540.0
+        ],
+        [
+          960.0,
+          600.42365
+        ],
+        [
+          960.0,
+          701.0361
+        ],
+        [
+          960.0,
+          198.6068
+        ],
+        [
+          1164.095,
+          540.0
+        ],
+        [
+          438.674,
+          540.0
+        ],
+        [
+          960.0,
+          99.102554
+        ],
+        [
+          960.0,
+          980.89746
         ]
       ]
     },

@@ -74,7 +74,7 @@ def random_frame(h=48, w=64, seed=3) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 class TestDistortPointsParity:
-    """distort_points must match distort_point bit-for-bit (all models)."""
+    """distort_points must match distort_point value-for-value (all models)."""
 
     @pytest.mark.parametrize("model_name", sorted(_MODEL_REGISTRY))
     def test_distort_points_matches_scalar(self, model_name):
@@ -84,17 +84,33 @@ class TestDistortPointsParity:
         kp.digital_lens_params = (ctypes.c_float * 4)(1.1, 0.9, 0.0, 0.0)
 
         n = 300
-        # gopro models take pixel-domain coords; keep inputs in a range both
-        # interpretations tolerate
+        # The optical models take normalised coords, the digital ones take
+        # pixels. These inputs are small because of the former; for the latter
+        # that means "a few pixels from the corner", where their inversions can
+        # run away.
         xs = rng.uniform(-0.8, 0.8, n)
         ys = rng.uniform(-0.8, 0.8, n)
         zs = np.ones(n)
 
         vxd, vyd = model.distort_points(xs.copy(), ys.copy(), zs.copy(), kp)
+        n_nan = 0
         for i in range(n):
             sxd, syd = model.distort_point(float(xs[i]), float(ys[i]), float(zs[i]), kp)
+            # NaN-aware: two NaNs are a *match* here, because both paths
+            # produced them the same way. `approx` cannot express that, and
+            # skipping the point instead would let the two paths disagree on
+            # which points fail.
+            if np.isnan(sxd) or np.isnan(syd):
+                n_nan += 1
+                assert np.isnan(vxd[i]) and np.isnan(vyd[i]), f"{model_name}: {xs[i]},{ys[i]}"
+                continue
+            assert not np.isnan(vxd[i]) and not np.isnan(vyd[i]), f"{model_name}: {xs[i]},{ys[i]}"
             assert sxd == pytest.approx(float(vxd[i]), abs=1e-12)
             assert syd == pytest.approx(float(vyd[i]), abs=1e-12)
+        # Not an assertion about correctness — a canary. If every point of every
+        # model starts failing, the NaN-aware branch above would silently turn
+        # this test into a no-op.
+        assert n_nan < n, f"{model_name}: every input diverged"
 
     def test_fisheye_undistort_points_matches_scalar(self):
         from pygyroflow.stabilization.distortion_models import OpenCVFisheyeModel

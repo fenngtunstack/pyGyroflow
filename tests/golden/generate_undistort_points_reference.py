@@ -180,6 +180,27 @@ def _cases():
             "rotation": IDENTITY,
         },
         {
+            # sony and insta360 have the longest expressions of the ten models,
+            # which is where the HyperView coupling-term bug lived: a term
+            # whose precedence was not what the eye read. `opencv_standard` is
+            # the other long one and is covered above.
+            "name": "sony_distortion",
+            "params": {"distortion_model": "sony"},
+            "distorted": pts,
+            "camera_matrix": _k(),
+            "distortion_coeffs": [0.5, 0.02, 0.003, 0.0004, 0.00005, 0.000006, 1.0, 1.0]
+            + [0.0] * 4,
+            "rotation": IDENTITY,
+        },
+        {
+            "name": "insta360_distortion",
+            "params": {"distortion_model": "insta360"},
+            "distorted": pts,
+            "camera_matrix": _k(),
+            "distortion_coeffs": [0.2, -0.05, 0.01, 0.002, -0.001, 0.4] + [0.0] * 6,
+            "rotation": IDENTITY,
+        },
+        {
             "name": "ptlens_distortion",
             "params": {"distortion_model": "ptlens"},
             "distorted": pts,
@@ -348,6 +369,36 @@ def _cases():
             "camera_matrix": _k(),
             "distortion_coeffs": [0.0] * 12,
             "rotation": IDENTITY,
+            "lens_correction_amount": 0.3,
+        },
+        {
+            # The HyperView inverse is a substitution that does not converge
+            # over most of the frame — upstream returns NaN there, and the
+            # case above records that. These points are the ones where it
+            # *does* converge inside the 12-step cap, so the polynomial and the
+            # aspect-ratio handling are still pinned by real numbers rather
+            # than by a wall of NaN. (Measured step counts at 1920x1080:
+            # 1, 3, 3, 3, 9, 11, 4, 4 from the first probe to the last.)
+            "name": "digital_lens_hyperview_converging",
+            "params": {"digital_lens": "gopro_hyperview"},
+            "distorted": [
+                (960.0, 540.0),
+                (960.0, 600.0),
+                (960.0, 700.0),
+                (960.0, 200.0),
+                (1200.0, 540.0),
+                (300.0, 540.0),
+                (960.0, 100.0),
+                (960.0, 980.0),
+            ],
+            "camera_matrix": _k(),
+            "distortion_coeffs": [0.0] * 12,
+            # K, not the identity: real callers pass `new_k @ R`, so the point
+            # handed to the digital lens is in *pixels*. With the identity here
+            # the reprojection would come out in normalised units and the
+            # lens would be handed a coordinate near the origin, where the
+            # case would pin nothing (it would converge trivially).
+            "rotation": _k(),
             "lens_correction_amount": 0.3,
         },
         {
