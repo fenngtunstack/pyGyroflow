@@ -1357,6 +1357,7 @@ class StabilizationManager:
             of_method=of_method,
             pose_method=0,
             offset_method=method if offset_method is None else offset_method,
+            compute_params=self._build_sync_compute_params(),
         )
 
         log.info(
@@ -1541,6 +1542,8 @@ class StabilizationManager:
         win_us = int(self._SYNC_POINT_WINDOW_MS * 1000)
         method = 2 if quaternions is not None else 1
         candidates: dict[int, float] = {}
+        # Built once for the whole pass: every window in it shares a lens.
+        sync_params = self._build_sync_compute_params()
 
         for p_ms in points_ms:
             center_us = int(p_ms * 1000.0)
@@ -1555,6 +1558,7 @@ class StabilizationManager:
                     of_method=2,
                     pose_method=0,
                     offset_method=method,
+                    compute_params=sync_params,
                 )
                 off = proc.run(
                     window,
@@ -2133,6 +2137,43 @@ class StabilizationManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _build_sync_compute_params(self) -> "ComputeParams | None":
+        """The ``ComputeParams`` the pose estimators run against during sync.
+
+        Port of upstream's ``autosync.rs:86-89``: a full snapshot from the
+        manager, then two overrides. The keyframes go because sync is finding
+        an offset, not rendering — an animated zoom or FOV would move the crop
+        under it. ``lens_correction_amount`` is pinned to 1.0 because the pose
+        estimators want the fully corrected image; this is the field upstream
+        sets, and the one its ``Camera::delta`` does *not* read (it passes a
+        literal 1.0), which is what made the estimator's lens handling easy to
+        lose in the port.
+
+        Returns None when there is no usable lens. The estimators accept that
+        and fall back to a pinhole camera — the behaviour they had before this
+        parameter existed — so a manager without a lens profile can still sync.
+        The check is up front rather than a caught exception around the whole
+        build: only the absent camera matrix is tolerated, not whatever else
+        the snapshot might raise on.
+        """
+        lens = self.lens
+        if lens is None:
+            return None
+        w, h = self.params.size
+        if lens.get_camera_matrix(size=(w, h)) is None:
+            log.warning(
+                "Auto-sync: no camera matrix for %dx%d; pose estimation runs on a "
+                "pinhole camera without lens distortion",
+                w,
+                h,
+            )
+            return None
+
+        params = self._build_compute_params()
+        params.keyframes.clear()
+        params.lens_correction_amount = 1.0
+        return params
 
     def _build_compute_params(self) -> ComputeParams:
         """Build a ComputeParams snapshot from current state."""

@@ -226,7 +226,18 @@ class OpenCVFisheyeModel(DistortionModelBase):
         scale = np.tan(theta) / safe_td
         theta_flipped = ((theta_d < 0.0) & (theta > 0.0)) | ((theta_d > 0.0) & (theta < 0.0))
 
-        ok = converged & ~theta_flipped & (np.abs(theta_d) > EPS)
+        # No `|theta_d| > EPS` clause here. It used to be in this expression,
+        # which made the exact principal point come back NaN while the scalar
+        # `undistort_point` returns (0, 0) for it — the scalar's `else:
+        # converged = True` branch takes the same route and multiplies by the
+        # scale, so the scale is what both should apply. For theta_d = 0 the
+        # scale is `tan(0) / 1` = 0 and the answer is (0, 0) either way. The
+        # clause only ever fired at the single pixel under the principal
+        # point, which is why it went unnoticed: there it turned a correct
+        # coordinate into a NaN, and NaN reads as "this point failed" to every
+        # consumer (the lens-correction blend in the image path, and the
+        # Almeida pose solver).
+        ok = converged & ~theta_flipped
         out_scale = np.where(ok, scale, np.nan)
         return xs * out_scale, ys * out_scale
 

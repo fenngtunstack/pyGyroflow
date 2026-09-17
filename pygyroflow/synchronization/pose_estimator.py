@@ -78,6 +78,7 @@ class PoseEstimator:
         self._of_method: int = 2  # DIS
         self._pose_method: int = 0  # essential matrix
         self._lpf: float = 0.0  # 0 = no filtering (upstream's default)
+        self._compute_params = None  # set_compute_params; None = pinhole
         self._detector: OpticalFlowDetector | None = None
 
     # ------------------------------------------------------------------
@@ -105,6 +106,17 @@ class PoseEstimator:
     def set_pose_method(self, method: int) -> None:
         """Set pose estimation method index."""
         self._pose_method = method
+
+    def set_compute_params(self, params) -> None:
+        """Give the estimators the ``ComputeParams`` upstream hands them.
+
+        Upstream's ``EstimatePoseTrait::init`` receives a full ``ComputeParams``
+        and the Almeida estimator reads the lens out of it on every call. The
+        port used to pass only ``camera_matrix``, which silently reduced that
+        estimator to a pinhole camera. ``None`` (the default) keeps that
+        behaviour, so a caller with no lens information is unaffected.
+        """
+        self._compute_params = params
 
     def clear(self) -> None:
         """Drop all stored frame results."""
@@ -194,7 +206,10 @@ class PoseEstimator:
         if len(prev_pts) < 10:
             return None
 
-        R = estimate_rotation(prev_pts, curr_pts, K, method=self._pose_method)
+        R = estimate_rotation(
+            prev_pts, curr_pts, K, method=self._pose_method,
+            params=self._compute_params, timestamp_ms=timestamp_us / 1000.0,
+        )
         if R is None:
             return None
 
@@ -244,6 +259,7 @@ class PoseEstimator:
             # Pose estimation
             R = estimate_rotation(
                 prev_pts, curr_pts, self._camera_matrix, method=self._pose_method,
+                params=self._compute_params, timestamp_ms=curr.timestamp_us / 1000.0,
             )
             if R is not None:
                 curr.rotation = R

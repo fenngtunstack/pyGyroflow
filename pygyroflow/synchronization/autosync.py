@@ -44,6 +44,9 @@ class AutosyncProcess:
         Offset search method index.
     every_nth_frame:
         Process every N-th frame to speed things up.
+    compute_params:
+        ``ComputeParams`` for the pose estimators' lens. Upstream builds a
+        dedicated one per sync run; ``None`` leaves them on a pinhole camera.
     """
 
     def __init__(
@@ -55,6 +58,7 @@ class AutosyncProcess:
         pose_method: int = 0,
         offset_method: int = 1,
         every_nth_frame: int = 1,
+        compute_params=None,
     ) -> None:
         self._pose_estimator = PoseEstimator()
         self._pose_estimator.set_fps(fps, scaled_fps)
@@ -64,6 +68,11 @@ class AutosyncProcess:
 
         if camera_matrix is not None:
             self._pose_estimator.set_camera_matrix(camera_matrix)
+        # The pose estimators need the lens, not just K. Upstream builds a
+        # dedicated ComputeParams for the sync run (autosync.rs:86-89) with the
+        # keyframes cleared and `lens_correction_amount = 1.0`, and hands it to
+        # every estimator.
+        self._pose_estimator.set_compute_params(compute_params)
 
         self._offset_method = offset_method
         self._fps = fps

@@ -43,6 +43,8 @@ def estimate_rotation(
     camera_matrix: npt.NDArray[np.float64],
     method: int = 0,
     size_wh: tuple[float, float] | None = None,
+    params=None,
+    timestamp_ms: float = 0.0,
 ) -> np.ndarray | None:
     """Estimate the 3x3 rotation matrix between two frames.
 
@@ -55,6 +57,15 @@ def estimate_rotation(
     method:
         Pose estimation method index (0=essential_matrix, 2=eight_point,
         3=homography).
+    size_wh:
+        Frame size the points are expressed in (Almeida only).
+    params:
+        ``ComputeParams``, so the estimator can reach the lens. Upstream hands
+        it to every estimator (``EstimatePoseTrait::init``); here only Almeida
+        uses it so far. ``None`` means "run on a pinhole camera", which is what
+        every caller got before this argument existed.
+    timestamp_ms:
+        Frame timestamp, for the per-timestamp lens lookup.
 
     Returns
     -------
@@ -68,7 +79,14 @@ def estimate_rotation(
         if size_wh is None:
             # principal point centred on typical sensors: w ~ 2*cx, h ~ 2*cy
             size_wh = (2.0 * float(camera_matrix[0, 2]), 2.0 * float(camera_matrix[1, 2]))
-        return estimate_pose_almeida(prev_pts, curr_pts, camera_matrix, size_wh)
+        return estimate_pose_almeida(
+            prev_pts,
+            curr_pts,
+            camera_matrix,
+            size_wh,
+            params=params,
+            timestamp_ms=timestamp_ms,
+        )
 
     if method_name == "eight_point":
         result = estimate_pose_eight_point(prev_pts, curr_pts, camera_matrix)
