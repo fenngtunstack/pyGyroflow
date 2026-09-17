@@ -397,6 +397,8 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | D-06（家族本身）`at_timestamp_for_points` + `undistort_points*` 七个函数 | `c7cbf1f` | 45 项测试。级联顺序用「把某一级的输出当下一级的输入、结果不变」断言（数字镜头、mesh），不重推畸变数学——那部分由 `test_distortion_models.py`/`test_distortion_cv2_parity.py` 覆盖。未收敛点的 `(-1000000,-1000000)` 哨兵用 `k1=-0.5`、归一化半径 1.0 触发（实测该点 10 次迭代不收敛），并断言只有失败的那个点进哨兵。变异检查：把 `_partial_correction` 换成恒等函数，`test_zero_correction_redistorts_the_point_back_where_it_started` 立刻失败 |
 | **D-06 参照**：`undistort_points` 对上游 Rust 逐值比对 | `6b7b84e` | `cpu_undistort.rs:649-803` 逐字节切出、`distortion_models/` 与 `gyro_source/splines.rs` 整流原样复制，编译后跑 26 用例 304 个坐标值，全部落在 3.7e-7 相对误差内（f32 vs f64 的本底）。**这一步查出上面三条缺陷**，其中两条结构性测试按构造就测不到。参照工程不入库，`generate_undistort_points_reference.py --stage` 现场从只读的 `opensource/gyroflow/` 抽取，所以不存在第二份会漂的副本 |
 | **D-06 余下**：`fov_iterative` 换用逐点家族 + 工作副本全量克隆 | `538c8af` | 18 项测试。① spy 断言多边形确实走 `undistort_points_with_rolling_shutter` 且 `use_fovs=False`，并把该函数桩成定值反推收缩循环的闭式结果（八角形半宽 100 → fov = 2·(100/0.5625)/1920），把循环本身钉住；② 逐项断言 IBIS 位移/mesh/数码镜头/光学模型/缩放中心各自**改变** FOV 且方向正确——这五项在旧实现里全无影响，其中 IBIS 用两个幅度验证单调性；③ 关键帧分支逐个参数断言 `_find_fov` 收到的三元组随帧变化，并单列一条「关键帧取值与静态值相同则结果不变」把"查了"和"变了"分开；④ 工作副本按 `is` 断言七个新字段同一对象，并断言估算用的是输入尺寸、fovs 已清空。变异检查：把 undistort 换成只做旋转+畸变的针孔版本 → ② 全挂；把 `nearest_edge` 的宽高比改回从当前矩形推导 → 对应断言挂 |
+| HyperView 数码镜头：x 多项式的括号位置 + 去掉自造的收敛保护 | `e229f05` | 括号那条：`x == width/2` 那一列上游原样返回、移植漂 6.7 px，修后两个 HyperView 用例对上 2.4e-7；另加 `digital_lens_hyperview_converging` 用例（原用例现在全 NaN，只钉住失败路径），以及 `sony_distortion`/`insta360_distortion`（表达式最长的两个模型，括号错误的高发区，对上 2.5e-6 / 1.7e-7）。保护那条：整帧量化了「12 步无保护」与「20 步 + 重置」的差别（NaN 9.0% vs 0%，未收敛 52% vs 11%），并新建 `TestTheHyperviewInversion` 把「迭代次数是上游的、且与 WGSL 一致」写成断言 |
+| Almeida 姿态估计接上透镜（D-06 余下）+ 鱼眼批处理主点 NaN | `034d033` | 独立重写上游 `Camera::delta` 逐值比对：带畸变/不带畸变各 5 个旋转，误差 < 1e-6。`params=None` 与改动前逐位一致（有断言）。批处理 vs 标量鱼眼逐点比对 300 点含主点，最大相对差 8.5e-10。变异检查：把 `_undistort` 换回「只归一化」，`TestAgainstUpstreamDelta` 5 项全挂 |
 | 补缺模型 `gopro6_superview`（此前静默回落成鱼眼） | `b718511` | 上游 `gopro6_superview.rs` 逐字节副本编译后跑出的 46 个参照值全部对上；容差按实测取（undistort 1.05e-7 / distort 1.14e-6 相对，来源是上游 f32、此处 f64），另有一条 2e-6 的聚合断言防漂移。两个探针钉住「看起来像 bug」的上游行为：`(100,900)` 需要 22 步而上游 12 步封顶（用「多项式被调用几次 == 12」断言，并断言返回值出自 fixture）；`(200,200)` 的原像在画面外约 -57 px（同时断言 undistort 能回来）。另断言两个 superview 在 1440 px 处结果不同（rel 1e-4）——把两者混为一个是这条缺陷的失效模式 |
 
 **实施中新发现的、原清单没有的缺陷**：
@@ -426,6 +428,11 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 - **工程自带的陀螺数据根本没被载入**。`load_project` 只套用了 IMU 变换，没解码 `quaternions`/`raw_imu`/`gravity_vectors`/`image_orientations` 并交给 gyro source。参考工程里这四个字段恰好全是 `null`（它们靠原片遥测），所以最初的手工验证看起来是对的——而 `WithGyroData` 工程存在的全部意义就是脱离原片。修的时候还要注意顺序：`load_from_telemetry` 内部会 `clear()`，把 IMU 变换清掉，所以变换必须在载入数据**之后**套用。
 
 **做 D-06 时新发现的缺陷**：
+
+- **HyperView 的 x 多项式，y² 耦合项写在乘法外面**（`e229f05`）。上游 `uv.0 * (P(x²) + y2*-0.1086027)`，移植写成 `uv.0 * (P(x²)) + y2*-0.1086027`——差一个因子 x，所以两者在**竖直中线**上相同、离开就分岔，写成加项时看代码完全正常。是模块自己带的 WGSL 文本（照抄上游的）把它出卖了：同一文件里两处自相矛盾。实测 `x == width/2` 那一列上游返回原列不变，移植漂出 6.7 px（相对 7e-3）。前向 `undistort_point` 同样受影响。
+- **HyperView 的逆迭代被移植自造了收敛保护**（`e229f05`）。上游 12 步、无保护；移植 20 步 + 发散重置，连 WGSL 也被改成 20（而 docstring 仍声称与 Gyroflow 的 WGSL 完全一致）。量了整帧（1920x1080，8 px 采样）：上游 NaN 9.0%、跑满 12 步未收敛 52%；移植 NaN 0%、11% 重置回「拉伸过但没求逆」的输入——那个重置的语义其实是**把数码镜头整个跳过**。两种都不好，选择改回上游：移植的目的是与 Gyroflow 一致，自造一个更"稳"的版本会让每次 HyperView 对比都对不上而原因看不出来。**上游这个逆迭代本身是坏的**（多数帧不收敛），记为上游性质而非我们的偏差。
+- **Almeida 姿态估计的 `delta` 缺了整段透镜反演**（`034d033`，见下方 D-06 余下行）。原 docstring 的理由「上游把透镜校正是关了的」是错的：`init` 设 `compute_params.lens_correction_amount = 0`，但 `delta` 给 `undistort_points` 的 `lens_correction_amount` 参数传的是**字面量 1.0**，所以它设的字段不决定分支。而且即便混合真跑了，0 的语义是「保留原始观感」= 之后再施加一次前向畸变，不是跳过。
+- **鱼眼批处理把正主点算成 NaN**（`034d033`）。`OpenCVFisheyeModel.undistort_points` 的收敛条件多了 `|theta_d| > EPS`，标量版对同一输入返回 (0,0)。只有主点那一个像素会踩到，所以一直没暴露；NaN 对两个消费方（图像路径的镜片校正混合、Almeida 求解器）都意味「这个点失败了」。
 
 - **IBIS 位移分支的旋转顺序写反**（`cpu_undistort.py` 的 `undistort_points`）。上游是顺序赋值：先 `x = cos·x − sin·y + cx`，**再**用这个新的 x 算 `y = sin·x + cos·y + cy`；移植写成 `x, y = …, …`，Python 先求值右侧元组，于是 y 用的是**旧的** x。只有 `sin(角度) == 0`（纯平移）时两者才一致，所以看代码看不出来、看 `almeida` 那类对称测试也看不出来。实测：`shift_per_point` 用例相对误差 1.5e-2，参照容差 1e-5。已修。
 - **`math.sqrt` 在负值上抛异常，而上游的 `f64::sqrt` 返回 NaN**。光折射校正把 `sin_theta_d` 除以系数，系数小于 1 时它会超过 1，根号下变负。上游在那里得到 NaN 并继续——消费方把 NaN 坐标当作"没有答案"（NaN 的任意比较都是假，点自动从边缘搜索里掉出去）——**渲染照常出片**；移植则抛 `ValueError`，整个渲染中断。用真工程里合法的系数（0.8）就能触发。已在两处改为返回 NaN 的辅助函数。这两条都是先有参照、后有发现：结构性测试对第一条天然免疫（断言两边共享同一个错误），对第二条也测不到（它压根没进过那条分支）。
@@ -472,7 +479,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | 项 | 说明 |
 |---|---|
 | D-06 `at_timestamp_for_points`/`undistort_points*` 逐点家族 | ~~家族本身~~ 已实现（`c7cbf1f`） |
-| **D-06 余下** 其余调用方换用逐点家族 | `zooming/fov_iterative.py` **已换**（`538c8af`）：`_undistort_points_simple` 整份删除，改调 `undistort_points_with_rolling_shutter`；工作副本改成全量克隆，逐帧镜头数据与逐帧 stab 数据随之到位。**还剩**下游四处：`synchronization/estimate_pose/almeida.py`（上游用 `undistort_points`，`p = Some(camera_matrix)`；那里现在用无畸变的针孔投影）、`find_offset/rs_sync.py`、`find_offset/visual_features.py`、`estimate_pose/` 下各估计器（上游用 `undistort_points_for_optical_flow`）。**这几处才是真影响自动同步的**——`almeida` 的自身注释就写着点没有畸变校正，`visual_features` 是 offset 搜索的特征点来源 |
+| **D-06 余下** 其余调用方换用逐点家族 | `zooming/fov_iterative.py` **已换**（`538c8af`）：`_undistort_points_simple` 整份删除，改调 `undistort_points_with_rolling_shutter`；工作副本改成全量克隆，逐帧镜头数据与逐帧 stab 数据随之到位。`synchronization/estimate_pose/almeida.py` **已换**（`034d033`）：`_CameraK` 现在持有 `ComputeParams` 与时间戳，`delta` 走镜头反演；`params` 可省（省则退回旧的针孔行为），manager 侧新增 `_build_sync_compute_params()` 喂给 `AutosyncProcess`，贯通 `PoseEstimator` → `estimate_rotation`。**还剩三处**：`find_offset/rs_sync.py`、`find_offset/visual_features.py`、`estimate_pose/` 下的 eight_point/essential/homography（上游用 `undistort_points_for_optical_flow`）。`visual_features` 是 offset 搜索的特征点来源，`rs_sync` 是卷帘快门分支，这两处最值得接着做 |
 | D-08 焦距平滑 | ~~整文件移植~~ 已实现（`cb606bb`），但需要 `lens_params` 写入侧才能上真机 |
 | D-05 max-zoom 反馈回路 | 需加字段 + 循环 |
 | D-09 自适应缩放关键帧 | 传 params 即可恢复大半 |

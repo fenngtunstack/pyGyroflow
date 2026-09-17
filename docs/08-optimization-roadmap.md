@@ -91,6 +91,7 @@
 - **P3-2 complementary 论文版重写**: Python 是 8 行简化版镜像 vs Rust 论文 V1/V2（600 行），需按 "Keeping a Good Attitude" 重写。
 - **P3-3 GPU 全 0 三根因**: ① coeffs 插值表恒全 0（`backend.py:270-275`，shader 双线性权重全 0）② `pixel_value_limit` 从未设置（wgsl `min(sum, 0)` 恒黑）③ `output_stride` 默认 0（所有行覆写第 0 行）。另有 CPU fallback 函数签名错误（`backend.py:349-366`，一调用就 TypeError）。代码级可修，最终验证需真实 GPU（本机仅 llvmpipe）。
 - **P3-4 fov_iterative 接入畸变模型** [x]（2026-09-17）: 分两步。畸变模型本身早已补进那份本地副本，但副本仍缺逐点 IBIS 位移、mesh/焦平面校正、数码镜头和 `lens_correction_amount < 1` 的混合，内参也是手工重算的（变焦镜头的逐帧标定到不了这里）。D-06 的逐点家族落地后（`c7cbf1f`、`6b7b84e`），`_undistort_points_simple` 整份删除，改调上游的 `undistort_points_with_rolling_shutter`；`zooming/__init__.py` 的工作副本从逐字段构造改成 `dataclasses.replace` 全量克隆（否则新字段照旧会被漏掉）。实测（合成夹具，静态缩放单一数值）：IBIS 位移 60/40 px 使 FOV 从 0.9963 降到 0.9354，mesh 使其降到 0.1740，数码镜头与鱼眼系数同样改变结果——这些在旧实现里**全部无影响**。
+- **P3-5 Almeida 姿态估计接上透镜** [x]（2026-09-17）: `_CameraK` 此前只拿 K，`delta` 做归一化 → 旋转 → 投影，跳过整段镜头反演（模块 docstring 用一个错误理由把它写成"有意为之"）。现在持有 `ComputeParams` 与时间戳，与上游 `Camera::delta` 逐值一致。顺带修掉 `OpenCVFisheyeModel.undistort_points` 把正主点算成 NaN（标量版返回 (0,0)）。剩余：`rs_sync`/`visual_features`/`estimate_pose` 三个估计器仍走 `undistort_points_for_optical_flow` 的缺口。
 
 ## P4 — 覆盖面与产品化（按需排期）
 
