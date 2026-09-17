@@ -496,6 +496,21 @@ def cpu_undistort(
 _POINT_FAILURE = (-1000000.0, -1000000.0)
 
 
+def _sqrt_allow_nan(value: float) -> float:
+    """``sqrt`` that yields NaN for a negative argument instead of raising.
+
+    Rust's ``f64::sqrt`` returns NaN outside the domain; Python's ``math.sqrt``
+    raises ``ValueError``. That difference is load-bearing: the light-refraction
+    correction divides ``sin_theta_d`` by the coefficient, so a coefficient
+    below 1 pushes it past 1 and the expression under the root goes negative.
+    Upstream produces a NaN coordinate there and every consumer treats NaN as
+    "no answer" — comparisons against NaN are false, so the point drops out of
+    the edge search and the frame renders anyway. Raising here would abort a
+    render upstream completes.
+    """
+    return math.sqrt(value) if value >= 0.0 else float("nan")
+
+
 def _points_kernel_params(
     camera_matrix, distortion_coeffs, params, light_refraction_coefficient
 ) -> KernelParams:
@@ -619,7 +634,7 @@ def _partial_correction(
     if refraction != 1.0 and refraction > 0.0:
         radius = math.sqrt(new_pt[0] ** 2 + new_pt[1] ** 2) / weight
         sin_theta_d = (radius / math.sqrt(1.0 + radius * radius)) * refraction
-        r_d = sin_theta_d / math.sqrt(1.0 - sin_theta_d * sin_theta_d)
+        r_d = sin_theta_d / _sqrt_allow_nan(1.0 - sin_theta_d * sin_theta_d)
         if r_d != 0.0:
             weight *= radius / r_d
 
@@ -722,7 +737,13 @@ def undistort_points(
             sin_a = math.sin(angle)
             x = x - c[0] - shift[3] + shift[0]
             y = y - c[1] - shift[4] + shift[1]
-            x, y = cos_a * x - sin_a * y + c[0], sin_a * x + cos_a * y + c[1]
+            # Upstream assigns x first and then reads the *new* x when it
+            # computes y, so the rotation is not the plain matrix product. A
+            # simultaneous `x, y = ...` here would leave y on the old x; the
+            # two agree only when sin(a) is zero, i.e. for a pure translation.
+            rotated_x = cos_a * x - sin_a * y + c[0]
+            y = sin_a * rotated_x + cos_a * y + c[1]
+            x = rotated_x
 
         # Normalised units, which is what the distortion models take.
         pw = ((x - c[0]) / f[0], (y - c[1]) / f[1])
@@ -743,7 +764,7 @@ def undistort_points(
                 sin_theta_d = (radius / math.sqrt(1.0 + radius * radius)) / (
                     light_refraction_coefficient
                 )
-                r_d = sin_theta_d / math.sqrt(1.0 - sin_theta_d * sin_theta_d)
+                r_d = sin_theta_d / _sqrt_allow_nan(1.0 - sin_theta_d * sin_theta_d)
                 factor = r_d / radius
                 pt = (pt[0] * factor, pt[1] * factor)
 

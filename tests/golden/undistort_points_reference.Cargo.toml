@@ -1,0 +1,17 @@
+[package]
+name = "upref"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "upref"
+path = "src/main.rs"
+
+[dependencies]
+# Same version upstream pins (opensource/gyroflow/src/core/Cargo.toml:26), so
+# the matrix types and their arithmetic match the reference exactly.
+nalgebra = { version = "0.34", features = ["serde-serialize"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# opencv_standard.rs logs when its iteration gives up.
+log = "0.4"
