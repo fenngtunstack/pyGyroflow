@@ -1289,6 +1289,7 @@ class StabilizationManager:
         progress_callback: Any = None,
         of_method: int = 2,
         offset_method: int | None = None,
+        pose_method: int = 0,
     ) -> float | None:
         """Auto-synchronize the gyro timeline to the video via optical flow.
 
@@ -1316,6 +1317,13 @@ class StabilizationManager:
             search_range_ms: Offset search window in ms.
             use_rs: Prefer the rolling-shutter-aware search.
             progress_callback: Optional Callable[[float], None].
+            of_method: Optical-flow method index.
+            offset_method: Offset-search method index; ``None`` picks 2 (RS)
+                when ``use_rs`` else 1 (cross-correlation).
+            pose_method: Pose-estimation method index. The faithful
+                ``PoseFindEssentialMat`` (0) demands inter-frame parallax —
+                a rotation-only synthetic scene gives it zero usable pairs —
+                so a caller syncing such footage selects 2 instead.
 
         Returns:
             Offset in ms (``visual = gyro + offset``), or None on failure.
@@ -1355,7 +1363,7 @@ class StabilizationManager:
             fps=self.params.fps,
             scaled_fps=self.params.get_scaled_fps(),
             of_method=of_method,
-            pose_method=0,
+            pose_method=pose_method,
             offset_method=method if offset_method is None else offset_method,
             compute_params=self._build_sync_compute_params(),
         )

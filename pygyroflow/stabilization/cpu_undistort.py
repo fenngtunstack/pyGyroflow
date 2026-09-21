@@ -820,6 +820,26 @@ def undistort_points_with_rolling_shutter(
     )
 
 
+def _optical_flow_lens_data(params, timestamp_us: int, points_dims: tuple[int, int]):
+    """Scaled camera matrix + coefficients at the flow's own scale.
+
+    The prep of ``undistort_points_for_optical_flow`` (lens data at the
+    frame's timestamp, matrix scaled from the calibration size down to the
+    size the flow points are expressed in), exposed because one caller — the
+    pose dispatch's method-2 stand-in — needs the undistorted points back in
+    *pixel* units and so re-runs :func:`undistort_points` with ``scaled_k``
+    as the rotation instead of the identity.
+    """
+    from pygyroflow.stabilization.frame_transform import _get_lens_data_at_timestamp
+
+    image_dim_ratio = points_dims[0] / max(1, params.width)
+
+    camera_matrix, coeffs, _, _, _, _ = _get_lens_data_at_timestamp(
+        params, timestamp_us / 1000.0, False
+    )
+    return np.asarray(camera_matrix, dtype=np.float64) * image_dim_ratio, coeffs
+
+
 def undistort_points_for_optical_flow(
     distorted, timestamp_us: int, params, points_dims: tuple[int, int]
 ) -> list[tuple[float, float]]:
@@ -832,14 +852,7 @@ def undistort_points_for_optical_flow(
     no stabilization is applied. This is the call that puts the flow's feature
     points into undistorted coordinates, which the offset search then assumes.
     """
-    from pygyroflow.stabilization.frame_transform import _get_lens_data_at_timestamp
-
-    image_dim_ratio = points_dims[0] / max(1, params.width)
-
-    camera_matrix, coeffs, _, _, _, _ = _get_lens_data_at_timestamp(
-        params, timestamp_us / 1000.0, False
-    )
-    scaled_k = np.asarray(camera_matrix, dtype=np.float64) * image_dim_ratio
+    scaled_k, coeffs = _optical_flow_lens_data(params, timestamp_us, points_dims)
 
     return undistort_points(
         distorted, scaled_k, coeffs, np.eye(3),

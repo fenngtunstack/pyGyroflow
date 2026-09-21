@@ -171,6 +171,7 @@ class PoseEstimator:
         timestamp_us: int,
         camera_matrix: npt.NDArray[np.float64] | None = None,
         optical_flow_method: int | None = None,
+        next_timestamp_us: int | None = None,
     ) -> FrameResult | None:
         """Process a single frame pair and estimate rotation.
 
@@ -187,6 +188,11 @@ class PoseEstimator:
             Override camera matrix (uses default if None).
         optical_flow_method:
             Override OF method index.
+        next_timestamp_us:
+            Timestamp of *curr_frame* in microseconds. The pose estimators
+            undistort the two point sets at their own frames' timestamps, so
+            a zoom lens wants the real value here; ``None`` reuses
+            *timestamp_us*.
 
         Returns
         -------
@@ -208,7 +214,11 @@ class PoseEstimator:
 
         R = estimate_rotation(
             prev_pts, curr_pts, K, method=self._pose_method,
+            size_wh=(prev_frame.shape[1], prev_frame.shape[0]),
             params=self._compute_params, timestamp_ms=timestamp_us / 1000.0,
+            next_timestamp_ms=(
+                next_timestamp_us / 1000.0 if next_timestamp_us is not None else None
+            ),
         )
         if R is None:
             return None
@@ -256,10 +266,16 @@ class PoseEstimator:
             curr.prev_points = prev_pts
             curr.curr_points = curr_pts
 
-            # Pose estimation
+            # Pose estimation. The frame size is the optical-flow working
+            # size (the frames fed to `feed_frame`, possibly smaller than the
+            # video) — the undistortion inside `estimate_rotation` scales the
+            # calibration to it — and each point set is undistorted at its
+            # own frame's timestamp.
             R = estimate_rotation(
                 prev_pts, curr_pts, self._camera_matrix, method=self._pose_method,
+                size_wh=(prev_gray.shape[1], prev_gray.shape[0]),
                 params=self._compute_params, timestamp_ms=curr.timestamp_us / 1000.0,
+                next_timestamp_ms=nxt.timestamp_us / 1000.0,
             )
             if R is not None:
                 curr.rotation = R

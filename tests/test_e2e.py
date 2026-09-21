@@ -665,22 +665,40 @@ class TestOrientationGuess:
         t = np.arange(n) / fps
         omega = 25.0 * np.sin(2 * np.pi * t / 1.5)  # visual-Y pan, deg/s
 
+        # Two depth layers (parallax) and a sliding camera: the default pose
+        # method 0 (PoseFindEssentialMat) needs non-planar, translating
+        # scenes — a rotation-only rig yields it zero usable pairs.
         rng = np.random.default_rng(5)
-        base = np.full((h, w), 128, dtype=np.uint8)
-        for _ in range(120):
+        far = np.full((h, w), 128, dtype=np.uint8)
+        near = np.zeros((h, w), dtype=np.uint8)
+        for k in range(120):
             cx, cy = int(rng.integers(0, w)), int(rng.integers(0, h))
-            cv2.circle(base, (cx, cy), int(rng.integers(3, 12)), int(rng.integers(0, 255)), -1)
+            if k % 3 == 0:
+                cv2.circle(near, (cx, cy), int(rng.integers(3, 12)), int(rng.integers(1, 255)), -1)
+            else:
+                cv2.circle(far, (cx, cy), int(rng.integers(3, 12)), int(rng.integers(0, 255)), -1)
 
         src = tmp_path / "pan.mp4"
         container = av.open(str(src), "w")
         vs = container.add_stream("libx264", rate=Fraction(int(fps), 1))
         vs.width, vs.height, vs.pix_fmt = w, h, "yuv420p"
         theta = np.rad2deg(np.cumsum(np.deg2rad(omega)) / fps)
+        slide = np.array([0.01, 0.0, 0.02])
+        Kinv = np.linalg.inv(K)
+
+        def _warp_layer(layer, depth, i, R):
+            H = K @ (R + np.outer(slide * i / depth, [0.0, 0.0, 1.0])) @ Kinv
+            return cv2.warpPerspective(
+                layer, H, (w, h), flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+
         for i in range(n):
             a = np.deg2rad(theta[i] - theta[0])
             R = np.array([[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]])
-            H = K @ R @ np.linalg.inv(K)
-            warped = cv2.warpPerspective(base, H, (w, h), borderMode=cv2.BORDER_REPLICATE)
+            warped = _warp_layer(far, 1.0, i, R)
+            fg = _warp_layer(near, 0.55, i, R)
+            warped[fg > 0] = fg[fg > 0]
             vf = av.VideoFrame.from_ndarray(np.repeat(warped[:, :, None], 3, axis=2), format="rgb24")
             for pkt in vs.encode(vf):
                 container.mux(pkt)
@@ -1050,7 +1068,15 @@ class TestAutoSync:
         mgr.gyro.load_from_telemetry(md)
         assert len(mgr.gyro.quaternions) >= n - 2
 
-        offset = mgr.synchronize(sample_count=30, search_range_ms=500.0)
+        # pose_method=2: this rig is rotation-only (no parallax), so the
+        # faithful PoseFindEssentialMat (method 0) finds zero usable pairs —
+        # its triangulated cheirality needs camera translation. Method 2
+        # passes the rotation gate, and the RS-aware offset search (whose
+        # model *is* rotation-only) carries the sync — as it implicitly did
+        # before the pose dispatch was fixed.
+        offset = mgr.synchronize(
+            sample_count=30, search_range_ms=500.0, pose_method=2
+        )
         assert offset is not None, "auto-sync returned None"
         assert abs(offset - (-delay_ms)) < 25.0, (
             f"recovered offset {offset:.1f} ms, expected {-delay_ms:.1f} ms"

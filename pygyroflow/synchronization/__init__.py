@@ -32,8 +32,10 @@ from pygyroflow.synchronization.optical_flow import (
 from pygyroflow.synchronization.estimate_pose import (
     estimate_rotation,
     estimate_pose_eight_point,
+    estimate_pose_find_essential_mat,
     estimate_essential_matrix,
     estimate_homography,
+    estimate_pose_find_homography,
 )
 from pygyroflow.synchronization.find_offset import (
     find_time_offset,
@@ -58,8 +60,10 @@ __all__ = [
     # Pose estimation
     "estimate_rotation",
     "estimate_pose_eight_point",
+    "estimate_pose_find_essential_mat",
     "estimate_essential_matrix",
     "estimate_homography",
+    "estimate_pose_find_homography",
     # Offset search
     "find_time_offset",
     "find_offset_visual_features",
