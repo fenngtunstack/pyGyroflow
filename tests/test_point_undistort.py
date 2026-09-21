@@ -578,6 +578,14 @@ class TestUndistortPointsWithRollingShutter:
     def test_no_points_in_no_points_out(self):
         assert undistort_points_with_rolling_shutter([], 0.0, 0, _params()) == []
 
+    def test_ndarray_input_does_not_trip_the_truthiness_guard(self):
+        """`if not distorted` raises on an ndarray ("truth value of an array
+        is ambiguous"); the guard checks length, so both input shapes work.
+        The offset search feeds ndarrays."""
+        pts = np.array([[CX, CY], [CX + FX, CY + FY]], dtype=np.float64)
+        out = undistort_points_with_rolling_shutter(pts, 0.0, 0, _params())
+        assert len(out) == 2
+
     def test_without_rolling_shutter_it_is_the_single_matrix_path(self):
         params = _params(frame_readout_time=0.0)
         out = undistort_points_with_rolling_shutter(

@@ -802,7 +802,9 @@ def undistort_points_with_rolling_shutter(
     """
     from pygyroflow.stabilization.frame_transform import at_timestamp_for_points
 
-    if not distorted:
+    # len(), not truthiness: an ndarray input would raise
+    # "truth value of an array is ambiguous" on `not distorted`.
+    if len(distorted) == 0:
         return []
 
     camera_matrix, coeffs, _new_k, rotations, shifts, mesh = at_timestamp_for_points(
