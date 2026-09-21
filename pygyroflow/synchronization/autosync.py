@@ -71,7 +71,9 @@ class AutosyncProcess:
         # The pose estimators need the lens, not just K. Upstream builds a
         # dedicated ComputeParams for the sync run (autosync.rs:86-89) with the
         # keyframes cleared and `lens_correction_amount = 1.0`, and hands it to
-        # every estimator.
+        # every estimator — and the RS-aware offset search undistorts its
+        # tracks with it too.
+        self._compute_params = compute_params
         self._pose_estimator.set_compute_params(compute_params)
 
         self._offset_method = offset_method
@@ -215,12 +217,15 @@ class AutosyncProcess:
             self._pose_estimator.get_frame_results().values(),
             key=lambda f: f.frame_no,
         )
-        height = float(frames[0][1].shape[0])
+        frame_height, frame_width = frames[0][1].shape[:2]
+        height = float(frame_height)
 
         rs = RollingShutterSync(
             quaternions,
             frame_readout_time_ms=frame_readout_time_ms,
             fps=self._fps,
+            scaled_fps=self._scaled_fps,
+            compute_params=self._compute_params,
         )
 
         added = 0
@@ -236,6 +241,8 @@ class AutosyncProcess:
                 a.curr_points,
                 height,
                 camera_matrix=self._pose_estimator_camera_matrix(),
+                compute_params=self._compute_params,
+                points_dims=(frame_width, frame_height),
             )
             added += 1
 

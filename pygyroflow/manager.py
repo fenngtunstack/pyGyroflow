@@ -1786,8 +1786,10 @@ class StabilizationManager:
 
         # Build the optical-flow tracks once; they are orientation-invariant.
         ordered = sorted(estimator.get_frame_results().values(), key=lambda f: f.frame_no)
+        sync_params = self._build_sync_compute_params()
         template = RollingShutterSync(
-            {}, frame_readout_time_ms=self.params.frame_readout_time, fps=self.params.fps
+            {}, frame_readout_time_ms=self.params.frame_readout_time, fps=self.params.fps,
+            scaled_fps=self.params.get_scaled_fps(), compute_params=sync_params,
         )
         K = camera_matrix if not np.allclose(camera_matrix, np.eye(3)) else None
         added = 0
@@ -1797,6 +1799,7 @@ class StabilizationManager:
             template.add_track_from_frames(
                 a.timestamp_us, b.timestamp_us,
                 a.prev_points, a.curr_points, float(height), camera_matrix=K,
+                compute_params=sync_params, points_dims=(width, height),
             )
             added += 1
         if added < 3:
@@ -1819,6 +1822,8 @@ class StabilizationManager:
                 self.gyro.quaternions,
                 frame_readout_time_ms=self.params.frame_readout_time,
                 fps=self.params.fps,
+                scaled_fps=self.params.get_scaled_fps(),
+                compute_params=sync_params,
             )
             rs.tracks = template.tracks
             try:

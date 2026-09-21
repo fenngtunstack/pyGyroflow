@@ -158,15 +158,32 @@ class RollingShutterSync:
         quaternions: TimeQuat,
         frame_readout_time_ms: float = 0.0,
         fps: float = 30.0,
+        scaled_fps: float | None = None,
+        compute_params=None,
     ):
+        """``compute_params`` (optional) turns on lens-corrected tracks: the
+        points are run through ``undistort_points_for_optical_flow`` —
+        upstream's rotation-only cost model works on undistorted unit rays,
+        so distorted pixels bias every candidate delay the same wrong way.
+        ``None`` keeps the pinhole normalization (and is what a caller
+        without a lens profile gets).
+
+        The readout-time defaulting mirrors ``FindOffsetsRssync::new``:
+        zero falls back to half the frame interval at ``scaled_fps``, and a
+        global-shutter lens overrides *even an explicit value* to 0.01 ms.
+        """
         self.quaternions = quaternions
         self.tracks: list[SyncTrack] = []
         self._flat_ta: np.ndarray | None = None  # vectorized cache
 
-        if frame_readout_time_ms > 0:
-            self.readout_time_s = frame_readout_time_ms / 1000.0
-        else:
-            self.readout_time_s = (1000.0 / fps / 2.0) / 1000.0
+        rt_ms = frame_readout_time_ms
+        if rt_ms == 0.0:
+            rt_ms = 1000.0 / (scaled_fps if scaled_fps else fps) / 2.0
+        if compute_params is not None and getattr(
+            getattr(compute_params, "lens", None), "global_shutter", False
+        ):
+            rt_ms = 0.01
+        self.readout_time_s = rt_ms / 1000.0
 
     def add_track_from_frames(
         self,
@@ -177,6 +194,8 @@ class RollingShutterSync:
         frame_height: float,
         camera_matrix: np.ndarray | None = None,
         distortion_coeffs: np.ndarray | None = None,
+        compute_params=None,
+        points_dims: tuple[int, int] | None = None,
     ):
         """Add an optical flow track between two frames.
 
@@ -189,26 +208,66 @@ class RollingShutterSync:
         frame_height:
             Frame height in pixels, used for rolling-shutter time calculation.
         camera_matrix:
-            Optional 3x3 camera intrinsics.  If None, assume identity
-            (already normalized coordinates).
+            Optional 3x3 camera intrinsics for the pinhole fallback; ignored
+            when ``compute_params`` is given.  If both are None, points are
+            assumed already normalized.
         distortion_coeffs:
-            Optional distortion coefficients (not yet used in this path).
+            Unused, kept for signature compatibility.
+        compute_params:
+            ``ComputeParams``: points are undistorted with the lens at each
+            frame's own timestamp before becoming unit rays, mirroring
+            ``rs_sync.rs:120-121``. (Upstream undistorts the A set at the
+            *sync range's* first timestamp, not the pair's own — the port
+            feeds per-pair tracks, where range == pair and the two coincide;
+            the difference only shows on a zoom lens with multi-pair
+            ranges, which this caller structure does not have.)
+        points_dims:
+            The (width, height) the flow points are expressed in, for the
+            calibration scaling. ``None`` assumes the calibration's own
+            size (ratio 1) — pass the real value for downscaled flow.
         """
         if len(pts_a_px) != len(pts_b_px) or len(pts_a_px) < 2:
             return
+
+        und_a = und_b = None
+        if compute_params is not None:
+            from pygyroflow.stabilization.cpu_undistort import (
+                undistort_points_for_optical_flow,
+            )
+
+            dims = points_dims if points_dims is not None else (
+                compute_params.width, compute_params.height
+            )
+            und_a = undistort_points_for_optical_flow(
+                pts_a_px, frame_a_ts_us, compute_params, dims
+            )
+            und_b = undistort_points_for_optical_flow(
+                pts_b_px, frame_b_ts_us, compute_params, dims
+            )
 
         ts_a: list[float] = []
         ts_b: list[float] = []
         pts_a_3d: list[tuple[float, float, float]] = []
         pts_b_3d: list[tuple[float, float, float]] = []
 
-        for (ax, ay), (bx, by) in zip(pts_a_px, pts_b_px):
-            # Per-point timestamp: frame_time + readout_time * (y / height)
+        for i, ((ax, ay), (bx, by)) in enumerate(zip(pts_a_px, pts_b_px)):
+            # Per-point timestamp: frame_time + readout_time * (y / height).
+            # The *original* flow point's row — upstream rs_sync.rs:132-133
+            # reads a_p[i].1 / b_p[i].1, not the undistorted coordinate.
             ta = frame_a_ts_us / 1e6 + self.readout_time_s * (ay / frame_height)
             tb = frame_b_ts_us / 1e6 + self.readout_time_s * (by / frame_height)
 
-            # Undistort pixel to normalized 3D direction
-            if camera_matrix is not None:
+            if und_a is not None:
+                nx_a, ny_a = und_a[i]
+                nx_b, ny_b = und_b[i]
+                # A failed undistortion comes back NaN and would poison the
+                # whole cost to NaN (upstream fails the sync the same way,
+                # just less visibly); the pair is dropped instead, matching
+                # the point-filters in the pose estimators.
+                if not (math.isfinite(nx_a) and math.isfinite(ny_a)
+                        and math.isfinite(nx_b) and math.isfinite(ny_b)):
+                    continue
+            elif camera_matrix is not None:
                 fx, fy = camera_matrix[0, 0], camera_matrix[1, 1]
                 cx, cy = camera_matrix[0, 2], camera_matrix[1, 2]
                 nx_a = (ax - cx) / fx
