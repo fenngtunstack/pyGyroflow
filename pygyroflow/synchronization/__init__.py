@@ -40,6 +40,7 @@ from pygyroflow.synchronization.estimate_pose import (
 from pygyroflow.synchronization.find_offset import (
     find_time_offset,
     find_offset_visual_features,
+    find_offset_visual_features_correlation_fallback,
     find_offset_rs_sync,
 )
 from pygyroflow.synchronization.pose_estimator import (
@@ -67,6 +68,7 @@ __all__ = [
     # Offset search
     "find_time_offset",
     "find_offset_visual_features",
+    "find_offset_visual_features_correlation_fallback",
     "find_offset_rs_sync",
     # Core classes
     "FrameResult",

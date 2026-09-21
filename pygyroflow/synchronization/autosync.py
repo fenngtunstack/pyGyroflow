@@ -175,6 +175,25 @@ class AutosyncProcess:
                 "falling back to cross-correlation"
             )
 
+        if self._offset_method == 1:
+            offset = self._visual_features_offset(
+                search_range_ms=search_range_ms,
+                initial_offset_ms=initial_offset_ms,
+                progress_callback=(
+                    (lambda p: progress_callback(0.6 + 0.4 * p))
+                    if progress_callback
+                    else None
+                ),
+            )
+            if offset is not None:
+                if progress_callback:
+                    progress_callback(1.0)
+                return offset
+            logger.warning(
+                "Offset method 1 (visual features) produced no result; "
+                "falling back to signal cross-correlation"
+            )
+
         from pygyroflow.synchronization.find_offset import find_time_offset
 
         offset = find_time_offset(
@@ -194,6 +213,58 @@ class AutosyncProcess:
             progress_callback(1.0)
 
         return offset
+
+    def _visual_features_offset(
+        self,
+        search_range_ms: float,
+        initial_offset_ms: float,
+        progress_callback: Callable[[float], None] | None = None,
+    ) -> float | None:
+        """Upstream's offset method 1: point-pair distance minimization.
+
+        Needs both the matched point pairs retained by the pose estimator
+        and a ``ComputeParams`` with the lens and the integrated gyro
+        streams. Returns ``None`` (so the caller falls back) when either is
+        missing — callers without a lens profile kept working that way.
+        """
+        if self._compute_params is None:
+            return None
+
+        ordered = sorted(
+            self._pose_estimator.get_frame_results().values(),
+            key=lambda f: f.frame_no,
+        )
+        pairs = []
+        for a, b in zip(ordered, ordered[1:]):
+            if a.prev_points is None or a.curr_points is None:
+                continue
+            if len(a.prev_points) < 2 or len(a.prev_points) != len(a.curr_points):
+                continue
+            pairs.append((
+                (a.timestamp_us, a.prev_points),
+                (b.timestamp_us, a.curr_points),
+            ))
+        if len(pairs) < 3:
+            logger.warning(
+                "Visual-feature offset search: only %d usable pairs", len(pairs)
+            )
+            return None
+
+        from pygyroflow.synchronization.find_offset.visual_features import (
+            find_offset_visual_features,
+        )
+
+        result = find_offset_visual_features(
+            pairs,
+            self._compute_params,
+            search_size_ms=search_range_ms,
+            initial_offset_ms=initial_offset_ms,
+            progress_callback=progress_callback,
+        )
+        if result is None:
+            return None
+        offset_ms, _cost = result
+        return offset_ms
 
     def _rs_sync_offset(
         self,
