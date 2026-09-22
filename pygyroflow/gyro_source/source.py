@@ -470,11 +470,13 @@ class GyroSource:
         _f64(t.imu_lpf)
         hasher.update(_struct.pack('i', int(t.imu_mf)))
 
+        io_stream = self.file_metadata.image_orientations
         for count in (
             len(self.raw_imu),
             len(self.file_metadata.raw_imu),
             len(self.quaternions),
             len(self.file_metadata.quaternions),
+            len(io_stream) if io_stream else 0,
             len(self.file_metadata.lens_positions),
             len(self.file_metadata.lens_params),
         ):
@@ -514,12 +516,24 @@ class GyroSource:
         return 0.0
 
     def find_bias(self, timestamp_start: float, timestamp_stop: float) -> tuple[float, float, float]:
-        """Find average gyro bias in a time window."""
+        """Find average gyro bias in a time window.
+
+        The window arrives on the *video* timeline; the raw IMU lives on
+        the gyro one, so both ends shift by the sync offset at that
+        instant (``mod.rs:933-935``) — without the shift a synced clip
+        averages the wrong stretch of samples.
+        """
+        ts_start = timestamp_start - self.offset_at_video_timestamp(
+            timestamp_start
+        )
+        ts_stop = timestamp_stop - self.offset_at_video_timestamp(
+            timestamp_stop
+        )
         bias_vals = [0.0, 0.0, 0.0]
         n = 0
 
         for sample in self.file_metadata.raw_imu:
-            if sample.gyro is not None and timestamp_start < sample.timestamp_ms < timestamp_stop:
+            if sample.gyro is not None and ts_start < sample.timestamp_ms < ts_stop:
                 bias_vals[0] -= sample.gyro[0]
                 bias_vals[1] -= sample.gyro[1]
                 bias_vals[2] -= sample.gyro[2]
