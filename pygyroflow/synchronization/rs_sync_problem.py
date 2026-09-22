@@ -166,6 +166,33 @@ class Spline:
         return ((self.m_d[idx] * h + self.m_c[idx]) * h + self.m_b[idx]) * h \
             + self.m_y[idx]
 
+    def eval_many(self, x: np.ndarray) -> np.ndarray:
+        """Vectorized :meth:`eval` over an array of query points."""
+        n = len(self.m_b)
+        out = np.zeros(len(x))
+        if n == 0:
+            return out
+        idx = np.clip(np.floor(x).astype(np.int64), 0, n)
+        h = x - idx
+        # Below the first knot / above the last: the boundary segments'
+        # polynomials (the scalar eval branches).
+        below = x < 0
+        above = x > n - 1.0
+        mid = ~(below | above)
+        if below.any():
+            i = np.nonzero(below)[0]
+            out[i] = (self.m_c[0] * h[i] + self.m_b[0]) * h[i] + self.m_y[0]
+        if above.any():
+            i = np.nonzero(above)[0]
+            out[i] = (self.m_c[n - 1] * h[i] + self.m_b[n - 1]) * h[i] \
+                + self.m_y[n - 1]
+        if mid.any():
+            i = np.nonzero(mid)[0]
+            ii = idx[i]
+            out[i] = ((self.m_d[ii] * h[i] + self.m_c[ii]) * h[i]
+                      + self.m_b[ii]) * h[i] + self.m_y[ii]
+        return out
+
     def deriv(self, x: float) -> float | None:
         n = len(self.m_b)
         if n == 0:
@@ -200,6 +227,15 @@ class NdSpline:
             if val is not None:
                 ret[i] = val
         return ret
+
+    def eval_many(self, t: np.ndarray) -> np.ndarray:
+        """(len(t), 4) evaluation — the vectorized hot path for
+        ``opt_compute_problem``."""
+        t = np.asarray(t, dtype=np.float64)
+        out = np.zeros((len(t), 4))
+        for i, sp in enumerate(self.splines):
+            out[:, i] = sp.eval_many(t)
+        return out
 
     def deriv(self, t: float) -> np.ndarray:
         ret = np.zeros(4)
@@ -283,25 +319,51 @@ class OptData:
         self.frame_data: dict[int, FrameData] = {}
 
 
+def _quat_prod_batch(p: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Row-wise Hamilton product of (N, 4) quaternion arrays — the same
+    component formulas as the scalar :func:`quat_prod`, stacked."""
+    w1, x1, y1, z1 = p[:, 0], p[:, 1], p[:, 2], p[:, 3]
+    w2, x2, y2, z2 = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return np.stack([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], axis=1)
+
+
+def _quat_rotate_conj_batch(q: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """``quat_rotate_point(quat_conj(q), p)`` for stacked rows: the exact
+    composition ``conj(q) ⊗ (0,p) ⊗ q`` built from :func:`_quat_prod_batch`
+    — no hand-expanded formulas to drift from the scalar reference."""
+    zero_p = np.concatenate([np.zeros((len(pts), 1)), pts], axis=1)
+    conj = q * np.array([1.0, -1.0, -1.0, -1.0])
+    return _quat_prod_batch(_quat_prod_batch(conj, zero_p), q)[:, 1:]
+
+
 def opt_compute_problem(timestamp_us: int, gyro_delay: float,
                         data: OptData) -> np.ndarray:
     """(N, 3) cross products of the gyro-rotated ray pairs
     (``lib.rs:406-428``): the residual of a pure-rotation model is zero for
     a correct delay, so what remains is explained by camera translation —
-    the quantity the motion estimate captures."""
+    the quantity the motion estimate captures.
+
+    Vectorized over the points (the quaternion component splines evaluate
+    as arrays); upstream parallelizes the same work with rayon."""
     flow = data.frame_data.get(timestamp_us)
     if flow is None:
         return np.zeros((0, 3))
     at = (flow.ts_a - data.quats_start + gyro_delay) * data.sample_rate
     bt = (flow.ts_b - data.quats_start + gyro_delay) * data.sample_rate
-    problem = np.zeros((len(at), 3))
-    for i in range(len(at)):
-        a = safe_normalize(data.quats.eval(at[i]))
-        b = safe_normalize(data.quats.eval(bt[i]))
-        ar = quat_rotate_point(quat_conj(a), flow.rays_a[i])
-        br = quat_rotate_point(quat_conj(b), flow.rays_b[i])
-        problem[i] = np.cross(ar, br)
-    return problem
+
+    qa = data.quats.eval_many(at)
+    qb = data.quats.eval_many(bt)
+    qa /= np.linalg.norm(qa, axis=1, keepdims=True)
+    qb /= np.linalg.norm(qb, axis=1, keepdims=True)
+
+    ar = _quat_rotate_conj_batch(qa, flow.rays_a)
+    br = _quat_rotate_conj_batch(qb, flow.rays_b)
+    return np.cross(ar, br)
 
 
 def opt_guess_translational_motion(problem: np.ndarray,
