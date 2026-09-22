@@ -260,7 +260,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | B-10 | R | **AKAZE 三个常数不同**。我们 threshold `0.001`、Lowe ratio `0.7`、无上限（`akaze.py:34,78`）；上游 `0.0007`、`0.5`、`maximum_features=200`（`akaze.rs:26,13`）。ratio 0.7 放进大量歧义匹配 —— 已修：threshold 0.0007 / maximum 200 / ratio 0.5（akaze.py:30-32，docstring 记录） | [实测] |
 | B-11 | D | **DIS 用错 preset**。我们 `PRESET_MEDIUM`（`opencv_dis.py:41`）；上游 `PRESET_FAST`（`opencv_dis.rs:59`） —— 已修：DISOPTICAL_FLOW_PRESET_FAST（opencv_dis.py:43） | [实测] |
 | B-12 | R | **`per_frame_time_offsets` 全链路无消费者**。`file_metadata.py:59` 声明、`:90` 置空、全仓库无读取点。上游 `frame_transform.rs:216` 在查四元数前加此偏移 | [实测] |
-| B-13 | R | `filter_of_lines`（30° 平均角过滤）+ `get_of_lines_for_timestamp`（按帧距取缓存 OF）缺失 | [报告] |
+| B-13 | R | `filter_of_lines`（30° 平均角过滤）+ `get_of_lines_for_timestamp`（按帧距取缓存 OF）缺失 —— 已补（`b96c4bd`）：30° 严格门 + 朴素圆均值（正交多数全灭的上游怪癖钉住）、2 ms 就近 + next_no 跳帧；num_frames>1 显式 NotImplementedError（多帧距缓存是 B-14 剩余） | [报告] |
 | B-14 | R | `cache_optical_flow` / 多帧距 OF / `cleanup` / `processed_frames` / `get_ranges`（>100ms 断档切分）缺失。`FrameResult` 只有 d=1 的点对 —— `get_ranges` 已补（`2f916c4`，>100 ms 断档切分 + 上游孤立帧空列表怪癖钉住）；多帧距 OF 缓存族仍缺 | [报告] |
 | B-15 | R | **rank<13 质量门缺失**。上游 `render_queue.rs:1485-1504` 按 `sync_data.rank` 跳过低运动段的偏移；我们完全不用 rank，改用 `_valid_sync_points`（>40ms 偏差剔除）与 `_drift_significant`（≥3 点、斜率>15ms、残差<10ms） | [报告] |
 | B-16 | R | **`SyncParams` 结构缺失**：`custom_sync_pattern`/`auto_sync_points`/`every_nth_frame`/`calc_initial_fast`/`initial_offset_inv` 全无。且 `manager.py:673-674` 在 OptimSync 给 <2 点时直接放弃，上游 `render_queue.rs:1448-1462` 会退化成均匀分布 —— calc_initial_fast/initial_offset_inv 已补（`ed114ad`）；OptimSync 空点回退均匀分布与兼容设置 sync_settings 叠加已补（`126f7db`）；`custom_sync_pattern` 图案本体与 `auto_sync_points` 开关仍缺 | [报告] |
@@ -407,6 +407,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | **D-06 参照**：`undistort_points` 对上游 Rust 逐值比对 | `6b7b84e` | `cpu_undistort.rs:649-803` 逐字节切出、`distortion_models/` 与 `gyro_source/splines.rs` 整流原样复制，编译后跑 26 用例 304 个坐标值，全部落在 3.7e-7 相对误差内（f32 vs f64 的本底）。**这一步查出上面三条缺陷**，其中两条结构性测试按构造就测不到。参照工程不入库，`generate_undistort_points_reference.py --stage` 现场从只读的 `opensource/gyroflow/` 抽取，所以不存在第二份会漂的副本 |
 | CPU 采样器消费 input_rotation（D-13） | `5e1b3be` | 7 项测试。90/180 度坐标映射按手算值比对（绕中心旋转，非角对称——首版测试在此翻过车）、零旋转恒等、fringe clamp 用旋转宽度、背景 clamp 天花板用未旋转宽度（1079 不被压到 1077，怪癖专测）、at_timestamp 打包两向、梯度帧端到端逐像素值 |
 | rs-sync 优化器 crate 移植 + 桥接（B-04） | `8ff80fa` + `00b6478` | 25 项模块测试 + 桥接后 e2e。梯度链（运动/延迟）对有限差分 <1e-5；端到端正弦场景恢复 −50 ms、代价 ~1e-6、残差景观真值处单点凹陷（**恒定角速度对该残差退化**——θ(t₁)+θ(t₂) 平移不变，须非线性 pan，记入测试 docstring）；向量化与标量路径 max diff 0.0（手展开公式在 y 分量翻过车，旋转轴对齐时差异项恰好消失——教训在提交信息）；e2e 实测 +191.6/200 ms |
+| filter_of_lines + get_of_lines_for_timestamp（B-13） | `b96c4bd` | 13 项测试：方向过滤（含正交多数全灭的朴素均值怪癖——上游语义）、缩放贯通、2 ms 容差两向、next_no 跳帧、filter 开关、多帧距显式未实现（不静默给错基线） |
 | PoseEstimator.get_ranges（B-14 部分） | `2f916c4` | 6 项测试：连续一区间、断档二分、恰好 100 ms 不切（严格 >）、孤立帧产生空列表（上游 != 守卫怪癖，注释钉为上游语义）、空/单帧、乱序插入先排序 |
 | CLI --export-stmap 与 --stdout-progress（C-11 两块） | `6a81788` | 5 项测试：模式 1/2 产物集合且不渲染、拒绝覆盖、进度 JSON 逐行（fraction 序列 + done 收尾）、无旗标回调为 None。progress_callback 贯通 render→process_frames，帧数估计 = 容器时长×fps（VFR 下钳 1.0，注释写明） |
 | 逐点搜索窗的 profile 覆盖（B-17） | `8614034` | 2 项测试：1.5 s → 1500 ms 到达 proc.run；无覆盖回落 120 ms 默认（与上游 5000 的差及原因写进代码注释与表行） |
