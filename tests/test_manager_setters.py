@@ -127,3 +127,35 @@ class TestInvalidation:
         mgr.set_max_zoom(150.0)
         mgr.set_light_refraction_coefficient(0.9)
         assert mgr._zooming_checksum == 0
+
+
+class TestImuTransformSetters:
+    """lib.rs:1078-1099: write IMUTransforms on the gyro source; the
+    caller triggers the recompute explicitly (our ``recompute_gyro``)."""
+
+    def test_lpf_and_median(self, mgr):
+        mgr.set_imu_lpf(25.0)
+        mgr.set_imu_median_filter(5)
+        assert mgr.gyro.imu_transforms.imu_lpf == 25.0
+        assert mgr.gyro.imu_transforms.imu_mf == 5
+
+    def test_rotations(self, mgr):
+        mgr.set_imu_rotation(1.0, 2.0, 3.0)
+        mgr.set_acc_rotation(4.0, 5.0, 6.0)
+        assert mgr.gyro.imu_transforms.imu_rotation_angles == (1.0, 2.0, 3.0)
+        assert mgr.gyro.imu_transforms.acc_rotation_angles == (4.0, 5.0, 6.0)
+
+    def test_orientation_and_bias(self, mgr):
+        mgr.set_imu_orientation("YxZ")
+        mgr.set_imu_bias(0.1, 0.2, 0.3)
+        assert mgr.gyro.imu_transforms.imu_orientation == "YxZ"
+        assert mgr.gyro.imu_transforms.gyro_bias == [0.1, 0.2, 0.3]
+
+    def test_recompute_gyro_applies_and_invalidates(self, mgr, monkeypatch):
+        applied = []
+        monkeypatch.setattr(mgr.gyro, "apply_transforms",
+                            lambda: applied.append(1))
+        before = mgr._compute_id
+        mgr.recompute_gyro()
+        assert applied == [1]
+        assert mgr._compute_id > before

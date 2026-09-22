@@ -2324,6 +2324,35 @@ class StabilizationManager:
         sync starts)."""
         self._of_method = int(v)
 
+    # IMU transform setters (lib.rs:1078-1095): they write the gyro
+    # source's IMUTransforms and leave recomputation to the caller's next
+    # recompute (upstream pairs them with an explicit recompute_gyro).
+    def set_imu_lpf(self, lpf: float) -> None:
+        self.gyro.imu_transforms.imu_lpf = float(lpf)
+
+    def set_imu_median_filter(self, size: int) -> None:
+        self.gyro.imu_transforms.imu_mf = int(size)
+
+    def set_imu_rotation(self, pitch_deg: float, roll_deg: float,
+                         yaw_deg: float) -> None:
+        self.gyro.imu_transforms.set_imu_rotation(pitch_deg, roll_deg, yaw_deg)
+
+    def set_acc_rotation(self, pitch_deg: float, roll_deg: float,
+                         yaw_deg: float) -> None:
+        self.gyro.imu_transforms.set_acc_rotation(pitch_deg, roll_deg, yaw_deg)
+
+    def set_imu_orientation(self, orientation: str) -> None:
+        self.gyro.imu_transforms.imu_orientation = orientation
+
+    def set_imu_bias(self, bx: float, by: float, bz: float) -> None:
+        self.gyro.imu_transforms.gyro_bias = [float(bx), float(by), float(bz)]
+
+    def recompute_gyro(self) -> None:
+        """Apply the IMU transforms and invalidate smoothing
+        (``lib.rs:1096-1099``) — the partner call of the setters above."""
+        self.gyro.apply_transforms()
+        self._invalidate_smoothing()
+
     def set_show_detected_features(self, v: bool) -> None:
         self.params.show_detected_features = bool(v)
 
