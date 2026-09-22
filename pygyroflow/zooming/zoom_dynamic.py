@@ -46,6 +46,17 @@ class ZoomMethod(IntEnum):
     GaussianFilter = 0
     EnvelopeFollower = 1
 
+    @classmethod
+    def from_index(cls, value: int) -> "ZoomMethod":
+        """``zooming/mod.rs:20-27``: an unknown method index logs an error
+        and falls back to GaussianFilter instead of failing the render —
+        a project written by a newer Gyroflow must still load."""
+        try:
+            return cls(value)
+        except ValueError:
+            logger.error("Invalid zooming method: %s", value)
+            return cls.GaussianFilter
+
 
 def compute(
     compute_params: ComputeParams,

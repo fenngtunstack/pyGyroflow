@@ -9,8 +9,6 @@ window instead.
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from pygyroflow.keyframes.manager import KeyframeManager
@@ -181,3 +179,18 @@ class TestEnvelopeFollowerKeyframedBranch:
         # onto the notch.
         assert min(smoothed[30:]) >= 0.5
         assert smoothed[-1] == pytest.approx(0.5)
+
+
+class TestFromIndex:
+    def test_unknown_index_falls_back_with_error(self, caplog):
+        """``zooming/mod.rs:20-27``: an unknown method index logs an error
+        and falls back to GaussianFilter — a project from a newer Gyroflow
+        must still render."""
+        with caplog.at_level("ERROR"):
+            assert ZoomMethod.from_index(99) == ZoomMethod.GaussianFilter
+        assert any("Invalid zooming method: 99" in r.message
+                   for r in caplog.records)
+
+    def test_valid_indices_pass_through(self):
+        assert ZoomMethod.from_index(0) == ZoomMethod.GaussianFilter
+        assert ZoomMethod.from_index(1) == ZoomMethod.EnvelopeFollower

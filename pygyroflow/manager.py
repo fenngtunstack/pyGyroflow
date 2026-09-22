@@ -1195,7 +1195,7 @@ class StabilizationManager:
 
         timestamps = [(i, i * 1000.0 / fps) for i in range(frames)]
 
-        method = ZoomMethod(self.params.adaptive_zoom_method)
+        method = ZoomMethod.from_index(self.params.adaptive_zoom_method)
         fovs, minimal_fovs = calculate_fovs(cp, timestamps, method)
 
         lens_fov_adj = self.lens.optimal_fov or 1.0
