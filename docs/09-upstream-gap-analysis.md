@@ -261,7 +261,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | B-11 | D | **DIS 用错 preset**。我们 `PRESET_MEDIUM`（`opencv_dis.py:41`）；上游 `PRESET_FAST`（`opencv_dis.rs:59`） —— 已修：DISOPTICAL_FLOW_PRESET_FAST（opencv_dis.py:43） | [实测] |
 | B-12 | R | **`per_frame_time_offsets` 全链路无消费者**。`file_metadata.py:59` 声明、`:90` 置空、全仓库无读取点。上游 `frame_transform.rs:216` 在查四元数前加此偏移 | [实测] |
 | B-13 | R | `filter_of_lines`（30° 平均角过滤）+ `get_of_lines_for_timestamp`（按帧距取缓存 OF）缺失 —— 已补（`b96c4bd`）：30° 严格门 + 朴素圆均值（正交多数全灭的上游怪癖钉住）、2 ms 就近 + next_no 跳帧；num_frames>1 显式 NotImplementedError（多帧距缓存是 B-14 剩余） | [报告] |
-| B-14 | R | `cache_optical_flow` / 多帧距 OF / `cleanup` / `processed_frames` / `get_ranges`（>100ms 断档切分）缺失。`FrameResult` 只有 d=1 的点对 —— `get_ranges` 已补（`2f916c4`，>100 ms 断档切分 + 上游孤立帧空列表怪癖钉住）；多帧距 OF 缓存族仍缺 | [报告] |
+| B-14 | R | `cache_optical_flow` / 多帧距 OF / `cleanup` / `processed_frames` / `get_ranges`（>100ms 断档切分）缺失。`FrameResult` 只有 d=1 的点对 —— `get_ranges` 已补（`2f916c4`）；多帧距 OF 缓存 + cleanup 也已补（`bf6e5dd`：d=1 取存量、d>1 重跑检测器、frame_no 断链、cleanup 释放灰帧、get_of_lines 缓存优先）—— **B-14 关闭** | [报告] |
 | B-15 | R | **rank<13 质量门缺失**。上游 `render_queue.rs:1485-1504` 按 `sync_data.rank` 跳过低运动段的偏移；我们完全不用 rank，改用 `_valid_sync_points`（>40ms 偏差剔除）与 `_drift_significant`（≥3 点、斜率>15ms、残差<10ms） | [报告] |
 | B-16 | R | **`SyncParams` 结构缺失**：`custom_sync_pattern`/`auto_sync_points`/`every_nth_frame`/`calc_initial_fast`/`initial_offset_inv` 全无。且 `manager.py:673-674` 在 OptimSync 给 <2 点时直接放弃，上游 `render_queue.rs:1448-1462` 会退化成均匀分布 —— calc_initial_fast/initial_offset_inv 已补（`ed114ad`）；OptimSync 空点回退均匀分布与兼容设置 sync_settings 叠加已补（`126f7db`）；`custom_sync_pattern` 图案本体与 `auto_sync_points` 开关仍缺 | [报告] |
 | B-17 | D | **逐点搜索窗口 120ms vs 上游 5000ms**（`manager.py:_SYNC_POINT_SEARCH_MS`） —— profile 的 search_size 覆盖已接（`8614034`，秒→ms 按 render_queue.rs:1470）；默认保持 120 ms 并记录原因（串行 Python 代价 ~40x，逐点各跑一次搜索） | [报告] |
@@ -410,6 +410,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | GCSV 格式 + sidecar 回退（A-02 文本半 / A-03） | `c69ec94` | 12 项测试：魔术行、缩放除数语义（gscale 另乘 π/180）、读出方向六码含 ±10000 哨兵、磁力计 Gauss→μT、lensprofile 头、tscale 时机、空 mp4 回退、扩展名优先级、直接入口、非 gcsv 文本仍拒。测试首版把扩展头写在 t 行之后被判数据行——顺序语义反向钉住 |
 | get_checksum 补全 + find_bias 偏移平移（A-11/A-12） | `ff986ee` | 6 项测试：image_orientations 计数入哈希、四类参数各自移动校验和、+50ms 偏移下窗口只含首样本（set_offset 而非裸写——offsets_adjusted 才是查询源，教训入测试注释）、严格边界 |
 | adjust_offsets RANSAC 式共识（A-13） | `15af508` | 8 项测试：离群点不拖漂移且被外推（上游关键性质）、|slope|≥0.1 的真漂移回落朴素拟合、单点直通、adjusted 键平移 |
+| 多帧距 OF 缓存 + cleanup（B-14 收尾） | `bf6e5dd` | 7 项测试：d=1 存量直取、d>1 检测器、掉帧断链（frame_no 守卫）、已缓存跳过、任意缓存距离可取、未缓存返回 None 非错基线、cleanup 灰帧释放点对存活 |
 | render_queue 的 ST-map job 接通（G-06 可达性） | `9dc14ab` | 3 项测试：默认 undistort 单图、both 双图、EXR 真图（尺寸=剪辑、可开）。C-12 其余（并行/取消/持久化/when_done）仍缺 |
 | A-08 改判：converter 公式恒等 | `e33501b` | 群逆律等价性 9 项测试（8 随机位形 6.6e-15° + X²≠I 非平凡性守卫）。**改公式后数值证伪回滚的过程保留在提交历史**——这是本表第二处初稿结论被推翻（第一处 B-23） |
 | 档案 crc32 校验和（C-17 一块） | `36f9a1e` | 6 项测试：格式串逐字节对照（Rust :.8 与 Python :.8f 一致）、缺系数补零、无矩阵保持 None、预设路径 crc32、收藏优先搜索命中。顺带修复 heredoc 事故：database.py 类尾方法被吞进模块级函数体，AST 定位后重组（全量测试过） |
