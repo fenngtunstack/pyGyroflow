@@ -418,6 +418,27 @@ class PoseEstimator:
         """Return the full ``{timestamp_us: FrameResult}`` map."""
         return dict(self._frames)
 
+    def get_ranges(self) -> list[tuple[int, int]]:
+        """Contiguous frame ranges, split at >100 ms gaps
+        (``synchronization/mod.rs:363-378``).
+
+        A dropped-frames hole in the middle of a clip is not one long
+        track: motion across the hole is unobserved, and the per-range
+        offset searches upstream runs must not bridge it.
+        """
+        ranges: list[tuple[int, int]] = []
+        prev_ts = 0
+        curr_range_start = 0
+        for f in sorted(self._frames):
+            if f - prev_ts > 100_000:  # 100 ms
+                if curr_range_start != prev_ts:
+                    ranges.append((curr_range_start, prev_ts))
+                curr_range_start = f
+            prev_ts = f
+        if curr_range_start != prev_ts:
+            ranges.append((curr_range_start, prev_ts))
+        return ranges
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
