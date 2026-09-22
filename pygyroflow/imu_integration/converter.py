@@ -98,8 +98,12 @@ class QuaternionConverter:
             # Find image orientation at this timestamp
             io_quat = _find_nearest(image_ts_sorted, image_orientations, org_ts)
 
-            # Correction: corr = n_quat * inverse(org_quat * inverse(io_quat))
-            # Simplification: corr = n_quat * io_quat * inverse(org_quat)
+            # Correction (imu_integration/mod.rs:46):
+            # corr = n_quat * inverse(org_quat * inverse(io_quat))
+            # which by the group-inverse law IS n_quat * io_quat * org⁻¹
+            # (verified numerically, see tests/test_converter_formula.py —
+            # the gap-table claim that they differ compared conventions,
+            # not algebra).
             corr = n_quat * io_quat * org_quat.inverse()
 
             # SLERP smooth the correction
