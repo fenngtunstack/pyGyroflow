@@ -129,7 +129,96 @@ class TestGetOfLinesForTimestamp:
         est._frames[0] = FrameResult(timestamp_us=0, frame_no=0)
         assert est.get_of_lines_for_timestamp(0) == (None, None)
 
-    def test_multi_frame_distance_is_explicitly_unimplemented(self):
+    def test_multi_frame_distance_needs_the_cache(self):
+        """Uncached d>1 gives (None, None) — not the d=1 pair by mistake
+        (that would silently measure the wrong baseline)."""
         est = _est_with_pairs(self._frames(), self._pts)
-        with pytest.raises(NotImplementedError, match="B-14"):
-            est.get_of_lines_for_timestamp(0, num_frames=2)
+        assert est.get_of_lines_for_timestamp(0, num_frames=2) == (None, None)
+
+
+class TestMultiDistanceCache:
+    """cache_optical_flow + the num_frames path (B-14's remaining half)."""
+
+    def _est_with_grays(self, n=5):
+        est = PoseEstimator()
+        for k in range(n):
+            fr = FrameResult(
+                timestamp_us=k * 33_333, frame_no=k,
+                prev_points=np.array([[k, k], [10.0, 20.0]], np.float32),
+                curr_points=np.array([[k + 1, k], [11.0, 20.0]], np.float32),
+            )
+            fr._gray_frame = np.zeros((8, 8), np.uint8)
+            fr.frame_size = (64, 48)
+            est._frames[k * 33_333] = fr
+        return est
+
+    def test_d1_comes_from_the_stored_pair(self):
+        est = self._est_with_grays()
+        est.cache_optical_flow(num_frames=1)
+        fr = est._frames[0]
+        assert 1 in (fr.optical_flow or {})
+        ts1, p1 = fr.optical_flow[1][0]
+        ts2, p2 = fr.optical_flow[1][1]
+        assert ts1 == 0 and ts2 == 33_333
+        assert p1[0][0] == 0  # the stored prev points
+
+    def test_larger_distances_use_the_detector(self):
+        est = self._est_with_grays()
+
+        class Det:
+            def detect_and_track(self, a, b):
+                return (np.array([[1.0, 1.0], [3.0, 4.0]]),
+                        np.array([[2.0, 2.0], [5.0, 6.0]]))
+
+        est.cache_optical_flow(num_frames=3, detector=Det)
+        fr = est._frames[0]
+        assert set(fr.optical_flow) == {1, 2, 3}
+        assert fr.optical_flow[3][0][1][0][0] == 1.0  # detector output
+        assert fr.optical_flow[3][1][0] == 3 * 33_333
+
+    def test_frame_no_gaps_break_the_chain(self):
+        """Distance pairs by frame_no + d; a dropped frame means no entry
+        for the distances that would bridge the hole."""
+        est = self._est_with_grays(5)
+        del est._frames[2 * 33_333]  # frame_no 2 gone
+        for ts, fr in est._frames.items():
+            if fr.frame_no == 3:
+                fr.frame_no = 5  # now a gap of 2
+        est.cache_optical_flow(num_frames=3, detector=lambda: None)
+        fr1 = est._frames[0]
+        assert 1 in fr1.optical_flow  # 0 -> 1 fine
+        assert 2 not in fr1.optical_flow  # 0 -> 2 gone (frame 2 deleted)
+
+    def test_already_cached_frames_are_skipped(self):
+        est = self._est_with_grays(3)
+        est.cache_optical_flow(num_frames=1)
+        marker = est._frames[0].optical_flow
+        est.cache_optical_flow(num_frames=3, detector=lambda: None)
+        assert est._frames[0].optical_flow is marker  # not rebuilt
+
+    def test_get_of_lines_serves_any_cached_distance(self):
+        est = self._est_with_grays(5)
+
+        class Det:
+            def detect_and_track(self, a, b):
+                return (np.array([[5.0, 5.0], [8.0, 9.0]]),
+                        np.array([[7.0, 7.0], [9.0, 10.0]]))
+
+        est.cache_optical_flow(num_frames=3, detector=Det)
+        pts, size = est.get_of_lines_for_timestamp(0, num_frames=3)
+        assert size == (64, 48)
+        assert pts[0][1][0] == (5.0, 5.0)
+        assert pts[1][0] == 3 * 33_333
+
+    def test_uncached_distance_returns_none_not_d1(self):
+        est = self._est_with_grays(3)
+        assert est.get_of_lines_for_timestamp(0, num_frames=2) == (None, None)
+
+    def test_cleanup_drops_gray_frames_keeps_points(self):
+        est = self._est_with_grays(3)
+        est.cache_optical_flow(num_frames=1)
+        est.cleanup()
+        assert not hasattr(est._frames[0], "_gray_frame")
+        assert est._frames[0].optical_flow  # points survive
+        pts, _ = est.get_of_lines_for_timestamp(0)
+        assert pts is not None

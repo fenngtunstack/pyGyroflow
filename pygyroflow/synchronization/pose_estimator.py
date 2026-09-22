@@ -53,6 +53,9 @@ class FrameResult:
     euler_angles: tuple[float, float, float] | None = None
     prev_points: np.ndarray | None = None
     curr_points: np.ndarray | None = None
+    # OF pairs by frame distance (upstream FrameResult.optical_flow):
+    # {d: ((ts_us, pts_prev), (ts_us, pts_curr))} for d = 1..N.
+    optical_flow: dict[int, tuple] | None = None
 
 
 class PoseEstimator:
@@ -464,15 +467,10 @@ class PoseEstimator:
         2 ms, then *next_no* frames later, returning that frame's stored
         point pair and its frame size.
 
-        The port's ``FrameResult`` stores only the d=1 pair, so
-        *num_frames* > 1 raises (the multi-baseline cache is gap B-14's
-        remaining half) rather than silently returning the wrong baseline.
+        Uncached distances ``d > 1`` return ``(None, None)`` — the caller
+        primes the multi-baseline cache with :meth:`cache_optical_flow`
+        (B-14) rather than this silently returning the wrong baseline.
         """
-        if num_frames != 1:
-            raise NotImplementedError(
-                "multi-frame-distance optical flow is not ported "
-                "(upstream gap B-14): FrameResult stores only the d=1 pair"
-            )
         entries = sorted(self._frames)
         if not entries:
             return None, None
@@ -483,19 +481,93 @@ class PoseEstimator:
         if idx >= len(entries):
             return None, None
         curr = self._frames[entries[idx]]
+
+        # The multi-distance cache first (mod.rs:234-236): the caller
+        # primes it with cache_optical_flow.
+        cached = (curr.optical_flow or {}).get(num_frames)
+        if cached is not None:
+            (ts1, p1), (ts2, p2) = cached
+            pts = (
+                (ts1, [tuple(map(float, p)) for p in p1]),
+                (ts2, [tuple(map(float, p)) for p in p2]),
+            )
+            if apply_filter:
+                pts = self.filter_of_lines(pts, scale)
+            frame_size = getattr(curr, "frame_size", None)
+            return pts, tuple(frame_size) if frame_size else None
+
+        # No cache entry: only the estimator's own d=1 pair is available
+        # without a detector — return None rather than the wrong baseline.
+        if num_frames != 1:
+            return None, None
         if curr.prev_points is None or curr.curr_points is None:
             return None, None
         pts = (
-            (curr.timestamp_us, [tuple(map(float, p)) for p in curr.prev_points]),
-            (entries[idx] if next_no else curr.timestamp_us,
+            (curr.timestamp_us,
+             [tuple(map(float, p)) for p in curr.prev_points]),
+            (curr.timestamp_us,
              [tuple(map(float, p)) for p in curr.curr_points]),
         )
         if apply_filter:
             pts = self.filter_of_lines(pts, scale)
-        frame_size = None
-        if getattr(curr, "frame_size", None) is not None:
-            frame_size = tuple(curr.frame_size)
-        return pts, frame_size
+        frame_size = getattr(curr, "frame_size", None)
+        return pts, tuple(frame_size) if frame_size else None
+
+    def cache_optical_flow(self, num_frames: int = 1,
+                           detector=None) -> None:
+        """Fill each frame's OF cache for distances 1..num_frames
+        (``synchronization/mod.rs:195-220``).
+
+        Distance d pairs a frame with the frame d indices later
+        (``frame_no + d`` — index arithmetic, not timestamps: dropped
+        frames break the chain there). The d=1 entry is the pair the
+        estimator already stored; larger distances re-run detection on
+        the retained gray frames when *detector* is given (upstream
+        reuses the per-frame OF method's detector; the port's estimator
+        discards it after processing, so callers pass one back).
+        """
+        keys = sorted(self._frames)
+        for i, ts in enumerate(keys):
+            frame = self._frames[ts]
+            if frame.optical_flow:
+                continue  # already cached
+            frame.optical_flow = {}
+            for d in range(1, num_frames + 1):
+                to_ts = keys[i + d] if i + d < len(keys) else None
+                if to_ts is None:
+                    continue
+                to_frame = self._frames[to_ts]
+                if frame.frame_no + d != to_frame.frame_no:
+                    continue
+                if d == 1 and frame.prev_points is not None \
+                        and frame.curr_points is not None:
+                    frame.optical_flow[d] = (
+                        (frame.timestamp_us, frame.prev_points),
+                        (to_frame.timestamp_us, frame.curr_points),
+                    )
+                    continue
+                prev_gray = getattr(frame, "_gray_frame", None)
+                next_gray = getattr(to_frame, "_gray_frame", None)
+                if prev_gray is None or next_gray is None:
+                    continue
+                det = detector() if detector is not None else None
+                if det is None:
+                    continue
+                pts1, pts2 = det.detect_and_track(prev_gray, next_gray)
+                if len(pts1) < 2:
+                    continue
+                frame.optical_flow[d] = (
+                    (frame.timestamp_us, pts1),
+                    (to_frame.timestamp_us, pts2),
+                )
+
+    def cleanup(self) -> None:
+        """Drop the cached gray frames (upstream ``cleanup``,
+        ``mod.rs:221-226`` — release the image memory the OF caches
+        held; the point pairs stay)."""
+        for frame in self._frames.values():
+            if hasattr(frame, "_gray_frame"):
+                del frame._gray_frame
 
     def get_ranges(self) -> list[tuple[int, int]]:
         """Contiguous frame ranges, split at >100 ms gaps
