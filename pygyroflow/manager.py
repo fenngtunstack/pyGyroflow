@@ -1581,9 +1581,21 @@ class StabilizationManager:
             )
         except Exception:
             log.warning("Auto-sync: OptimSync point selection failed", exc_info=True)
-            return {}
+            points_ms = []
         if len(points_ms) < 2:
-            return {}
+            # Upstream (render_queue.rs:1451-1453): when the optimal-point
+            # selection comes back empty, the sync points fall back to a
+            # uniform spread — chunk centres of max_sync_points over the
+            # clip — instead of abandoning multi-point refinement.
+            chunks = self.params.duration_ms / self._SYNC_POINT_COUNT
+            start = chunks / 2.0
+            points_ms = [
+                start + i * chunks for i in range(self._SYNC_POINT_COUNT)
+            ]
+            log.info(
+                "Auto-sync: no optimal sync points; falling back to %d "
+                "uniform points", self._SYNC_POINT_COUNT,
+            )
 
         height, width = frames[0][1].shape[:2]
         camera_matrix = self.lens.get_camera_matrix(size=(width, height))

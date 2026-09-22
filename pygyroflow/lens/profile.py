@@ -632,6 +632,23 @@ class LensProfile:
             if isinstance(odim, dict) and "w" in odim and "h" in odim:
                 cpy.output_dimension = {"w": int(odim["w"]), "h": int(odim["h"])}
 
+            # Sync-settings overlay (lens_profile.rs:393-404): the
+            # setting's block merges into the profile's existing one —
+            # except that a setting-level custom_sync_pattern REPLACES the
+            # profile's rather than concatenating onto it (both having one
+            # would produce a nonsense combined pattern).
+            if isinstance(setting.get("sync_settings"), dict):
+                obj = setting["sync_settings"]
+                if isinstance(cpy.sync_settings, dict):
+                    if "custom_sync_pattern" in obj \
+                            and "custom_sync_pattern" in cpy.sync_settings:
+                        cpy.sync_settings.pop("custom_sync_pattern", None)
+                    from pygyroflow.util import merge_json
+
+                    merge_json(cpy.sync_settings, obj)
+                else:
+                    cpy.sync_settings = dict(obj)
+
             cpy.is_copy = True
             result.append(cpy)
 
