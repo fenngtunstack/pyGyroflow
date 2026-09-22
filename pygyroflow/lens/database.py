@@ -11,6 +11,7 @@ import gzip
 import json
 import logging
 import os
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +191,12 @@ class LensProfileDatabase:
                     stub = LensProfile()
                     stub.name = Path(fname).stem
                     stub.path_to_file = fpath
+                    # lens_profile_database.rs:81 — the preset's checksum
+                    # is the crc32 of its path, so favourites keyed by it
+                    # survive the file's contents changing.
+                    stub.checksum = format(
+                        zlib.crc32(fpath.encode("utf-8")) & 0xFFFFFFFF, "08x"
+                    )
                     self._insert(key, stub)
                     continue
 
@@ -345,10 +352,6 @@ class LensProfileDatabase:
     def __len__(self) -> int:
         return len(self.profiles)
 
-    # ------------------------------------------------------------------ #
-    #  Internal helpers                                                    #
-    # ------------------------------------------------------------------ #
-
     def _load_single_profile(self, data: Any, fname: str, path_to_file: str | None = None) -> None:
         """Parse a single profile dict and insert it (with compatible copies).
 
@@ -362,6 +365,7 @@ class LensProfileDatabase:
             return
         try:
             profile = LensProfile.from_json(data)
+            _assign_profile_checksum(profile)
         except Exception as exc:
             logger.error("Error parsing lens profile %s: %s", fname, exc)
             return
@@ -440,3 +444,33 @@ class LensProfileDatabase:
             "a7iv": "ILCE-7M4", "a7iii": "ILCE-7M3",
         }
         return aliases.get(text.lower(), text)
+
+
+def _assign_profile_checksum(profile: LensProfile) -> None:
+    """The crc32 a JSON profile gets on load (lens_profile_database.rs:
+    112-130): ``{identifier}|{w}{h}|{fx:.8}{fy:.8}|{cx:.8}{cy:.8}|{4 coeffs
+    :.8}``. Floats print with 8 decimals — Rust's ``{:.8}`` — and the
+    string is hashed as raw bytes. A profile without a usable camera
+    matrix keeps ``None`` (upstream's closure bails the same way)."""
+    matrix = profile.camera_matrix
+    if not isinstance(matrix, (list, tuple)) or len(matrix) < 2:
+        return
+    try:
+        fx = float(matrix[0][0]); fy = float(matrix[1][1])
+        cx = float(matrix[0][2]); cy = float(matrix[1][2])
+    except (TypeError, IndexError, ValueError):
+        return
+    coeffs = [float(c) for c in (profile.distortion_coeffs or [])[:4]]
+    coeffs += [0.0] * (4 - len(coeffs))
+    w = profile.calib_dimension.get("w", 0)
+    h = profile.calib_dimension.get("h", 0)
+    payload = (
+        f"{profile.identifier or ''}"
+        f"|{w}{h}"
+        f"|{fx:.8f}{fy:.8f}"
+        f"|{cx:.8f}{cy:.8f}"
+        f"|" + "".join(f"{c:.8f}" for c in coeffs)
+    )
+    profile.checksum = format(
+        zlib.crc32(payload.encode("utf-8")) & 0xFFFFFFFF, "08x"
+    )
