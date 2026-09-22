@@ -263,7 +263,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | B-13 | R | `filter_of_lines`（30° 平均角过滤）+ `get_of_lines_for_timestamp`（按帧距取缓存 OF）缺失 | [报告] |
 | B-14 | R | `cache_optical_flow` / 多帧距 OF / `cleanup` / `processed_frames` / `get_ranges`（>100ms 断档切分）缺失。`FrameResult` 只有 d=1 的点对 | [报告] |
 | B-15 | R | **rank<13 质量门缺失**。上游 `render_queue.rs:1485-1504` 按 `sync_data.rank` 跳过低运动段的偏移；我们完全不用 rank，改用 `_valid_sync_points`（>40ms 偏差剔除）与 `_drift_significant`（≥3 点、斜率>15ms、残差<10ms） | [报告] |
-| B-16 | R | **`SyncParams` 结构缺失**：`custom_sync_pattern`/`auto_sync_points`/`every_nth_frame`/`calc_initial_fast`/`initial_offset_inv` 全无。且 `manager.py:673-674` 在 OptimSync 给 <2 点时直接放弃，上游 `render_queue.rs:1448-1462` 会退化成均匀分布 | [报告] |
+| B-16 | R | **`SyncParams` 结构缺失**：`custom_sync_pattern`/`auto_sync_points`/`every_nth_frame`/`calc_initial_fast`/`initial_offset_inv` 全无。且 `manager.py:673-674` 在 OptimSync 给 <2 点时直接放弃，上游 `render_queue.rs:1448-1462` 会退化成均匀分布 —— calc_initial_fast/initial_offset_inv 已补（`ed114ad`）；OptimSync 空点回退均匀分布与兼容设置 sync_settings 叠加已补（`126f7db`）；`custom_sync_pattern` 图案本体与 `auto_sync_points` 开关仍缺 | [报告] |
 | B-17 | D | **逐点搜索窗口 120ms vs 上游 5000ms**（`manager.py:_SYNC_POINT_SEARCH_MS`） | [报告] |
 | B-18 | D | 流式 API 缺失：无 `feed_frame`、无取消、无增量估计、无 OF 缓存生命周期。批处理 `run()` 功能上够用，但长视频无进度/无中断 | [报告] |
 | B-19 | D | `guess_imu_orientation` 过程不同：我们用 6 个三帧窗口 + `_compute_cost`（`manager.py:852-964`）；上游 `rs_sync.rs:190-222` 是 48 个朝向的 `pre_sync` 代价求和 —— 48 个朝向的枚举已在（`_POSSIBLE_ORIENTATIONS` 恰 48 项）；差异仅在窗口选取（6 个三帧窗口 vs 全程）与代价函数（`_compute_cost` vs crate `pre_sync`）。B-04 落地后代价侧可换 crate 的 pre_sync，留作后续 | [报告] |
@@ -305,7 +305,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-13 | R | `compute_distort_map` 无畸变模型（见 G-06） —— 已修（`bcc927b`）：整网格喂 undistort_points_with_rolling_shutter（use_fovs=true、全额校正，逐行旋转由点族内部处理），未收敛点归零 | [实测] |
 | C-14 | R | **manager setter 面**：上游约 45 个 `set_*`，我们 10 个。功能性缺失：`frame_readout_direction`/`additional_rotation`/`additional_translation`/`zooming_method`/`max_zoom`/`video_speed`/`digital_lens`/背景全套/IMU 变换全套 | [报告] |
 | C-15 | R | **`util.rs` 辅助缺失**：`get_video_metadata`（扩展名白名单）、base91+zlib 编解码（**工程文件陀螺载荷用**）、`MapClosest::get_closest`（100ms 容差就近取）、`merge_json`（镜头库 sync_settings 合并）、`map_coord`。`util.py` 只有 `timestamp_at_frame`/`frame_at_timestamp` —— base91+zlib/MapClosest/map_coord 已在前批落地；`merge_json` 与扩展名白名单补齐（`e2b929f`）；`get_video_metadata` 本体（容器探测）在移植侧由 PyAV open 承担，不再单列 | [实测] |
-| C-16 | R | **`LensProfile` 保存/命名/校验缺失**，且 `get_all_matching_profiles`（`lens/profile.py:430-523`）**把 `sync_settings` 覆盖整个丢掉**——其余 20 项覆盖都移植对了 | [报告] |
+| C-16 | R | **`LensProfile` 保存/命名/校验缺失**，且 `get_all_matching_profiles`（`lens/profile.py:430-523`）**把 `sync_settings` 覆盖整个丢掉**——其余 20 项覆盖都移植对了 —— sync_settings 叠加已补（`126f7db`：merge_json 键级合并 + custom_sync_pattern 先删后并）；保存/命名/校验仍缺 | [报告] |
 | C-17 | D | 镜头库 `_insert`（`lens/database.py:374-381`）不算 crc32 校验和；无收藏/评分/去重；`search` 无"交换长宽比优先级"。别名表（gopro5-13/bmpcc/a7x/session5）逐条一致 | [报告] |
 
 ### D. stabilization 核心
@@ -407,6 +407,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | **D-06 参照**：`undistort_points` 对上游 Rust 逐值比对 | `6b7b84e` | `cpu_undistort.rs:649-803` 逐字节切出、`distortion_models/` 与 `gyro_source/splines.rs` 整流原样复制，编译后跑 26 用例 304 个坐标值，全部落在 3.7e-7 相对误差内（f32 vs f64 的本底）。**这一步查出上面三条缺陷**，其中两条结构性测试按构造就测不到。参照工程不入库，`generate_undistort_points_reference.py --stage` 现场从只读的 `opensource/gyroflow/` 抽取，所以不存在第二份会漂的副本 |
 | CPU 采样器消费 input_rotation（D-13） | `5e1b3be` | 7 项测试。90/180 度坐标映射按手算值比对（绕中心旋转，非角对称——首版测试在此翻过车）、零旋转恒等、fringe clamp 用旋转宽度、背景 clamp 天花板用未旋转宽度（1079 不被压到 1077，怪癖专测）、at_timestamp 打包两向、梯度帧端到端逐像素值 |
 | rs-sync 优化器 crate 移植 + 桥接（B-04） | `8ff80fa` + `00b6478` | 25 项模块测试 + 桥接后 e2e。梯度链（运动/延迟）对有限差分 <1e-5；端到端正弦场景恢复 −50 ms、代价 ~1e-6、残差景观真值处单点凹陷（**恒定角速度对该残差退化**——θ(t₁)+θ(t₂) 平移不变，须非线性 pan，记入测试 docstring）；向量化与标量路径 max diff 0.0（手展开公式在 y 分量翻过车，旋转轴对齐时差异项恰好消失——教训在提交信息）；e2e 实测 +191.6/200 ms |
+| OptimSync 均匀回退 + sync_settings 叠加（B-16/C-16 部分） | `126f7db` | 5 项测试：键级合并且原档案不动、设置冲突胜、无块整体采纳、pattern 替换不拼接（上游 393-404 的先删后并语义）、空点回退块中心 1000/9000 ms 且不再早退 |
 | STMap distort 图走真实模型（C-13/G-06） | `bcc927b` | 6 项测试：畸变改变图（旧逆矩阵恒等场景给恒等网格——判别性断言）、恒等场景逐像素回自身、主点径向不动、卷帘逐行差异 >0.05 px、哨兵归零不泄漏、尺寸覆盖 |
 | 视频输出原子发布 + 元数据拷贝（C-09 部分） | `1304d50` | 5 项测试：close 后改名发布且 .tmp 消失、flush 失败最终名不出现（PyAV 惰性建文件的断言边界写进注释）、未知扩展名警告直写、序列输出无改名路径、title 元数据往返 |
 | estimate_rolling_shutter（for_rs 分支） | `be76284` | 4 项机制测试：已知最小值恢复（12.34 ms，粗搜+细搜落点 ±0.02）、半开区间边界（[-33,+32] @30fps，Rust 语义）、空输入、params 私有副本换字段且不改动调用方。场景级对称不敏感的发现见 B-02 行 |
