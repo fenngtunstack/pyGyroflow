@@ -231,18 +231,18 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | # | 等级 | 项 | 证据 |
 |---|---|---|---|
 | A-01 | R | **25 种格式只支持 4 种**。上游 `telemetry-parser/lib.rs:161-187` 注册 GoPro/Sony/Canon/Nikon/DJI/Xtra/Insta360/GyroflowGcsv/GyroflowProtobuf/BlackBox/BlackmagicBraw/RedR3d/Runcam/WitMotion/PhoneApps/ArduPilot/Vuze/KanDao/QoocamEgo/Camm/EspLog/Cooke/SenseFlow/Freefly/Zcam。我们只有 GoPro/DJI/Sony/Insta360 | [实测] |
-| A-02 | R | **GCSV/Protobuf 输入缺失**（`gyroflow.proto` + `gcsv.rs`，1307 行）。这是"相机无陀螺、用外部 IMU"场景的唯一入口 | [报告] |
-| A-03 | R | **无 sidecar 回退**。上游 `lib.rs:107-124`：mp4 内无数据时回退同名 `.gcsv/.bbl/.bfl/.csv`。我们 `parser.py:47-51` 非 mp4/mov/insv 直接抛 | [报告] |
+| A-02 | R | **GCSV/Protobuf 输入缺失**（`gyroflow.proto` + `gcsv.rs`，1307 行）。这是"相机无陀螺、用外部 IMU"场景的唯一入口 —— **GCSV 已移植**（`c69ec94`：头块/缩放/方向编码/按列宽的可选通道，12 项测试）；Protobuf 半仍缺 | [报告] |
+| A-03 | R | **无 sidecar 回退**。上游 `lib.rs:107-124`：mp4 内无数据时回退同名 `.gcsv/.bbl/.bfl/.csv`。我们 `parser.py:47-51` 非 mp4/mov/insv 直接抛 —— 已修（`c69ec94`）：mp4/mov/insv/mkv 无数据时按上游扩展名顺序回退 sidecar；.gcsv/.csv/.txt 直接入口 | [报告] |
 | A-04 | R | **整个文件读进内存**。`parser.py:66-68` `f.read()`；上游 `lib.rs:73-84` 只读头尾。多 GB 素材会爆 | [报告] |
 | A-05 | R | **FileMetadata 19 字段中 9 个声明但从不写入**：`gravity_vectors`/`image_orientations`/`lens_positions`/`lens_params`/`per_frame_time_offsets`/`digital_zoom`/`camera_stab_data`/`mesh_correction`/`frame_readout_direction`。逐个 grep 确证（仅 `thin()` 会置 None） | [实测] |
 | A-06 | R | **Sony 专项全缺**（`sony.rs` 621 行，我们只读 7 个 tag）：`init_lens_profile`（从 LensDistortion 0xe421 建档案，6 项 SVD + Newton 逆）、`stab_collect`+`stab_calc_splines`（IBIS 0xe40f/0xe450、OIS 0xe416 → CatmullRom 样条）、`get_time_offset`（0xe40c/0xe40d/0xe437/0xe435）、`get_mesh_correction`（0xe42f Mesh + 0xe423 FPD）。**注意**：`distortion_models/sony.py` 我们写了 353 行的着色器侧模型，但**无任何东西喂它系数** | [实测] |
 | A-07 | R | **`splines.rs` 在 Python 侧不存在**（CatmullRom + BivariateSpline）。上游用于 Sony IBIS/OIS 与 mesh，不是死代码 | [报告] —— 已实现（`8bfa9e1`）：`gyro_source/splines.py`，CatmullRom 与 BivariateSpline 与上游 Rust 逐位一致（17 用例 / 108 个数值，见 `tests/golden/splines.json`） | [实测] |
-| A-08 | D | **GoPro method-0 `QuaternionConverter` 公式不同**。`converter.py:103` 写 `n_quat * io_quat * org⁻¹`，上游 `mod.rs:47` 是 `n_quat * (org_quat * io_quat⁻¹)⁻¹`。实测短片段影响小（差异是恒定 20.5°±0.40° 安装角，逐帧相对旋转只差 0.043°），但公式错是事实 | [实测] |
+| A-08 | D | ~~GoPro method-0 `QuaternionConverter` 公式不同~~ **改判：按群逆律恒等**（`e33501b`）。(org·io⁻¹)⁻¹ = io·org⁻¹ 是旋转群恒等式，两式是同一四元数（8 随机位形最大差 6.6e-15°）——原"差异"实测（恒定安装角差）来自拿不同乘法约定互比，非代数差异。曾按本表断言改公式后数值证伪回滚 | [实测] |
 | A-09 | D | **滤波边界行为不同**。上游零状态因果前后向；我们用 `sosfiltfilt`（奇数对称填充）与 `medfilt`（居中窗）。序列两端系统性不同 | [报告] |
 | A-10 | D | **VQF 磁力计输入不同**。上游 `mod.rs:126` 硬编码 `let m = [0,0,0]`；我们在 `TimeIMU.magn` 有值时传真实磁力计。当前 Python 解析器从不填 magn，属潜伏 | [报告] |
-| A-11 | R | **`get_checksum` 截断**。`source.py:448-462` 只哈希 detected_source/orientation/duration/lpf/两个计数；上游还哈希 rotation/bias/offsets/method/首末四元数。改这些参数不触发重算 | [报告] |
-| A-12 | R | **`find_bias` 未做偏移修正**。上游 `mod.rs:933-935` 用 `offset_at_video_timestamp` 修正取样窗口 | [报告] |
-| A-13 | D | **`adjust_offsets` 是朴素最小二乘**。上游 `mod.rs:700-776` 是 RANSAC 式成对斜率搜索 + 5ms 内点阈值；一个坏同步点会污染我们的线性拟合 | [报告] |
+| A-11 | R | **`get_checksum` 截断**。`source.py:448-462` 只哈希 detected_source/orientation/duration/lpf/两个计数；上游还哈希 rotation/bias/offsets/method/首末四元数。改这些参数不触发重算 —— 已修（`ff986ee`）：全字段对齐 mod.rs:869-895，含此前漏的 image_orientations 计数 | [报告] |
+| A-12 | R | **`find_bias` 未做偏移修正**。上游 `mod.rs:933-935` 用 `offset_at_video_timestamp` 修正取样窗口 —— 已修（`ff986ee`）：窗口两端各减同步偏移，严格边界原样 | [报告] |
+| A-13 | D | **`adjust_offsets` 是朴素最小二乘**。上游 `mod.rs:700-776` 是 RANSAC 式成对斜率搜索 + 5ms 内点阈值；一个坏同步点会污染我们的线性拟合 —— 已修（`15af508`）：成对斜率共识 + 5ms 内点带 + |slope|<0.1 门 + 离群点外推，全项对齐 | [报告] |
 
 ### B. 同步子系统
 
@@ -407,6 +407,10 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | **D-06 参照**：`undistort_points` 对上游 Rust 逐值比对 | `6b7b84e` | `cpu_undistort.rs:649-803` 逐字节切出、`distortion_models/` 与 `gyro_source/splines.rs` 整流原样复制，编译后跑 26 用例 304 个坐标值，全部落在 3.7e-7 相对误差内（f32 vs f64 的本底）。**这一步查出上面三条缺陷**，其中两条结构性测试按构造就测不到。参照工程不入库，`generate_undistort_points_reference.py --stage` 现场从只读的 `opensource/gyroflow/` 抽取，所以不存在第二份会漂的副本 |
 | CPU 采样器消费 input_rotation（D-13） | `5e1b3be` | 7 项测试。90/180 度坐标映射按手算值比对（绕中心旋转，非角对称——首版测试在此翻过车）、零旋转恒等、fringe clamp 用旋转宽度、背景 clamp 天花板用未旋转宽度（1079 不被压到 1077，怪癖专测）、at_timestamp 打包两向、梯度帧端到端逐像素值 |
 | rs-sync 优化器 crate 移植 + 桥接（B-04） | `8ff80fa` + `00b6478` | 25 项模块测试 + 桥接后 e2e。梯度链（运动/延迟）对有限差分 <1e-5；端到端正弦场景恢复 −50 ms、代价 ~1e-6、残差景观真值处单点凹陷（**恒定角速度对该残差退化**——θ(t₁)+θ(t₂) 平移不变，须非线性 pan，记入测试 docstring）；向量化与标量路径 max diff 0.0（手展开公式在 y 分量翻过车，旋转轴对齐时差异项恰好消失——教训在提交信息）；e2e 实测 +191.6/200 ms |
+| GCSV 格式 + sidecar 回退（A-02 文本半 / A-03） | `c69ec94` | 12 项测试：魔术行、缩放除数语义（gscale 另乘 π/180）、读出方向六码含 ±10000 哨兵、磁力计 Gauss→μT、lensprofile 头、tscale 时机、空 mp4 回退、扩展名优先级、直接入口、非 gcsv 文本仍拒。测试首版把扩展头写在 t 行之后被判数据行——顺序语义反向钉住 |
+| get_checksum 补全 + find_bias 偏移平移（A-11/A-12） | `ff986ee` | 6 项测试：image_orientations 计数入哈希、四类参数各自移动校验和、+50ms 偏移下窗口只含首样本（set_offset 而非裸写——offsets_adjusted 才是查询源，教训入测试注释）、严格边界 |
+| adjust_offsets RANSAC 式共识（A-13） | `15af508` | 8 项测试：离群点不拖漂移且被外推（上游关键性质）、|slope|≥0.1 的真漂移回落朴素拟合、单点直通、adjusted 键平移 |
+| A-08 改判：converter 公式恒等 | `e33501b` | 群逆律等价性 9 项测试（8 随机位形 6.6e-15° + X²≠I 非平凡性守卫）。**改公式后数值证伪回滚的过程保留在提交历史**——这是本表第二处初稿结论被推翻（第一处 B-23） |
 | 档案 crc32 校验和（C-17 一块） | `36f9a1e` | 6 项测试：格式串逐字节对照（Rust :.8 与 Python :.8f 一致）、缺系数补零、无矩阵保持 None、预设路径 crc32、收藏优先搜索命中。顺带修复 heredoc 事故：database.py 类尾方法被吞进模块级函数体，AST 定位后重组（全量测试过） |
 | settings 文件驱动 CLI 默认（C-10） | `71f7308` | 4 项测试：文件默认生效、显式旗标覆盖、坏文件静默不崩、sync_params 到达 synchronize。GUI 态键（窗口布局等）无 CLI 对应物，表里写明不再逐一映射 |
 | IMU 变换 setter 全套 + recompute_gyro（C-14 收尾） | `76c28a0` | 4 项测试：双滤波、双旋转、朝向零偏写入 IMUTransforms，recompute 应用且 compute_id 前移 |
