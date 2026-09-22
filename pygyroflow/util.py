@@ -518,3 +518,41 @@ def frame_at_timestamp(timestamp_ms: float, fps: float) -> int:
         Zero-based frame index (rounded).
     """
     return round(timestamp_ms * fps / 1000.0) if fps > 0 else 0
+
+
+def merge_json(a, b):
+    """Recursively merge JSON-like *b* into *a* (``util.rs:96-114``).
+
+    Objects merge key-wise (recursing into ``a``'s existing value or Null),
+    arrays concatenate, and ``b``'s array into ``a``'s object appends the
+    object as an element. Anything else: *b* replaces *a*. Mutates and
+    returns *a* — the merge the lens-profile database applies to a
+    profile's ``sync_settings`` overlay.
+    """
+    import copy
+
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k, v in b.items():
+            if k not in a or a[k] is None:
+                a[k] = None
+            a[k] = merge_json(a[k], v)
+    elif isinstance(a, list) and isinstance(b, list):
+        a.extend(copy.deepcopy(b))
+    elif isinstance(a, list) and isinstance(b, dict):
+        a.append(copy.deepcopy(b))
+    else:
+        return copy.deepcopy(b)
+    return a
+
+
+_VIDEO_EXTENSIONS = ("mp4", "mov", "braw", "insv", "360", "mxf")
+
+
+def filename_has_video_extension(url: str) -> bool:
+    """The extension whitelist half of ``util.rs::get_video_metadata``:
+    upstream refuses to treat a file as video (and hand it to the
+    telemetry parser) unless the name ends in one of these. The port's
+    equivalent gate lives in its own open path; the whitelist is shared
+    here so both answer the same question."""
+    name = url.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    return name.lower().endswith(_VIDEO_EXTENSIONS)
