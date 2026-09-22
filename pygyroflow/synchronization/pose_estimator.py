@@ -10,6 +10,7 @@ gyroscope data for time-offset search.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -417,6 +418,84 @@ class PoseEstimator:
     def get_frame_results(self) -> dict[int, FrameResult]:
         """Return the full ``{timestamp_us: FrameResult}`` map."""
         return dict(self._frames)
+
+    @staticmethod
+    def filter_of_lines(
+        lines: tuple[tuple[int, list], tuple[int, list]] | None,
+        scale: float,
+    ):
+        """Drop flow lines whose direction deviates >30° from the mean
+        (``synchronization/mod.rs:169-193``) and scale the survivors.
+
+        A "line" is one matched pair: its direction is
+        ``atan2(p2.y − p1.y, p2.x − p1.x)``. Averaging angles this way is
+        circular-naive — upstream does it too; with the 30° gate it only
+        bites when the motion is near the ±π wrap, where the port matches
+        upstream's behaviour.
+        """
+        if lines is None:
+            return None
+        (ts1, pts1), (ts2, pts2) = lines
+        if not len(pts1) or len(pts1) != len(pts2):
+            return None
+        angles = [
+            math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+            for p1, p2 in zip(pts1, pts2)
+        ]
+        avg_angle = sum(angles) / len(angles)
+        limit = 30.0 * (math.pi / 180.0)
+        out1, out2 = [], []
+        for p1, p2, angle in zip(pts1, pts2, angles):
+            if abs(angle - avg_angle) < limit:
+                out1.append((p1[0] * scale, p1[1] * scale))
+                out2.append((p2[0] * scale, p2[1] * scale))
+        return ((ts1, out1), (ts2, out2))
+
+    def get_of_lines_for_timestamp(
+        self,
+        timestamp_us: int,
+        next_no: int = 0,
+        scale: float = 1.0,
+        num_frames: int = 1,
+        apply_filter: bool = False,
+    ):
+        """The cached optical-flow lines at *timestamp_us*
+        (``synchronization/mod.rs:228-247``): the frame closest within
+        2 ms, then *next_no* frames later, returning that frame's stored
+        point pair and its frame size.
+
+        The port's ``FrameResult`` stores only the d=1 pair, so
+        *num_frames* > 1 raises (the multi-baseline cache is gap B-14's
+        remaining half) rather than silently returning the wrong baseline.
+        """
+        if num_frames != 1:
+            raise NotImplementedError(
+                "multi-frame-distance optical flow is not ported "
+                "(upstream gap B-14): FrameResult stores only the d=1 pair"
+            )
+        entries = sorted(self._frames)
+        if not entries:
+            return None, None
+        closest = min(entries, key=lambda ts: abs(ts - timestamp_us))
+        if abs(closest - timestamp_us) > 2000:
+            return None, None
+        idx = entries.index(closest) + next_no
+        if idx >= len(entries):
+            return None, None
+        curr = self._frames[entries[idx]]
+        if curr.prev_points is None or curr.curr_points is None:
+            return None, None
+        pts = (
+            (curr.timestamp_us, [tuple(map(float, p)) for p in curr.prev_points]),
+            (entries[idx] if next_no else curr.timestamp_us,
+             [tuple(map(float, p)) for p in curr.curr_points]),
+        )
+        if apply_filter:
+            pts = self.filter_of_lines(pts, scale)
+        frame_size = None
+        if getattr(curr, "frame_size", None) is not None:
+            frame_size = tuple(curr.frame_size)
+        return pts, frame_size
 
     def get_ranges(self) -> list[tuple[int, int]]:
         """Contiguous frame ranges, split at >100 ms gaps
