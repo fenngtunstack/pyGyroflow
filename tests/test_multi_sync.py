@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests for multi-point sync refinement (manager.synchronize wiring).
 
 The orchestration itself needs real footage; these tests pin the outlier
@@ -131,6 +130,11 @@ class TestRsSyncOffsetArithmetic:
 
             def _compute_cost(self, *a, **k):
                 return neighbour_cost
+
+            def _as_rs_sync_problem(self):
+                # The flat-landscape guard scores neighbours through this;
+                # None disables it (inf-cost neighbours never reject).
+                return None
 
         proc = mod.AutosyncProcess(fps=30.0)
         proc._pose_estimator = type(

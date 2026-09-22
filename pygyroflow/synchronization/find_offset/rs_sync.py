@@ -459,6 +459,35 @@ class RollingShutterSync:
 
         return best_cost, best_delay
 
+    def _as_rs_sync_problem(self):
+        """This sync's data as the crate optimizer's problem.
+
+        Quaternions in (resampled to the nearest 50 Hz like upstream),
+        per-track rays in — the same construction ``full_sync`` drives.
+        Shared with the flat-landscape guard so both score candidates on
+        one cost function.
+        """
+        if not self.tracks:
+            return None
+        keys = sorted(self.quaternions.keys())
+        if not keys:
+            return None
+
+        from pygyroflow.synchronization.rs_sync_problem import SyncProblem
+
+        problem = SyncProblem()
+        problem.set_gyro_quaternions(
+            keys,
+            [self.quaternions[k].quaternion() for k in keys],
+        )
+        for track in self.tracks:
+            problem.set_track_result(
+                int(round(track.ts_a[0] * 1e6)) if track.ts_a else 0,
+                track.ts_a, track.ts_b,
+                track.pts_a, track.pts_b,
+            )
+        return problem
+
     def full_sync(
         self,
         initial_delay_ms: float,
@@ -468,9 +497,17 @@ class RollingShutterSync:
         search_radius_ms: float = 500.0,
         refinement_levels: int = 4,
     ) -> tuple[float, float] | None:
-        """Full coarse-to-fine synchronization search.
+        """Full coarse-to-fine synchronization search (the rs-sync crate).
 
         Returns (cost, delay_ms) or None if no solution found.
+
+        Drives the ported ``rs-sync`` optimizer (:mod:`..rs_sync_problem`)
+        exactly the way upstream's ``FindOffsetsRssync`` drives the crate:
+        quaternions in, per-track rays in, ``pre_sync`` grid + ``sync``
+        rounds out. The optimizer models a per-frame **translational
+        motion** alongside the delay with a robust ``log1p`` loss, which
+        the old grid refinement here could not — it just subsampled the
+        grid around the coarse winner and had no motion model at all.
 
         Parameters
         ----------
@@ -479,56 +516,27 @@ class RollingShutterSync:
         from_ts_us, to_ts_us:
             Sync window boundaries in microseconds.
         coarse_step_ms:
-            Coarse search step in milliseconds.
+            Coarse search step in milliseconds (``presync_step``).
         search_radius_ms:
-            Search half-width in milliseconds.
+            Search half-width in milliseconds (``presync_radius``).
         refinement_levels:
-            Number of refinement iterations (each reduces step by 10x).
+            Number of ``sync`` rounds (upstream passes 4).
         """
-        if not self.tracks:
+        problem = self._as_rs_sync_problem()
+        if problem is None:
             return None
 
-        initial_delay_s = initial_delay_ms / 1000.0
-        radius_s = search_radius_ms / 1000.0
-        step_s = coarse_step_ms / 1000.0
-
-        best_delay = initial_delay_s
-        best_cost = float("inf")
-
-        from_ts_s = from_ts_us / 1e6
-        to_ts_s = to_ts_us / 1e6
-
-        # Coarse search
-        delays = np.arange(
-            initial_delay_s - radius_s,
-            initial_delay_s + radius_s + step_s,
-            step_s,
+        result = problem.full_sync(
+            initial_delay_ms / 1000.0,
+            from_ts_us, to_ts_us,
+            coarse_step_ms / 1000.0,
+            search_radius_ms / 1000.0,
+            refinement_levels,
         )
-
-        for delay in delays:
-            cost = self._compute_cost(delay, from_ts_s, to_ts_s)
-            if cost < best_cost:
-                best_cost = cost
-                best_delay = delay
-
-        # Refinement iterations
-        for level in range(refinement_levels):
-            step_s /= 10.0
-            radius_s = step_s * 10.0
-
-            delays = np.arange(
-                best_delay - radius_s,
-                best_delay + radius_s + step_s,
-                step_s,
-            )
-
-            for delay in delays:
-                cost = self._compute_cost(delay, from_ts_s, to_ts_s)
-                if cost < best_cost:
-                    best_cost = cost
-                    best_delay = delay
-
-        return best_cost, best_delay * 1000.0
+        if result is None:
+            return None
+        cost, delay_s = result
+        return cost, delay_s * 1000.0
 
 
 def find_offset_rs_sync(

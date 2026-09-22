@@ -461,30 +461,6 @@ class AutosyncProcess:
 
         cost, delay_ms = result
 
-        # Contrast guard: a flat cost landscape means the tracks carry no
-        # usable sync signal (e.g. fast-motion optical-flow breakage); the
-        # "minimum" is then noise. Compare the winner against the cost at
-        # +/-100 ms and refuse to return an offset that is not
-        # distinguishable from its neighbourhood.
-        from_ts_s = min(ts_all) / 1e6
-        to_ts_s = max(ts_all) / 1e6
-        neighbours = [
-            rs._compute_cost(delay_ms / 1000.0 + d, from_ts_s, to_ts_s)
-            for d in (-0.1, -0.05, 0.05, 0.1)
-        ]
-        neighbour_med = sorted(neighbours)[len(neighbours) // 2]
-        if cost > 0.97 * neighbour_med:
-            logger.warning(
-                "RS sync: cost landscape is flat (best %.4f vs neighbour "
-                "median %.4f); offset not significant, rejecting",
-                cost, neighbour_med,
-            )
-            return None
-
-        # full_sync returns the delay in the same convention as upstream's
-        # `offset` (gyro_ts = visual_ts + delay), so a perfect match lands on
-        # the initial guess `-initial_offset_ms`.
-        #
         # Upstream rejects results outside 90% of the search radius — at the
         # edge of the window the cost minimum is not a real match, it is the
         # boundary. Checked on the raw delay, before the readout term.
@@ -498,6 +474,24 @@ class AutosyncProcess:
             )
             return None
 
+        # Contrast guard (port deviation, upstream has none): compare the
+        # optimizer's cost at the winner against its ±50/±100 ms
+        # neighbourhoods — on the optimizer's own cost, not the old grid
+        # metric, so the scales cannot disagree. A flat landscape means the
+        # tracks carry no usable sync signal and the "minimum" is noise.
+        neighbours = [
+            self._rs_cost_at(rs, delay_ms / 1000.0 + d, ts_all)
+            for d in (-0.1, -0.05, 0.05, 0.1)
+        ]
+        neighbour_med = sorted(neighbours)[len(neighbours) // 2]
+        if cost > 0.97 * neighbour_med:
+            logger.warning(
+                "RS sync: cost landscape is flat (best %.4f vs neighbour "
+                "median %.4f); offset not significant, rejecting",
+                cost, neighbour_med,
+            )
+            return None
+
         # Then subtract half the sensor readout time: the optical-flow pair
         # sits at the frame's *readout* midpoint, and a rolling shutter takes
         # frame_readout_time to sweep the frame, so the gyro↔frame
@@ -505,6 +499,35 @@ class AutosyncProcess:
         # did) biases every synced offset by a constant readout/2 — tens of
         # ms on a slow sensor.
         return -delay_ms - frame_readout_time_ms / 2.0, cost
+
+    def _rs_cost_at(self, rs, delay_s: float, ts_all: list[int]) -> float:
+        """The crate optimizer's pre_sync-style cost at *delay_s*.
+
+        Used by the flat-landscape guard: the winner's cost and its
+        neighbourhood must come from the same metric (the optimizer's
+        robust loss), not from a different cost function whose scale can
+        disagree with it.
+        """
+        from pygyroflow.synchronization.rs_sync_problem import (
+            clamp_k,
+            opt_compute_problem,
+            opt_guess_translational_motion,
+        )
+
+        problem = rs._as_rs_sync_problem()
+        if problem is None:
+            return float("inf")
+        from_ts, to_ts = min(ts_all), max(ts_all)
+        total = 0.0
+        for ts in sorted(
+            k for k in problem.problem.frame_data if from_ts <= k < to_ts
+        ):
+            p = opt_compute_problem(ts, delay_s, problem.problem)
+            m = opt_guess_translational_motion(p, 20)
+            k = clamp_k(1.0 / np.linalg.norm(p @ m) * 1e2)
+            r = (p @ m) * (k / np.linalg.norm(m))
+            total += float(np.sqrt(np.sqrt(np.log1p(r * r)).sum()))
+        return total
 
     def _pose_estimator_camera_matrix(self) -> np.ndarray | None:
         """Camera matrix set on the pose estimator (None if identity)."""

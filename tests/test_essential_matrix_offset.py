@@ -211,6 +211,9 @@ class TestTheSyncParamsKnobs:
             def _compute_cost(self, *a, **k):
                 return 1.0  # flat-landscape guard: neighbours cost more
 
+            def _as_rs_sync_problem(self):
+                return None  # guard's neighbour scoring disabled
+
         import pygyroflow.synchronization.find_offset.rs_sync as rs_mod
         monkeypatch.setattr(rs_mod, "RollingShutterSync", StubRs)
         monkeypatch.setattr(em, "find_offset_essential_matrix", fake_em)
