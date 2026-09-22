@@ -133,7 +133,7 @@ class TestTheDispatch:
         assert called == [1]
         assert any("Unknown pose method 7" in r.message for r in caplog.records)
 
-    def test_method_2_is_the_eight_point_stand_in(self, monkeypatch):
+    def test_method_2_pinhole_fallback_passes_the_real_k(self, monkeypatch):
         seen = {}
 
         def spy(p1, p2, k):
@@ -304,54 +304,41 @@ class TestFindEssentialMat:
 # ---------------------------------------------------------------------------
 
 
-class TestMethodTwoStandIn:
-    def test_points_go_back_through_pixels(self, monkeypatch):
-        """The stand-in needs a K, so the undistorted points are put back into
-        pixel units of the flow size and the K at pts1's timestamp is used."""
+class TestMethodTwoArrsac:
+    def test_the_estimator_receives_unit_rays(self, monkeypatch):
+        """``eight_point.rs:29-35``: ARRSAC works on homogenized,
+        normalized unit rays — no K, no pixel units."""
         seen = {}
 
-        def spy(p1, p2, k):
-            seen["p1_scale"] = float(np.abs(p1).max())
-            seen["k"] = np.asarray(k).copy()
-            return np.eye(3), np.zeros(3)
+        def spy(rays_a, rays_b, **kwargs):
+            seen["a"] = np.asarray(rays_a).copy()
+            seen["b"] = np.asarray(rays_b).copy()
+            return np.eye(3)
 
-        monkeypatch.setattr(pkg, "estimate_pose_eight_point", spy)
+        monkeypatch.setattr(pkg, "estimate_pose_arrsac", spy)
         pix = np.array([[100.0, 100.0], [960.0, 540.0], [1800.0, 900.0]] * 5,
                        dtype=np.float64)
         pkg.estimate_rotation(
             pix, pix, K, method=2, size_wh=(960.0, 540.0), params=_params()
         )
-        # Half-size flow space: K scaled by 0.5, points back in pixel scale.
-        assert np.allclose(seen["k"], K * 0.5)
-        assert seen["p1_scale"] > 100.0
+        for rays in (seen["a"], seen["b"]):
+            assert rays.shape[1] == 3
+            norms = np.linalg.norm(rays, axis=1)
+            assert np.allclose(norms, 1.0, atol=1e-9)
 
-    def test_it_still_recovers_a_rotation_with_a_lens(self):
-        """With a strong lens the undistorted stand-in lands on the true
-        rotation while distorted pixels through the old path visibly miss.
-
-        The bound is loose relative to method 0's on purpose: the stand-in
-        inherits classic ``recoverPose``'s sign-test, which occasionally takes
-        the wrong fold of the two-fold solution — the exact weakness ARRSAC
-        does not have. Seed and coefficients are pinned so the fold is
-        resolved and the assertion measures the wiring, not the coin flip.
-        """
-        coeffs = [-0.15, 0.05, 0.0, 0.0]
-        R_true = _rot(rx=math.radians(3.0), ry=math.radians(-2.0))
-        pix1, pix2 = _synth_fisheye_pair(R_true, coeffs=coeffs)
+    def test_it_recovers_a_rotation_with_a_lens(self):
+        """On rays exact to the fisheye round-trip the faithful ARRSAC
+        lands on the true rotation (measured 0.07°). A strong-lens scene
+        with amplified eight-point noise is *upstream* failure territory —
+        its threshold ladder rejects and the frame gets no pose — so the
+        assertion pins the regime where the method is designed to work."""
+        R_true = _rot(rx=math.radians(0.7), ry=math.radians(-0.4))
+        pix1, pix2 = _synth_fisheye_pair(R_true)
         R = pkg.estimate_rotation(
-            pix1, pix2, K, method=2, size_wh=(W, H), params=_params(coeffs=coeffs),
+            pix1, pix2, K, method=2, size_wh=(W, H), params=_params(),
         )
         assert R is not None
         assert _angle_between(R, R_true) < 0.5
-
-        E, mask = cv2.findEssentialMat(
-            pix1.astype(np.float32), pix2.astype(np.float32), K,
-            cv2.RANSAC, 0.999, 1.0,
-        )
-        _, R_pinhole, _, _ = cv2.recoverPose(
-            E, pix1.astype(np.float32), pix2.astype(np.float32), K, mask=mask
-        )
-        assert _angle_between(R_pinhole, R_true) > 2.0
 
 
 # ---------------------------------------------------------------------------

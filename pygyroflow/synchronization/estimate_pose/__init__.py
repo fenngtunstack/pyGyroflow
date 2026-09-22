@@ -5,10 +5,9 @@ Upstream's ``EstimatePoseMethod`` has four strategies, dispatched by index:
 * ``0`` ``PoseFindEssentialMat`` -- OpenCV LMEDS on undistorted normalized
   points (``find_essential_mat.py``, faithful port)
 * ``1`` ``PoseAlmeida``          -- per-point ray deltas (``almeida.py``)
-* ``2`` ``PoseEightPoint``       -- upstream runs ARRSAC over unit rays;
-  **ARRSAC is not ported** (no OpenCV equivalent), so this index runs the
-  eight-point RANSAC helper on undistorted *pixel* coordinates instead.
-  Documented gap, not a faithful port.
+* ``2`` ``PoseEightPoint``       -- ARRSAC over unit rays
+  (:mod:`.arrsac`, faithful port of the ``arrsac`` crate + rust-cv's
+  eight-point estimator).
 * ``3`` ``PoseFindHomography``   -- homography + decomposition on undistorted
   normalized points (``homography.py``, faithful port)
 
@@ -23,9 +22,10 @@ import numpy.typing as npt
 import logging
 
 from pygyroflow.stabilization.cpu_undistort import (
-    _optical_flow_lens_data,
-    undistort_points,
     undistort_points_for_optical_flow,
+)
+from pygyroflow.synchronization.estimate_pose.arrsac import (
+    estimate_pose_arrsac,
 )
 from pygyroflow.synchronization.estimate_pose.eight_point import (
     estimate_pose_eight_point,
@@ -143,28 +143,19 @@ def estimate_rotation(
     ts2_us = int(round(next_timestamp_ms * 1000.0))
 
     if method_name == "eight_point":
-        # ARRSAC stand-in. Upstream feeds ARRSAC unit rays, which need no K;
-        # findEssentialMat does need one, so the undistorted points are put
-        # back into pixel units and the intrinsics at *prev_pts*' timestamp
-        # stand in for both sets. On a zoom lens that is an approximation the
-        # ARRSAC port will one day remove.
-        scaled_k, coeffs = _optical_flow_lens_data(params, ts1_us, dims)
-        prev = undistort_points(
-            prev_pts, scaled_k, coeffs, scaled_k, p=None, rot_per_point=None,
-            params=params, lens_correction_amount=1.0, timestamp_ms=ts1_us / 1000.0,
-            shift_per_point=None, mesh=None,
-        )
-        curr = undistort_points(
-            curr_pts, scaled_k, coeffs, scaled_k, p=None, rot_per_point=None,
-            params=params, lens_correction_amount=1.0, timestamp_ms=ts2_us / 1000.0,
-            shift_per_point=None, mesh=None,
-        )
-        result = estimate_pose_eight_point(
-            np.asarray(prev, dtype=np.float64),
-            np.asarray(curr, dtype=np.float64),
-            scaled_k,
-        )
-        return result[0] if result is not None else None
+        # The faithful ARRSAC + eight-point (``eight_point.rs:20-61``):
+        # each undistorted point homogenized (x, y, 1) and normalized to a
+        # unit ray — upstream's ``UnitVector3::new_normalize(...to_homogeneous())``
+        # — each set at its own timestamp's lens.
+        prev = undistort_points_for_optical_flow(prev_pts, ts1_us, params, dims)
+        curr = undistort_points_for_optical_flow(curr_pts, ts2_us, params, dims)
+        prev = np.asarray(prev, dtype=np.float64)
+        curr = np.asarray(curr, dtype=np.float64)
+        prev = np.column_stack([prev, np.ones(len(prev))])
+        curr = np.column_stack([curr, np.ones(len(curr))])
+        prev /= np.maximum(np.linalg.norm(prev, axis=1, keepdims=True), 1e-12)
+        curr /= np.maximum(np.linalg.norm(curr, axis=1, keepdims=True), 1e-12)
+        return estimate_pose_arrsac(prev, curr)
 
     prev = np.asarray(
         undistort_points_for_optical_flow(prev_pts, ts1_us, params, dims),
@@ -183,6 +174,7 @@ def estimate_rotation(
 
 __all__ = [
     "estimate_rotation",
+    "estimate_pose_arrsac",
     "estimate_pose_eight_point",
     "estimate_pose_find_essential_mat",
     "estimate_essential_matrix",
