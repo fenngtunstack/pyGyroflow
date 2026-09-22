@@ -197,17 +197,35 @@ def main(argv=None) -> None:
              "\"{'stabilization': {'fov': 1.5}}\". Repeatable, applied in "
              "order after any preset given as a positional input",
     )
+    # Persistent defaults (C-10): the same keys upstream's settings.json
+    # drives — a plain `-p`/`-s` JSON blob in the file replaces having to
+    # repeat it on every invocation. Explicit flags win over the file.
+    try:
+        from pygyroflow.settings import Settings
+        _settings = Settings()
+        _settings.load()
+    except Exception:
+        _settings = None
+
+    def _settings_json(key: str):
+        if _settings is None:
+            return None
+        value = _settings.get(key)
+        return json.dumps(value) if isinstance(value, dict) else None
+
     parser.add_argument(
         "-p", "--output-params",
         metavar="JSON",
         help="Render options to merge in, e.g. "
-             "\"{'codec': 'H.265/HEVC', 'bitrate': 150, 'audio': true}\"",
+             "\"{'codec': 'H.265/HEVC', 'bitrate': 150, 'audio': true}\". "
+             "Falls back to the 'output_params' key in the settings file",
     )
     parser.add_argument(
         "-s", "--sync-params",
         metavar="JSON",
         help="Synchronization options to merge in, e.g. "
-             "\"{'offset_method': 2, 'of_method': 2}\"",
+             "\"{'offset_method': 2, 'of_method': 2}\". Falls back to the "
+             "'sync_params' key in the settings file",
     )
     parser.add_argument(
         "--export-project",
@@ -327,6 +345,12 @@ def main(argv=None) -> None:
     )
 
     args = parser.parse_args(argv)
+
+    # Persistent defaults: an explicit flag beats the settings file.
+    if args.output_params is None:
+        args.output_params = _settings_json("output_params")
+    if args.sync_params is None:
+        args.sync_params = _settings_json("sync_params")
 
     # Configure logging
     level = logging.DEBUG if args.verbose else logging.INFO
