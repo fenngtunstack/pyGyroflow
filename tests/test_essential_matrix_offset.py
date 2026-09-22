@@ -152,10 +152,11 @@ class TestTheAutosyncIntegration:
         )
         gyro = [(k * 33_333, np.array([0.0, 10.0, 0.0])) for k in range(40)]
         visual = [(k * 33_333, np.array([0.0, 10.0, 0.0])) for k in range(30)]
-        offset = proc._essential_matrix_offset(
+        offset, cost = proc._essential_matrix_offset(
             visual, gyro, search_range_ms=200.0, initial_offset_ms=0.0
         )
         assert offset == pytest.approx(-37.0)
+        assert cost == pytest.approx(1.0)
         assert seen["n_of"] == 30
         assert seen["search_size_ms"] == pytest.approx(100.0)  # half window
 
@@ -163,7 +164,7 @@ class TestTheAutosyncIntegration:
         proc = AutosyncProcess(camera_matrix=np.eye(3), fps=30.0, offset_method=0)
         monkeypatch.setattr(
             proc, "_essential_matrix_offset",
-            lambda *a, **k: 12.0,
+            lambda *a, **k: (12.0, 1.0),
         )
         gyro = [(k * 33_333, np.array([0.0, 10.0, 0.0])) for k in range(40)]
         frames = [(k * 33_333, np.zeros((16, 16), dtype=np.uint8))
@@ -177,3 +178,114 @@ class TestTheAutosyncIntegration:
         )
         offset = proc.run(frames, gyro, search_range_ms=200.0)
         assert offset == pytest.approx(12.0)
+
+
+class TestTheSyncParamsKnobs:
+    def test_calc_initial_fast_seeds_the_rs_search(self, monkeypatch):
+        """``rs_sync.rs:15-44``: the essential-matrix estimate becomes the
+        initial offset and the RS window widens to ±3000 ms — even if that
+        widens a smaller user window (upstream sets it unconditionally)."""
+        proc = AutosyncProcess(
+            camera_matrix=np.eye(3), fps=30.0, offset_method=2,
+            calc_initial_fast=True,
+        )
+        seen = {}
+
+        def fake_em(of_samples, gyro_samples, **kwargs):
+            seen["em_kwargs"] = kwargs
+            return (-55.0, 0.5)
+
+        captured = {}
+
+        class StubRs:
+            def __init__(self, *a, **k):
+                pass
+
+            def add_track_from_frames(self, *a, **k):
+                pass
+
+            def full_sync(self, **kwargs):
+                captured["initial_delay"] = kwargs["initial_delay_ms"]
+                return (0.5, 0.0)  # (cost, delay) -> offset 0 inside window
+
+            def _compute_cost(self, *a, **k):
+                return 1.0  # flat-landscape guard: neighbours cost more
+
+        import pygyroflow.synchronization.find_offset.rs_sync as rs_mod
+        monkeypatch.setattr(rs_mod, "RollingShutterSync", StubRs)
+        monkeypatch.setattr(em, "find_offset_essential_matrix", fake_em)
+
+        pts = np.array([[10.0, 10.0], [50.0, 40.0]])
+        from pygyroflow.synchronization.pose_estimator import FrameResult
+
+        est = proc.pose_estimator
+        for k in range(4):
+            est._frames[k * 33_333] = FrameResult(
+                timestamp_us=k * 33_333, frame_no=k,
+                prev_points=pts, curr_points=pts + 1.0,
+            )
+        gyro = [(k * 33_333, np.array([0.0, 10.0, 0.0])) for k in range(4)]
+        visual = [(k * 33_333, np.array([0.0, 10.0, 0.0])) for k in range(3)]
+        frames = [(k * 33_333, np.zeros((8, 8), np.uint8)) for k in range(4)]
+
+        result = proc._rs_sync_offset(
+            frames, {0: None}, frame_readout_time_ms=0.0,
+            search_range_ms=200.0, visual_rots=visual, gyro_data=gyro,
+        )
+        assert result is not None
+        assert seen["em_kwargs"]["initial_offset_ms"] == 0.0
+        # The RS search started from the seeded offset: full_sync's
+        # initial_delay_ms is the negated seed, in ms.
+        assert captured["initial_delay"] == pytest.approx(55.0)
+
+    def test_initial_offset_inv_keeps_the_better_sign(self, monkeypatch):
+        """``autosync.rs:223-247``: both signs are tried; the result that
+        exists (then the lower cost) wins."""
+        proc = AutosyncProcess(
+            camera_matrix=np.eye(3), fps=30.0, offset_method=0,
+            initial_offset_inv=True,
+        )
+        calls = []
+
+        def fake(of_samples, gyro_samples, **kwargs):
+            calls.append(kwargs["initial_offset_ms"])
+            if kwargs["initial_offset_ms"] < 0:
+                return (75.0, 0.3)  # the negated trial finds it
+            return None
+
+        monkeypatch.setattr(em, "find_offset_essential_matrix", fake)
+        gyro = [(k * 33_333, np.array([0.0, 10.0, 0.0])) for k in range(40)]
+        visual = [(k * 33_333, np.array([0.0, 10.0, 0.0])) for k in range(30)]
+        frames = [(k * 33_333, np.zeros((8, 8), np.uint8)) for k in range(40)]
+        monkeypatch.setattr(
+            proc._pose_estimator, "get_visual_rotations",
+            lambda **k: visual,
+        )
+        offset = proc.run(frames, gyro, search_range_ms=200.0,
+                          initial_offset_ms=50.0)
+        assert offset == pytest.approx(75.0)
+        assert calls == [50.0, -50.0]  # both signs were tried
+
+    def test_initial_offset_inv_skipped_for_tiny_initial(self, monkeypatch):
+        """``|initial| > 1`` gate: a near-zero prior doesn't double the
+        search."""
+        proc = AutosyncProcess(
+            camera_matrix=np.eye(3), fps=30.0, offset_method=0,
+            initial_offset_inv=True,
+        )
+        calls = []
+
+        def fake(of_samples, gyro_samples, **kwargs):
+            calls.append(kwargs["initial_offset_ms"])
+            return None
+
+        monkeypatch.setattr(em, "find_offset_essential_matrix", fake)
+        gyro = [(k * 33_333, np.array([0.0, 10.0, 0.0])) for k in range(40)]
+        visual = [(k * 33_333, np.array([0.0, 10.0, 0.0])) for k in range(30)]
+        frames = [(k * 33_333, np.zeros((8, 8), np.uint8)) for k in range(40)]
+        monkeypatch.setattr(
+            proc._pose_estimator, "get_visual_rotations",
+            lambda **k: visual,
+        )
+        proc.run(frames, gyro, search_range_ms=200.0, initial_offset_ms=0.5)
+        assert calls == [0.5]

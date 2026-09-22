@@ -59,6 +59,8 @@ class AutosyncProcess:
         offset_method: int = 1,
         every_nth_frame: int = 1,
         compute_params=None,
+        calc_initial_fast: bool = False,
+        initial_offset_inv: bool = False,
     ) -> None:
         self._pose_estimator = PoseEstimator()
         self._pose_estimator.set_fps(fps, scaled_fps)
@@ -77,6 +79,12 @@ class AutosyncProcess:
         self._pose_estimator.set_compute_params(compute_params)
 
         self._offset_method = offset_method
+        # SyncParams.calc_initial_fast (rs_sync.rs:15-44): seed the RS search
+        # with an essential-matrix estimate and narrow the window to it.
+        # SyncParams.initial_offset_inv (autosync.rs:223-247): also try the
+        # negated initial offset and keep whichever search does better.
+        self._calc_initial_fast = calc_initial_fast
+        self._initial_offset_inv = initial_offset_inv
         self._fps = fps
         self._scaled_fps = scaled_fps or fps
 
@@ -158,61 +166,39 @@ class AutosyncProcess:
             )
             return None
 
-        # Rolling-shutter-aware per-point search: uses the matched point
-        # pairs retained by the pose estimator plus the gyro quaternion
-        # stream. Falls back to the cross-correlation when unavailable.
-        if self._offset_method == 2 and quaternions:
-            rs_offset = self._rs_sync_offset(
-                frames, quaternions, frame_readout_time_ms, search_range_ms,
-                initial_offset_ms=initial_offset_ms,
-            )
-            if rs_offset is not None:
-                if progress_callback:
-                    progress_callback(1.0)
-                return rs_offset
-            logger.warning(
-                "RS-aware sync produced no result; "
-                "falling back to cross-correlation"
-            )
+        # SyncParams.initial_offset_inv (autosync.rs:223-247): when set and
+        # the initial offset is meaningful, run the search for BOTH signs of
+        # the initial offset and keep whichever does better — more sync
+        # points upstream (the port has one range, so: one that exists beats
+        # one that doesn't, then the lower cost).
+        check_negative = self._initial_offset_inv and abs(initial_offset_ms) > 1.0
 
-        if self._offset_method == 0:
-            offset = self._essential_matrix_offset(
-                visual_rots,
-                gyro_data,
-                search_range_ms=search_range_ms,
-                initial_offset_ms=initial_offset_ms,
-                progress_callback=(
-                    (lambda p: progress_callback(0.6 + 0.4 * p))
-                    if progress_callback
-                    else None
-                ),
+        offset, cost = self._offset_dispatch(
+            visual_rots, gyro_data, frames, quaternions, frame_readout_time_ms,
+            search_range_ms, initial_offset_ms, progress_callback,
+        )
+        if check_negative:
+            neg_offset, neg_cost = self._offset_dispatch(
+                visual_rots, gyro_data, frames, quaternions,
+                frame_readout_time_ms, search_range_ms, -initial_offset_ms,
+                progress_callback,
             )
-            if offset is not None:
-                if progress_callback:
-                    progress_callback(1.0)
-                return offset
-            logger.warning(
-                "Offset method 0 (essential matrix) produced no result; "
-                "falling back to signal cross-correlation"
-            )
+            if neg_offset is not None:
+                if offset is None:
+                    offset, cost = neg_offset, neg_cost
+                elif neg_cost is not None and cost is not None and neg_cost < cost:
+                    offset, cost = neg_offset, neg_cost
 
-        if self._offset_method == 1:
-            offset = self._visual_features_offset(
-                search_range_ms=search_range_ms,
-                initial_offset_ms=initial_offset_ms,
-                progress_callback=(
-                    (lambda p: progress_callback(0.6 + 0.4 * p))
-                    if progress_callback
-                    else None
-                ),
-            )
-            if offset is not None:
-                if progress_callback:
-                    progress_callback(1.0)
-                return offset
+        if offset is not None:
+            if progress_callback:
+                progress_callback(1.0)
+            return offset
+        if check_negative:
+            # The dispatch already logged per-method fallbacks; a failed
+            # ±-trial pair is worth one line of its own.
             logger.warning(
-                "Offset method 1 (visual features) produced no result; "
-                "falling back to signal cross-correlation"
+                "Both ±initial-offset trials produced no result "
+                "(initial %.2f ms)", initial_offset_ms,
             )
 
         from pygyroflow.synchronization.find_offset import find_time_offset
@@ -234,6 +220,57 @@ class AutosyncProcess:
             progress_callback(1.0)
 
         return offset
+
+    def _offset_dispatch(
+        self,
+        visual_rots: list[tuple[int, np.ndarray]],
+        gyro_data: list[tuple[int, np.ndarray]],
+        frames,
+        quaternions: dict | None,
+        frame_readout_time_ms: float,
+        search_range_ms: float,
+        initial_offset_ms: float,
+        progress_callback: Callable[[float], None] | None,
+    ) -> tuple[float | None, float | None]:
+        """Run the configured offset search once (``estimator.find_offsets``,
+        synchronization/mod.rs:384-386). Returns ``(offset, cost)`` — cost
+        may be None for searches that don't expose one — or ``(None, None)``
+        when the method produced nothing; the correlation fallback stays in
+        ``run`` so the ±-trial wrapper can wrap exactly one dispatch."""
+        # Rolling-shutter-aware per-point search: uses the matched point
+        # pairs retained by the pose estimator plus the gyro quaternion
+        # stream. Falls back to the cross-correlation when unavailable.
+        if self._offset_method == 2 and quaternions:
+            rs_offset = self._rs_sync_offset(
+                frames, quaternions, frame_readout_time_ms, search_range_ms,
+                initial_offset_ms=initial_offset_ms,
+                visual_rots=visual_rots, gyro_data=gyro_data,
+            )
+            if rs_offset is not None:
+                return rs_offset
+            logger.warning(
+                "RS-aware sync produced no result; "
+                "falling back to cross-correlation"
+            )
+
+        if self._offset_method == 0:
+            result = self._essential_matrix_offset(
+                visual_rots,
+                gyro_data,
+                search_range_ms=search_range_ms,
+                initial_offset_ms=initial_offset_ms,
+                progress_callback=progress_callback,
+            )
+            return result if result is not None else (None, None)
+
+        if self._offset_method == 1:
+            offset = self._visual_features_offset(
+                search_range_ms=search_range_ms,
+                initial_offset_ms=initial_offset_ms,
+                progress_callback=progress_callback,
+            )
+            return offset, None
+        return None, None
 
     def _essential_matrix_offset(
         self,
@@ -275,8 +312,7 @@ class AutosyncProcess:
         )
         if result is None:
             return None
-        offset_ms, _cost = result
-        return offset_ms
+        return result
 
     def _visual_features_offset(
         self,
@@ -337,16 +373,40 @@ class AutosyncProcess:
         frame_readout_time_ms: float,
         search_range_ms: float,
         initial_offset_ms: float = 0.0,
-    ) -> float | None:
+        visual_rots: list[tuple[int, np.ndarray]] | None = None,
+        gyro_data: list[tuple[int, np.ndarray]] | None = None,
+    ) -> tuple[float, float] | None:
         """Run the rolling-shutter-aware offset search.
 
         Builds ``RollingShutterSync`` tracks from the pose estimator's
         retained point pairs and runs the coarse-to-fine per-point
-        quaternion error minimization. Returns the offset in the
+        quaternion error minimization. Returns ``(offset, cost)`` in the
         ``visual = gyro + offset`` convention (sign-flipped from the
         internal delay), or None when there is not enough data.
+
+        With ``calc_initial_fast`` set (``rs_sync.rs:15-44``) the search is
+        seeded first with the essential-matrix estimate: the median of its
+        offsets becomes the initial offset and the window widens to
+        ±3000 ms around it — upstream's fast start, which trades a cheap
+        pre-pass for a much narrower RS search.
         """
         from pygyroflow.synchronization.find_offset.rs_sync import RollingShutterSync
+
+        if self._calc_initial_fast and visual_rots and gyro_data:
+            seeded = self._essential_matrix_offset(
+                visual_rots, gyro_data,
+                search_range_ms=search_range_ms,
+                initial_offset_ms=initial_offset_ms,
+            )
+            if seeded is not None:
+                # Upstream sets search_size = 3000.0 unconditionally — even
+                # if that *widens* a smaller user window.
+                initial_offset_ms, _seed_cost = seeded
+                search_range_ms = 6000.0
+                logger.info(
+                    "Fast start: essential-matrix offset %.2f ms, "
+                    "RS window ±3000 ms", initial_offset_ms,
+                )
 
         ordered = sorted(
             self._pose_estimator.get_frame_results().values(),
@@ -444,7 +504,7 @@ class AutosyncProcess:
         # correspondence is late by half of it. Dropping this term (as this
         # did) biases every synced offset by a constant readout/2 — tens of
         # ms on a slow sensor.
-        return -delay_ms - frame_readout_time_ms / 2.0
+        return -delay_ms - frame_readout_time_ms / 2.0, cost
 
     def _pose_estimator_camera_matrix(self) -> np.ndarray | None:
         """Camera matrix set on the pose estimator (None if identity)."""

@@ -113,7 +113,7 @@ class TestRsSyncOffsetArithmetic:
             self.curr_points = np.ones((n, 2), np.float32)
 
     @staticmethod
-    def _proc(delay_ms, *, cost=1.0, neighbour_cost=100.0):
+    def _proc(delay_ms, monkeypatch, *, cost=1.0, neighbour_cost=100.0):
         """An AutosyncProcess whose RS search returns *delay_ms* verbatim."""
         from pygyroflow.synchronization import autosync as mod
         from pygyroflow.synchronization.find_offset import rs_sync as rs_mod
@@ -141,49 +141,55 @@ class TestRsSyncOffsetArithmetic:
                 for i in range(6)
             }},
         )()
-        rs_mod.RollingShutterSync = _StubRs
+        # monkeypatch, not a bare assignment: the stub must not leak into
+        # other test modules' RS paths (it used to poison test_e2e when the
+        # battery order put this file first).
+        monkeypatch.setattr(rs_mod, "RollingShutterSync", _StubRs)
         return proc
 
     def _frames(self, n=6):
         return [(i * 33_000, np.zeros((64, 64), np.uint8)) for i in range(n)]
 
-    def test_readout_half_is_subtracted(self):
-        proc = self._proc(delay_ms=10.0)
-        offset = proc._rs_sync_offset(
+    def test_readout_half_is_subtracted(self, monkeypatch):
+        proc = self._proc(delay_ms=10.0, monkeypatch=monkeypatch)
+        offset, cost = proc._rs_sync_offset(
             self._frames(), {}, frame_readout_time_ms=14.0, search_range_ms=500.0
         )
         assert offset == pytest.approx(-10.0 - 7.0)
+        assert cost == pytest.approx(cost)
 
-    def test_global_shutter_is_plain_negation(self):
-        proc = self._proc(delay_ms=10.0)
-        offset = proc._rs_sync_offset(
+    def test_global_shutter_is_plain_negation(self, monkeypatch):
+        proc = self._proc(delay_ms=10.0, monkeypatch=monkeypatch)
+        offset, _cost = proc._rs_sync_offset(
             self._frames(), {}, frame_readout_time_ms=0.0, search_range_ms=500.0
         )
         assert offset == pytest.approx(-10.0)
 
-    def test_offset_near_the_search_limit_is_rejected(self):
+    def test_offset_near_the_search_limit_is_rejected(self, monkeypatch):
         """|delay - initial| >= 90% of the radius is the window edge, not a match."""
-        proc = self._proc(delay_ms=240.0)  # radius 250 -> limit 225
+        proc = self._proc(delay_ms=240.0, monkeypatch=monkeypatch)  # radius 250 -> limit 225
         assert proc._rs_sync_offset(
             self._frames(), {}, frame_readout_time_ms=0.0, search_range_ms=500.0
         ) is None
 
-    def test_offset_inside_the_limit_is_accepted(self):
-        proc = self._proc(delay_ms=200.0)  # < 225
-        assert proc._rs_sync_offset(
+    def test_offset_inside_the_limit_is_accepted(self, monkeypatch):
+        proc = self._proc(delay_ms=200.0, monkeypatch=monkeypatch)  # < 225
+        offset, _cost = proc._rs_sync_offset(
             self._frames(), {}, frame_readout_time_ms=0.0, search_range_ms=500.0
-        ) == pytest.approx(-200.0)
+        )
+        assert offset == pytest.approx(-200.0)
 
-    def test_initial_offset_shifts_the_acceptance_window(self):
+    def test_initial_offset_shifts_the_acceptance_window(self, monkeypatch):
         """The guard measures distance from the initial guess, not from zero."""
-        proc = self._proc(delay_ms=300.0)
+        proc = self._proc(delay_ms=300.0, monkeypatch=monkeypatch)
         # initial_offset 100 -> initial_delay -100 -> |300 - (-100)| = 400 > 225
         assert proc._rs_sync_offset(
             self._frames(), {}, frame_readout_time_ms=0.0,
             search_range_ms=500.0, initial_offset_ms=100.0,
         ) is None
         # initial_offset -300 -> initial_delay 300 -> distance 0
-        assert proc._rs_sync_offset(
+        offset, _cost = proc._rs_sync_offset(
             self._frames(), {}, frame_readout_time_ms=0.0,
             search_range_ms=500.0, initial_offset_ms=-300.0,
-        ) == pytest.approx(-300.0)
+        )
+        assert offset == pytest.approx(-300.0)
