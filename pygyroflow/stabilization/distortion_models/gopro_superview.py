@@ -241,5 +241,16 @@ fn digital_distort_point(_uv: vec2<f32>) -> vec2<f32> {
 """
         )
 
+    def adjust_lens_profile(self, profile) -> None:
+        """``gopro_superview.rs:59-65``: a 4:3 calibration was authored on
+        the cropped pixels — widen it back. ``lens_model`` is renamed
+        unconditionally, aspect matching or not."""
+        aspect = int(profile.calib_dimension["w"] / profile.calib_dimension["h"] * 100.0)
+        if aspect == 133:  # It's 4:3
+            profile.calib_dimension["w"] = round(
+                profile.calib_dimension["w"] * 1.3333333333333
+            )
+        profile.lens_model = "Superview"
+
     def id(self) -> str:
         return "gopro_superview"

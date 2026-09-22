@@ -239,6 +239,17 @@ class LensProfile:
         if "checksum" in data and data["checksum"] is not None:
             p.checksum = str(data["checksum"])
 
+        # The digital lens fixes the profile up at load time (upstream
+        # resolve_interpolations, lens_profile_database.rs:202 — every
+        # profile parsed from the database passes through it): Superview /
+        # Hyperview widen a calibration authored on cropped or squeezed
+        # pixels back to the sensor's real geometry. No digital_lens means
+        # every model's adjust is the no-op default, so this is free.
+        if p.digital_lens:
+            from pygyroflow.stabilization.distortion_models import from_name
+
+            from_name(p.digital_lens).adjust_lens_profile(p)
+
         return p
 
     def get_json_value(self) -> dict[str, Any]:

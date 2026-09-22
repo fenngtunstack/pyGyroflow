@@ -203,5 +203,15 @@ fn digital_distort_point(_uv: vec2<f32>) -> vec2<f32> {
 }
 """
 
+    def adjust_lens_profile(self, profile) -> None:
+        """``gopro6_superview.rs:53-59``: same 4:3 widening as Superview,
+        same unconditional ``lens_model`` rename."""
+        aspect = int(profile.calib_dimension["w"] / profile.calib_dimension["h"] * 100.0)
+        if aspect == 133:  # It's 4:3
+            profile.calib_dimension["w"] = round(
+                profile.calib_dimension["w"] * 1.3333333333333
+            )
+        profile.lens_model = "Superview"
+
     def id(self) -> str:
         return "gopro6_superview"

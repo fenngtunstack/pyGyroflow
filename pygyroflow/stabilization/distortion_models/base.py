@@ -79,6 +79,18 @@ class DistortionModelBase(ABC):
         """Return the distortion model identifier string."""
         ...
 
+    def adjust_lens_profile(self, profile) -> None:
+        """Fix up a lens profile at load time for this digital lens.
+
+        Port of the ``adjust_lens_profile`` the upstream macro generates for
+        every model (distortion_models/mod.rs:43-47). Most models never touch
+        the profile; the GoPro digital lenses widen a 4:3 (Superview) or 8:7
+        (Hyperview) calibration width back to what the sensor captured and
+        rename ``lens_model`` — a profile authored against the *cropped*
+        pixels otherwise stays cropped, and every FOV computed from it is
+        wrong. Not abstract: the no-op is the default on purpose.
+        """
+
     # -- vectorized batch variants ----------------------------------------
 
     def distort_points(

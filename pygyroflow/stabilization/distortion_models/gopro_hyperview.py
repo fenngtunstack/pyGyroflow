@@ -311,5 +311,16 @@ fn digital_distort_point(_uv: vec2<f32>) -> vec2<f32> {
 """
         )
 
+    def adjust_lens_profile(self, profile) -> None:
+        """``gopro_hyperview.rs:57-63``: an 8:7 calibration was authored on
+        the squeezed pixels — widen it back. ``lens_model`` is renamed
+        unconditionally, aspect matching or not."""
+        aspect = int(profile.calib_dimension["w"] / profile.calib_dimension["h"] * 100.0)
+        if aspect == 114:  # It's 8:7
+            profile.calib_dimension["w"] = round(
+                profile.calib_dimension["w"] * 1.55555555555
+            )
+        profile.lens_model = "Hyperview"
+
     def id(self) -> str:
         return "gopro_hyperview"
