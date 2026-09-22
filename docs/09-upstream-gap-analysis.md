@@ -147,7 +147,7 @@ kernel_params.interpolation = 2   # 注释写 "Bilinear"
 
 ---
 
-### G-06 [实测] ~~STMap 的 redistort 图没有畸变模型~~ 已修（`bcc927b`，图本体）；可达性（render_queue 的 stmap job）仍属 C-12
+### G-06 [实测] ~~STMap 的 redistort 图没有畸变模型~~ 已修（`bcc927b`，图本体）；~~可达性（render_queue 的 stmap job）~~ 已接通（`9dc14ab`）—— **G-06 关闭**
 
 `pygyroflow/stmap/exporter.py:225-236` 是逐像素 Python 双重循环，只把 `matrices[0]` 的 3×3 求逆。注释自认 "simplified approach"。
 
@@ -410,6 +410,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | GCSV 格式 + sidecar 回退（A-02 文本半 / A-03） | `c69ec94` | 12 项测试：魔术行、缩放除数语义（gscale 另乘 π/180）、读出方向六码含 ±10000 哨兵、磁力计 Gauss→μT、lensprofile 头、tscale 时机、空 mp4 回退、扩展名优先级、直接入口、非 gcsv 文本仍拒。测试首版把扩展头写在 t 行之后被判数据行——顺序语义反向钉住 |
 | get_checksum 补全 + find_bias 偏移平移（A-11/A-12） | `ff986ee` | 6 项测试：image_orientations 计数入哈希、四类参数各自移动校验和、+50ms 偏移下窗口只含首样本（set_offset 而非裸写——offsets_adjusted 才是查询源，教训入测试注释）、严格边界 |
 | adjust_offsets RANSAC 式共识（A-13） | `15af508` | 8 项测试：离群点不拖漂移且被外推（上游关键性质）、|slope|≥0.1 的真漂移回落朴素拟合、单点直通、adjusted 键平移 |
+| render_queue 的 ST-map job 接通（G-06 可达性） | `9dc14ab` | 3 项测试：默认 undistort 单图、both 双图、EXR 真图（尺寸=剪辑、可开）。C-12 其余（并行/取消/持久化/when_done）仍缺 |
 | A-08 改判：converter 公式恒等 | `e33501b` | 群逆律等价性 9 项测试（8 随机位形 6.6e-15° + X²≠I 非平凡性守卫）。**改公式后数值证伪回滚的过程保留在提交历史**——这是本表第二处初稿结论被推翻（第一处 B-23） |
 | 档案 crc32 校验和（C-17 一块） | `36f9a1e` | 6 项测试：格式串逐字节对照（Rust :.8 与 Python :.8f 一致）、缺系数补零、无矩阵保持 None、预设路径 crc32、收藏优先搜索命中。顺带修复 heredoc 事故：database.py 类尾方法被吞进模块级函数体，AST 定位后重组（全量测试过） |
 | settings 文件驱动 CLI 默认（C-10） | `71f7308` | 4 项测试：文件默认生效、显式旗标覆盖、坏文件静默不崩、sync_params 到达 synchronize。GUI 态键（窗口布局等）无 CLI 对应物，表里写明不再逐一映射 |
