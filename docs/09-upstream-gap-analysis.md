@@ -306,7 +306,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-14 | R | **manager setter 面**：上游约 45 个 `set_*`，我们 10 个。功能性缺失：`frame_readout_direction`/`additional_rotation`/`additional_translation`/`zooming_method`/`max_zoom`/`video_speed`/`digital_lens`/背景全套/IMU 变换全套 —— 24 个缺口已补（`b6ba695`：stab_enabled/video_speed/max_zoom/frame_offset/readout_direction/additional 全家/拉伸/光折射/背景全套/horizon_lock/zooming_method/of_method/debug overlay/digital_lens 双 setter 落镜头档案）；IMU 变换全套也已补（`76c28a0`：六 setter + recompute_gyro，setter 只写、显式重算——上游语义）—— **C-14 至此关闭** | [报告] |
 | C-15 | R | **`util.rs` 辅助缺失**：`get_video_metadata`（扩展名白名单）、base91+zlib 编解码（**工程文件陀螺载荷用**）、`MapClosest::get_closest`（100ms 容差就近取）、`merge_json`（镜头库 sync_settings 合并）、`map_coord`。`util.py` 只有 `timestamp_at_frame`/`frame_at_timestamp` —— base91+zlib/MapClosest/map_coord 已在前批落地；`merge_json` 与扩展名白名单补齐（`e2b929f`）；`get_video_metadata` 本体（容器探测）在移植侧由 PyAV open 承担，不再单列 | [实测] |
 | C-16 | R | **`LensProfile` 保存/命名/校验缺失**，且 `get_all_matching_profiles`（`lens/profile.py:430-523`）**把 `sync_settings` 覆盖整个丢掉**——其余 20 项覆盖都移植对了 —— sync_settings 叠加已补（`126f7db`：merge_json 键级合并 + custom_sync_pattern 先删后并）；保存/命名/校验仍缺 | [报告] |
-| C-17 | D | 镜头库 `_insert`（`lens/database.py:374-381`）不算 crc32 校验和；无收藏/评分/去重；`search` 无"交换长宽比优先级"。别名表（gopro5-13/bmpcc/a7x/session5）逐条一致 | [报告] |
+| C-17 | D | 镜头库 `_insert`（`lens/database.py:374-381`）不算 crc32 校验和；无收藏/评分/去重；`search` 无"交换长宽比优先级"。别名表（gopro5-13/bmpcc/a7x/session5）逐条一致 —— **crc32 已补**（`36f9a1e`：.gyroflow = 路径 crc32（rs:81）、JSON 档案 = 八位小数格式串 crc32（rs:112-130），收藏优先搜索闭环——此前按 checksum 匹配但加载侧从不赋值，实为死路）；评分/去重/长宽比交换仍缺 | [报告] |
 
 ### D. stabilization 核心
 
@@ -407,6 +407,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | **D-06 参照**：`undistort_points` 对上游 Rust 逐值比对 | `6b7b84e` | `cpu_undistort.rs:649-803` 逐字节切出、`distortion_models/` 与 `gyro_source/splines.rs` 整流原样复制，编译后跑 26 用例 304 个坐标值，全部落在 3.7e-7 相对误差内（f32 vs f64 的本底）。**这一步查出上面三条缺陷**，其中两条结构性测试按构造就测不到。参照工程不入库，`generate_undistort_points_reference.py --stage` 现场从只读的 `opensource/gyroflow/` 抽取，所以不存在第二份会漂的副本 |
 | CPU 采样器消费 input_rotation（D-13） | `5e1b3be` | 7 项测试。90/180 度坐标映射按手算值比对（绕中心旋转，非角对称——首版测试在此翻过车）、零旋转恒等、fringe clamp 用旋转宽度、背景 clamp 天花板用未旋转宽度（1079 不被压到 1077，怪癖专测）、at_timestamp 打包两向、梯度帧端到端逐像素值 |
 | rs-sync 优化器 crate 移植 + 桥接（B-04） | `8ff80fa` + `00b6478` | 25 项模块测试 + 桥接后 e2e。梯度链（运动/延迟）对有限差分 <1e-5；端到端正弦场景恢复 −50 ms、代价 ~1e-6、残差景观真值处单点凹陷（**恒定角速度对该残差退化**——θ(t₁)+θ(t₂) 平移不变，须非线性 pan，记入测试 docstring）；向量化与标量路径 max diff 0.0（手展开公式在 y 分量翻过车，旋转轴对齐时差异项恰好消失——教训在提交信息）；e2e 实测 +191.6/200 ms |
+| 档案 crc32 校验和（C-17 一块） | `36f9a1e` | 6 项测试：格式串逐字节对照（Rust :.8 与 Python :.8f 一致）、缺系数补零、无矩阵保持 None、预设路径 crc32、收藏优先搜索命中。顺带修复 heredoc 事故：database.py 类尾方法被吞进模块级函数体，AST 定位后重组（全量测试过） |
 | settings 文件驱动 CLI 默认（C-10） | `71f7308` | 4 项测试：文件默认生效、显式旗标覆盖、坏文件静默不崩、sync_params 到达 synchronize。GUI 态键（窗口布局等）无 CLI 对应物，表里写明不再逐一映射 |
 | IMU 变换 setter 全套 + recompute_gyro（C-14 收尾） | `76c28a0` | 4 项测试：双滤波、双旋转、朝向零偏写入 IMUTransforms，recompute 应用且 compute_id 前移 |
 | manager setter 面 24 个缺口（C-14 主体） | `b6ba695` | 17 项测试：逐 setter 落点、分量 setter 组合、背景 float32、horizon >0.01 启用门、数码镜头三态（None 首写默认零、越界忽略）、失效 ID 单调与缩放校验和清零。digital_lens 按 upstream 落镜头档案非 params |
