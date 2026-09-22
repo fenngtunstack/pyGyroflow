@@ -304,7 +304,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-12 | R | **RenderQueue 是骨架**。上游 1740 行（并行渲染、暂停/取消、队列持久化、preset 批量、渲染前 autosync、缩略图、when_done）；我们 227 行顺序执行，export 类 job 只 `json.dump` options，stmap job 抛 `NotImplementedError` | [报告] |
 | C-13 | R | `compute_distort_map` 无畸变模型（见 G-06） —— 已修（`bcc927b`）：整网格喂 undistort_points_with_rolling_shutter（use_fovs=true、全额校正，逐行旋转由点族内部处理），未收敛点归零 | [实测] |
 | C-14 | R | **manager setter 面**：上游约 45 个 `set_*`，我们 10 个。功能性缺失：`frame_readout_direction`/`additional_rotation`/`additional_translation`/`zooming_method`/`max_zoom`/`video_speed`/`digital_lens`/背景全套/IMU 变换全套 | [报告] |
-| C-15 | R | **`util.rs` 辅助缺失**：`get_video_metadata`（扩展名白名单）、base91+zlib 编解码（**工程文件陀螺载荷用**）、`MapClosest::get_closest`（100ms 容差就近取）、`merge_json`（镜头库 sync_settings 合并）、`map_coord`。`util.py` 只有 `timestamp_at_frame`/`frame_at_timestamp` | [实测] |
+| C-15 | R | **`util.rs` 辅助缺失**：`get_video_metadata`（扩展名白名单）、base91+zlib 编解码（**工程文件陀螺载荷用**）、`MapClosest::get_closest`（100ms 容差就近取）、`merge_json`（镜头库 sync_settings 合并）、`map_coord`。`util.py` 只有 `timestamp_at_frame`/`frame_at_timestamp` —— base91+zlib/MapClosest/map_coord 已在前批落地；`merge_json` 与扩展名白名单补齐（`e2b929f`）；`get_video_metadata` 本体（容器探测）在移植侧由 PyAV open 承担，不再单列 | [实测] |
 | C-16 | R | **`LensProfile` 保存/命名/校验缺失**，且 `get_all_matching_profiles`（`lens/profile.py:430-523`）**把 `sync_settings` 覆盖整个丢掉**——其余 20 项覆盖都移植对了 | [报告] |
 | C-17 | D | 镜头库 `_insert`（`lens/database.py:374-381`）不算 crc32 校验和；无收藏/评分/去重；`search` 无"交换长宽比优先级"。别名表（gopro5-13/bmpcc/a7x/session5）逐条一致 | [报告] |
 
