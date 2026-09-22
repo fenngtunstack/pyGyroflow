@@ -452,6 +452,48 @@ def map_coord(x, in_min, in_max, out_min, out_max):
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
 
 
+def offset_at_timestamp(offsets: dict, timestamp_ms: float) -> float:
+    """Interpolate a sync-offset curve at *timestamp_ms*.
+
+    Upstream's ``GyroSource::offset_at_timestamp`` (gyro_source/mod.rs). Both
+    the gyro source and the keyframe manager apply it — the keyframe side
+    adds the offset before its video-time lookup, so keyframed values move
+    with the footage once an auto-sync offset is known. Lives here (Layer 0)
+    because both Layer-1 consumers need it and neither may import the other.
+
+    Interpolates with the CLAMPED lookup time — the raw timestamp would
+    extrapolate without bound past the last sync point.
+    """
+    import bisect
+
+    if not offsets:
+        return 0.0
+
+    keys = sorted(offsets.keys())
+    if len(keys) == 1:
+        return offsets[keys[0]]
+
+    timestamp_us = round(timestamp_ms * 1000.0)
+    lookup_us = max(keys[0] + 1, min(keys[-1] - 1, timestamp_us))
+
+    idx = bisect.bisect_right(keys, lookup_us) - 1
+    if idx < 0:
+        idx = 0
+
+    if keys[idx] == lookup_us:
+        return offsets[keys[idx]]
+
+    if idx + 1 < len(keys):
+        t0, t1 = keys[idx], keys[idx + 1]
+        time_delta = t1 - t0
+        if time_delta == 0:
+            return offsets[t0]
+        fract = (lookup_us - t0) / time_delta
+        return offsets[t0] + (offsets[t1] - offsets[t0]) * fract
+
+    return 0.0
+
+
 def timestamp_at_frame(frame: int, fps: float) -> float:
     """Convert frame index to timestamp in milliseconds.
 

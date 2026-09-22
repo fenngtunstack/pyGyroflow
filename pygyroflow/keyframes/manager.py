@@ -54,6 +54,20 @@ class KeyframeManager:
         # Timestamp scale factor (maps video time to keyframe time)
         self.timestamp_scale: Optional[float] = None
 
+        # Sync offsets, mirrored from the gyro source whenever it changes
+        # (upstream ``KeyframeManager.gyro_offsets``, kept in sync by
+        # ``GyroFlow::set_offset`` & co calling ``update_gyro``). Timestamps
+        # in microseconds, offsets in milliseconds.
+        self.gyro_offsets: dict[int, float] = {}
+
+    def update_gyro(self, offsets: dict[int, float]) -> None:
+        """Mirror the gyro source's sync offsets (``keyframes.rs:218-220``).
+
+        Takes the offsets dict itself (``GyroSource.get_offsets()`` returns a
+        copy) so the keyframe manager stays decoupled from the gyro source.
+        """
+        self.gyro_offsets = dict(offsets)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -304,10 +318,15 @@ class KeyframeManager:
     ) -> Optional[float]:
         """Get interpolated value at a gyro timestamp (milliseconds).
 
-        In Rust, this applies gyro offset before calling value_at_video_timestamp.
-        The Python version currently delegates directly without offset,
-        since gyro offset handling is not yet implemented.
+        Port of ``keyframes.rs:204-208``: the query lands on the *video*
+        timeline by way of the sync offset at that instant — once an
+        auto-sync offset is known, a keyframed value looked up on the gyro
+        timeline must move with the footage, or every smoothed sample reads
+        the keyframe curve shifted by the whole sync error.
         """
+        from pygyroflow.util import offset_at_timestamp
+
+        timestamp_ms += offset_at_timestamp(self.gyro_offsets, timestamp_ms)
         return self.value_at_video_timestamp(key, timestamp_ms)
 
     # ------------------------------------------------------------------
@@ -422,6 +441,7 @@ class KeyframeManager:
         self._timestamps.clear()
         self._custom_provider = None
         self.timestamp_scale = None
+        self.gyro_offsets = {}
 
     def clear_type(self, key: KeyframeType) -> None:
         """Remove all keyframes of a specific type."""
@@ -440,14 +460,25 @@ class KeyframeManager:
                 str(ts): {"id": kf.id, "value": kf.value, "easing": kf.easing.value}
                 for ts, kf in kfs.items()
             }
+        # Upstream's serde derives include gyro_offsets (keyframes.rs:79).
+        if self.gyro_offsets:
+            result["gyro_offsets"] = {
+                str(ts): off for ts, off in self.gyro_offsets.items()
+            }
         return result
 
     def deserialize(self, data: dict) -> None:
         """Deserialize keyframes from a dict, replacing current state."""
         self._keyframes.clear()
         self._timestamps.clear()
+        self.gyro_offsets = {}
 
         for type_name, ts_map in data.items():
+            if type_name == "gyro_offsets":
+                self.gyro_offsets = {
+                    int(ts): float(off) for ts, off in ts_map.items()
+                }
+                continue
             try:
                 key = KeyframeType[type_name]
             except KeyError:

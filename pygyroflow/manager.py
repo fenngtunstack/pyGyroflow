@@ -428,6 +428,10 @@ class StabilizationManager:
                 self.gyro.integration_method = int(gyro_src["integration_method"])
 
         self.gyro.set_offsets({int(k): float(v) for k, v in proj.offsets.items()})
+        # Project load replaces the offset curve wholesale — the keyframe
+        # manager's mirror has to follow (upstream's set_offset wrappers do
+        # this on every mutation).
+        self.keyframes.update_gyro(self.gyro.get_offsets())
 
         # float32 ndarray, not a tuple: `_build_compute_params` copies it with
         # `.copy()`, which a tuple does not have.
@@ -1280,6 +1284,31 @@ class StabilizationManager:
     # Synchronization
     # ------------------------------------------------------------------
 
+    def set_gyro_offset(self, timestamp_us: int, offset_ms: float) -> None:
+        """Set a sync offset and mirror it into the keyframe manager.
+
+        Upstream's ``GyroFlow::set_offset`` (lib.rs:1066-1070): the gyro
+        source is mutated, then ``keyframes.update_gyro`` re-mirrors the
+        offset curve — without that mirror, keyframed values queried on the
+        gyro timeline (all the smoothing-path lookups) keep reading the
+        pre-sync timeline.
+        """
+        self.gyro.set_offset(timestamp_us, offset_ms)
+        self.keyframes.update_gyro(self.gyro.get_offsets())
+        self._invalidate_zooming()
+
+    def remove_gyro_offset(self, timestamp_us: int) -> None:
+        """Remove a sync offset and mirror it into the keyframe manager."""
+        self.gyro.remove_offset(timestamp_us)
+        self.keyframes.update_gyro(self.gyro.get_offsets())
+        self._invalidate_zooming()
+
+    def clear_gyro_offsets(self) -> None:
+        """Clear all sync offsets and mirror that into the keyframe manager."""
+        self.gyro.clear_offsets()
+        self.keyframes.update_gyro(self.gyro.get_offsets())
+        self._invalidate_zooming()
+
     def synchronize(
         self,
         input_path: str | None = None,
@@ -1425,7 +1454,7 @@ class StabilizationManager:
             else:
                 return None
 
-        self.gyro.set_offset(0, float(offset))
+        self.set_gyro_offset(0, float(offset))
         log.info("Auto-sync offset: %.2f ms", offset)
 
         # Multi-point refinement (upstream auto_sync_points / max_sync_points):
@@ -1437,7 +1466,11 @@ class StabilizationManager:
             frame_readout_time_ms=self.params.frame_readout_time,
         )
         if len(points) >= 2:
+            # set_offsets is the gyro source's bulk replace; mirror the curve
+            # into the keyframe manager the same way set_gyro_offset does.
             self.gyro.set_offsets(points)
+            self.keyframes.update_gyro(self.gyro.get_offsets())
+            self._invalidate_zooming()
             vals = [points[k] for k in sorted(points)]
             log.info(
                 "Auto-sync: %d sync points, %.1f..%.1f ms (span %.1f ms)",

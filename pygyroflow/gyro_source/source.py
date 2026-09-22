@@ -390,36 +390,13 @@ class GyroSource:
 
         Shared by GyroSource lookups and the stabilization layer
         (frame_transform applies the same correction to quaternion
-        lookups, mirroring Gyroflow's ``quat_at_timestamp``).
+        lookups, mirroring Gyroflow's ``quat_at_timestamp``). The
+        implementation lives in :mod:`pygyroflow.util` so the keyframe
+        manager can use it too without a Layer-1 cross-dependency.
         """
-        if not offsets:
-            return 0.0
+        from pygyroflow.util import offset_at_timestamp as _offset_at_timestamp
 
-        keys = sorted(offsets.keys())
-        if len(keys) == 1:
-            return offsets[keys[0]]
-
-        timestamp_us = round(timestamp_ms * 1000.0)
-        lookup_us = max(keys[0] + 1, min(keys[-1] - 1, timestamp_us))
-
-        idx = bisect.bisect_right(keys, lookup_us) - 1
-        if idx < 0:
-            idx = 0
-
-        if keys[idx] == lookup_us:
-            return offsets[keys[idx]]
-
-        if idx + 1 < len(keys):
-            t0, t1 = keys[idx], keys[idx + 1]
-            time_delta = t1 - t0
-            if time_delta == 0:
-                return offsets[t0]
-            # interpolate with the CLAMPED lookup time — the raw timestamp
-            # would extrapolate without bound past the last sync point
-            fract = (lookup_us - t0) / time_delta
-            return offsets[t0] + (offsets[t1] - offsets[t0]) * fract
-
-        return 0.0
+        return _offset_at_timestamp(offsets, timestamp_ms)
 
     def _adjust_offsets(self) -> None:
         """Recalculate linear fit and adjusted offsets.
