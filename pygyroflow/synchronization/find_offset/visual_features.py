@@ -78,8 +78,8 @@ def find_offset_visual_features(
     """Find the time offset that best explains the optical flow with the gyro.
 
     Port of ``visual_features.rs::find_offsets`` (the ``for_rs = false``
-    branch; the ``for_rs`` rolling-shutter estimator is a GUI-side method the
-    port does not have — the port's RS sync is ``rs_sync``, offset method 2).
+    branch; the ``for_rs`` rolling-shutter estimator lives in
+    :func:`estimate_rolling_shutter`).
 
     Parameters
     ----------
@@ -264,3 +264,52 @@ def find_offset_visual_features_correlation_fallback(
         best_offset, best_corr,
     )
     return float(best_offset)
+
+
+def estimate_rolling_shutter(
+    matched_pairs,
+    params,
+    fps: float,
+) -> tuple[float, float] | None:
+    """Estimate the sensor's rolling-shutter readout time (``for_rs``).
+
+    Port of ``visual_features.rs:87-110`` (the branch upstream's
+    ``estimate_rolling_shutter`` autosync mode drives): instead of shifting
+    the gyro timeline, every candidate is a *readout time* -- the per-point
+    rolling-shutter model inside ``undistort_points_with_rolling_shutter``
+    reads ``params.frame_readout_time``, so each candidate swaps that field
+    on a private copy and measures the same point-pair distance at zero
+    offset. The sweep runs +/-(1000/fps) in 1 ms steps, then +/-1 ms around
+    the winner at 0.01 ms.
+
+    Returns ``(readout_ms, cost)`` or ``None`` with no data.
+    """
+    if not len(matched_pairs):
+        logger.warning("Rolling-shutter estimate: no point pairs")
+        return None
+
+    import dataclasses
+
+    w, h = float(params.width), float(params.height)
+
+    def distance_at(rs_ms: float) -> float:
+        candidate = dataclasses.replace(params, frame_readout_time=rs_ms)
+        return _total_distance(matched_pairs, candidate, 0.0, w, h)
+
+    max_rs = 1000.0 / fps if fps > 0 else 33.0
+    steps = int(max_rs)
+    best_rs = 0.0
+    best_cost = float("inf")
+    for i in range(-steps, steps):
+        cost = distance_at(float(i))
+        if cost < best_cost:
+            best_cost, best_rs = cost, float(i)
+
+    for i in range(200):
+        rs = best_rs - 1.0 + i * 0.01
+        cost = distance_at(rs)
+        if cost < best_cost:
+            best_cost, best_rs = cost, rs
+
+    logger.debug("rolling shutter estimate: %.2f ms (cost %.1f)", best_rs, best_cost)
+    return best_rs, best_cost
