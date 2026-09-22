@@ -2,9 +2,10 @@
 
 Upstream's offset methods (``synchronization/mod.rs:384-386``):
 
-* ``0`` ``essential_matrix`` -- point pairs + essential matrices per
-  offset candidate. **Not ported**; the signal-level shim below runs the
-  correlation fallback for this index.
+* ``0`` ``essential_matrix`` -- the pose estimator's angular velocity vs
+  the raw IMU, weighted squared error (:func:`find_offset_essential_matrix`,
+  faithful port), driven from ``AutosyncProcess.run``; the signal-level
+  shim below keeps the correlation fallback for rotation-list callers.
 * ``1`` ``visual_features``  -- the faithful port
   (:func:`find_offset_visual_features`) minimizes the gyro-rotated point
   distances over candidate offsets. It needs matched point pairs and a
@@ -27,6 +28,9 @@ from pygyroflow.synchronization.find_offset.visual_features import (
     find_offset_visual_features,
     find_offset_visual_features_correlation_fallback,
 )
+from pygyroflow.synchronization.find_offset.essential_matrix import (
+    find_offset_essential_matrix,
+)
 from pygyroflow.synchronization.find_offset.rs_sync import (
     find_offset_rs_sync,
 )
@@ -39,7 +43,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # Method index -- mirrors Gyroflow's ``offset_method``
-# 0 = essential_matrix (not ported; see module docstring)
+# 0 = essential_matrix (signal callers get the fallback)
 # 1 = visual_features (point-pair search; signal callers get the fallback)
 # 2 = rs_sync
 
@@ -96,5 +100,6 @@ __all__ = [
     "find_time_offset",
     "find_offset_visual_features",
     "find_offset_visual_features_correlation_fallback",
+    "find_offset_essential_matrix",
     "find_offset_rs_sync",
 ]

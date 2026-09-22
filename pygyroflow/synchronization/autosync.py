@@ -175,6 +175,27 @@ class AutosyncProcess:
                 "falling back to cross-correlation"
             )
 
+        if self._offset_method == 0:
+            offset = self._essential_matrix_offset(
+                visual_rots,
+                gyro_data,
+                search_range_ms=search_range_ms,
+                initial_offset_ms=initial_offset_ms,
+                progress_callback=(
+                    (lambda p: progress_callback(0.6 + 0.4 * p))
+                    if progress_callback
+                    else None
+                ),
+            )
+            if offset is not None:
+                if progress_callback:
+                    progress_callback(1.0)
+                return offset
+            logger.warning(
+                "Offset method 0 (essential matrix) produced no result; "
+                "falling back to signal cross-correlation"
+            )
+
         if self._offset_method == 1:
             offset = self._visual_features_offset(
                 search_range_ms=search_range_ms,
@@ -213,6 +234,49 @@ class AutosyncProcess:
             progress_callback(1.0)
 
         return offset
+
+    def _essential_matrix_offset(
+        self,
+        visual_rots: list[tuple[int, np.ndarray]],
+        gyro_data: list[tuple[int, np.ndarray]],
+        search_range_ms: float,
+        initial_offset_ms: float,
+        progress_callback: Callable[[float], None] | None = None,
+    ) -> float | None:
+        """Upstream's offset method 0 (``essential_matrix::find_offsets``).
+
+        Matches the pose estimator's angular velocity against the raw IMU
+        samples with weighted squared error. Returns ``None`` (so the
+        caller falls back) when a range carries no movement or the minimum
+        lands on the window edge.
+        """
+        from pygyroflow.types.time_types import TimeIMU
+
+        of_samples = [
+            TimeIMU(timestamp_ms=ts / 1000.0, gyro=np.asarray(v, dtype=np.float64))
+            for ts, v in visual_rots
+        ]
+        gyro_samples = [
+            TimeIMU(timestamp_ms=ts / 1000.0, gyro=np.asarray(v, dtype=np.float64))
+            for ts, v in gyro_data
+        ]
+
+        from pygyroflow.synchronization.find_offset.essential_matrix import (
+            find_offset_essential_matrix,
+        )
+
+        result = find_offset_essential_matrix(
+            of_samples,
+            gyro_samples,
+            search_size_ms=search_range_ms / 2.0,
+            initial_offset_ms=initial_offset_ms,
+            scaled_fps=self._scaled_fps,
+            progress_callback=progress_callback,
+        )
+        if result is None:
+            return None
+        offset_ms, _cost = result
+        return offset_ms
 
     def _visual_features_offset(
         self,
