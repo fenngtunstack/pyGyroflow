@@ -2198,6 +2198,138 @@ class StabilizationManager:
         self.smoothing.current().set_parameter(name, value)
         self._invalidate_smoothing()
 
+    # ------------------------------------------------------------------
+    # Remaining upstream setter surface (core/lib.rs). Each mirrors its
+    # upstream counterpart's invalidation: what a setter touches decides
+    # whether smoothing, zooming or neither must be recomputed.
+    # ------------------------------------------------------------------
+
+    def set_stab_enabled(self, v: bool) -> None:
+        self.params.stab_enabled = bool(v)
+        self._invalidate_smoothing()
+
+    def set_video_speed(self, v: float) -> None:
+        self.params.video_speed = float(v)
+        self._invalidate_smoothing()
+
+    def set_max_zoom(self, v: float | None) -> None:
+        self.params.max_zoom = None if v is None else float(v)
+        self._invalidate_zooming()
+
+    def set_frame_offset(self, v: int) -> None:
+        self.params.frame_offset = int(v)
+        self._invalidate_smoothing()
+
+    def set_frame_readout_direction(self, v) -> None:
+        self.params.frame_readout_direction = v
+        self._invalidate_smoothing()
+
+    def set_additional_rotation(self, x: float, y: float, z: float) -> None:
+        self.params.additional_rotation = (float(x), float(y), float(z))
+        self._invalidate_smoothing()
+
+    def set_additional_rotation_x(self, v: float) -> None:
+        r = list(self.params.additional_rotation)
+        r[0] = float(v)
+        self.set_additional_rotation(*r)
+
+    def set_additional_rotation_y(self, v: float) -> None:
+        r = list(self.params.additional_rotation)
+        r[1] = float(v)
+        self.set_additional_rotation(*r)
+
+    def set_additional_rotation_z(self, v: float) -> None:
+        r = list(self.params.additional_rotation)
+        r[2] = float(v)
+        self.set_additional_rotation(*r)
+
+    def set_additional_translation(self, x: float, y: float, z: float) -> None:
+        self.params.additional_translation = (float(x), float(y), float(z))
+        self._invalidate_smoothing()
+
+    def set_additional_translation_x(self, v: float) -> None:
+        t = list(self.params.additional_translation)
+        t[0] = float(v)
+        self.set_additional_translation(*t)
+
+    def set_additional_translation_y(self, v: float) -> None:
+        t = list(self.params.additional_translation)
+        t[1] = float(v)
+        self.set_additional_translation(*t)
+
+    def set_additional_translation_z(self, v: float) -> None:
+        t = list(self.params.additional_translation)
+        t[2] = float(v)
+        self.set_additional_translation(*t)
+
+    def set_input_horizontal_stretch(self, v: float) -> None:
+        self.params.input_horizontal_stretch = float(v)
+        self._invalidate_zooming()
+
+    def set_input_vertical_stretch(self, v: float) -> None:
+        self.params.input_vertical_stretch = float(v)
+        self._invalidate_zooming()
+
+    def set_light_refraction_coefficient(self, v: float) -> None:
+        self.params.light_refraction_coefficient = float(v)
+        self._invalidate_zooming()
+
+    def set_background_mode(self, v) -> None:
+        self.params.background_mode = v
+        self._invalidate_zooming()
+
+    def set_background_margin(self, v: float) -> None:
+        self.params.background_margin = float(v)
+        self._invalidate_zooming()
+
+    def set_background_margin_feather(self, v: float) -> None:
+        self.params.background_margin_feather = float(v)
+        self._invalidate_zooming()
+
+    def set_background_color(self, color) -> None:
+        self.params.background = np.asarray(color, dtype=np.float32)
+        self._invalidate_zooming()
+
+    def set_horizon_lock(self, percent: float, roll: float = 0.0,
+                         pitch: float = 0.0) -> None:
+        lock = self.smoothing.horizon_lock
+        lock.horizonlockpercent = float(percent)
+        lock.horizonroll = float(roll)
+        lock.horizonpitch = float(pitch)
+        lock.lock_enabled = abs(float(percent)) > 0.01
+        self._invalidate_smoothing()
+
+    def set_digital_lens_name(self, name: str | None) -> None:
+        """Digital lens lives on the lens profile (upstream lib.rs:1030)."""
+        self.lens.digital_lens = name
+        self._invalidate_zooming()
+
+    def set_digital_lens_param(self, index: int, value: float) -> None:
+        """The four digital-lens coefficients, on the lens profile like
+        upstream (lib.rs:1038-1043), defaulting to zeros on first write."""
+        current = self.lens.digital_lens_params
+        params = list(current) if current is not None else [0.0] * 4
+        if 0 <= index < len(params):
+            params[index] = float(value)
+        self.lens.digital_lens_params = params
+        self._invalidate_zooming()
+
+    def set_zooming_method(self, v: int) -> None:
+        self.params.adaptive_zoom_method = int(v)
+        self._invalidate_zooming()
+
+    def set_of_method(self, v: int) -> None:
+        """The optical-flow method for the *next* sync run (upstream keeps
+        it on SyncParams; the port has no persistent estimator until a
+        sync starts)."""
+        self._of_method = int(v)
+
+    def set_show_detected_features(self, v: bool) -> None:
+        self.params.show_detected_features = bool(v)
+
+    def set_show_optical_flow(self, v: bool) -> None:
+        self.params.show_optical_flow = bool(v)
+
     def override_video_fps(self, fps: float, recompute: bool = True) -> None:
         """Override video FPS with a scaling factor."""
         if abs(fps - self.params.fps) > 0.001:
