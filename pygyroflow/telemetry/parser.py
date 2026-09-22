@@ -45,10 +45,40 @@ def parse_telemetry_file(
         raise TelemetryParseError(f"File not found: {path}")
 
     ext = os.path.splitext(path)[1].lower()
-    if ext in (".mp4", ".mov", ".insv"):
-        return _parse_embedded(path, sample_index, video_size, fps)
+    if ext in (".mp4", ".mov", ".insv", ".mkv"):
+        meta = _parse_embedded(path, sample_index, video_size, fps)
+        if meta.has_motion():
+            return meta
+        # No data inside: fall back to a same-named sidecar file
+        # (telemetry-parser lib.rs:107-116) — the .gcsv/.bbl/.bfl/.csv a
+        # companion logger wrote next to the clip.
+        sidecar = _find_sidecar(path)
+        if sidecar is not None:
+            log.info("No embedded telemetry; using sidecar %s", sidecar)
+            return parse_telemetry_file(sidecar, sample_index, video_size, fps)
+        return meta
+
+    if ext in (".gcsv", ".csv", ".txt"):
+        from pygyroflow.telemetry.gcsv import detect_gcsv, parse_gcsv
+
+        with open(path, "rb") as f:
+            data = f.read(512)
+        if detect_gcsv(data):
+            with open(path, "rb") as f:
+                return parse_gcsv(f.read())
 
     raise TelemetryParseError(f"Unsupported file format: {ext}")
+
+
+def _find_sidecar(path: str) -> str | None:
+    """A sibling file with the same stem and a telemetry extension, in
+    upstream's order (lowercase first)."""
+    stem = os.path.splitext(path)[0]
+    for ext in ("gcsv", "bbl", "bfl", "csv", "GCSV", "BBL", "BFL", "CSV"):
+        candidate = f"{stem}.{ext}"
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def detect_telemetry_format(path: str) -> str:
