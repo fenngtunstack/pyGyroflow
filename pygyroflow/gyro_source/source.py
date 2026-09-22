@@ -398,35 +398,80 @@ class GyroSource:
 
         return _offset_at_timestamp(offsets, timestamp_ms)
 
+    @staticmethod
+    def _line_fit(offsets: dict[int, float]) -> tuple[float, float, float] | None:
+        """Least-squares line over the offset map, as residual sum too
+        (``mod.rs:683-698``): ``[slope, intercept, residual_ss]``."""
+        keys = sorted(offsets)
+        if len(keys) < 2:
+            return None
+        a = np.column_stack([np.asarray(keys, dtype=np.float64),
+                             np.ones(len(keys))])
+        b = np.asarray([offsets[k] for k in keys], dtype=np.float64)
+        try:
+            solution, *_ = np.linalg.lstsq(a, b, rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+        residuals = float(np.sum((a @ solution - b) ** 2))
+        return float(solution[0]), float(solution[1]), residuals
+
     def _adjust_offsets(self) -> None:
         """Recalculate linear fit and adjusted offsets.
 
-        Simplified version of Gyroflow's adjust_offsets — does linear fitting
-        when multiple offsets exist.
+        Port of ``adjust_offsets`` (``mod.rs:700-776``): pairwise-slope
+        consensus with a 5 ms inlier band, not a plain least squares over
+        everything — one bad sync point must not drag the drift curve.
+        The best consensus wins on inlier count first (among >2-point
+        near-constant solutions, lowest residual), and the fitted line
+        then spans **all** keys, extrapolating over the rejected outliers.
         """
         if len(self.offsets) <= 1:
             self.offsets_linear = dict(self.offsets)
         else:
-            # Simple linear regression
-            keys = sorted(self.offsets.keys())
-            values = [self.offsets[k] for k in keys]
-            n = len(keys)
-            sum_x = sum(keys)
-            sum_y = sum(values)
-            sum_xy = sum(k * v for k, v in zip(keys, values))
-            sum_x2 = sum(k * k for k in keys)
+            keys = sorted(self.offsets)
+            best_offsets: dict[int, float] = {}
+            best_rsquared = 1000.0
+            best_coeffs = (0.0, 0.0)
+            max_fitting_error = 5.0  # ms
 
-            denom = n * sum_x2 - sum_x * sum_x
-            if abs(denom) > 1e-10:
-                slope = (n * sum_xy - sum_x * sum_y) / denom
-                intercept = (sum_y - slope * sum_x) / n
+            for i in keys:
+                for j in keys:
+                    if i == j:
+                        continue
+                    slope = (self.offsets[j] - self.offsets[i]) / (j - i)
+                    intersect = self.offsets[i] - i * slope
+                    within = {
+                        k: v for k, v in self.offsets.items()
+                        if abs((k * slope + intersect) - v) < max_fitting_error
+                    }
+                    if len(within) >= len(best_offsets) and within != best_offsets:
+                        solution = self._line_fit(within)
+                        if solution is None:
+                            continue
+                        close_constant = abs(solution[0]) < 0.1
+                        if len(within) > 2 and close_constant:
+                            if solution[2] < best_rsquared:
+                                best_rsquared = solution[2]
+                                best_offsets = dict(within)
+                                best_coeffs = (solution[0], solution[1])
+                        elif close_constant:
+                            best_offsets = dict(within)
+                            best_coeffs = (solution[0], solution[1])
+
+            if best_offsets:
+                self.offsets_linear = {
+                    k: k * best_coeffs[0] + best_coeffs[1]
+                    for k in self.offsets
+                }
             else:
-                slope = 0.0
-                intercept = sum_y / n
-
-            self.offsets_linear = {
-                k: k * slope + intercept for k in self.offsets
-            }
+                solution = self._line_fit(self.offsets)
+                if solution is not None:
+                    self.offsets_linear = {
+                        k: k * solution[0] + solution[1]
+                        for k in self.offsets
+                    }
+                else:
+                    self.offsets_linear = dict(self.offsets)
 
         # Build adjusted offsets: key = timestamp + offset in us
         self.offsets_adjusted = {
