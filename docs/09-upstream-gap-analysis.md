@@ -299,7 +299,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-07 | E | **容器旋转元数据没读**（见 G-07）—— 已实现（`3aadd0d`） | [实测] |
 | C-08 | R | 无 GPU 解码/编码（上游 `ffmpeg_hw.rs` 412 行 + 各平台 interop）；无 GPU 解码重试阶梯、无像素格式回退 | [报告] |
 | C-09 | R | 渲染健壮性：上游写 `.tmp` 再改名、拷贝容器元数据/timecode、清残留 `%Nd` 文件、保持系统唤醒；我们直接写目标路径、无元数据 —— `.tmp` 原子发布 + 容器元数据拷贝已实现（`1304d50`，含扩展名→封装表与未知扩展名的直写回退）；timecode 拷贝、残留 `%Nd` 清理、防休眠仍缺 | [报告] |
-| C-10 | R | **`settings.py` 是死代码**。106 行类，**全仓库零引用**。CLI 默认值硬编码在 argparse。上游 settings.json 约 25 个键驱动导出/同步默认值 | [报告] |
+| C-10 | R | **`settings.py` 是死代码**。106 行类，**全仓库零引用**。CLI 默认值硬编码在 argparse。上游 settings.json 约 25 个键驱动导出/同步默认值 —— 已接线（`71f7308`）：CLI 加载 settings 文件，'output_params'/'sync_params' 作 -p/-s 的未给出默认、显式旗标胜出、坏文件静默。上游约 25 键中其余 GUI 态键（窗口布局等）无 CLI 对应物，不再逐一映射 | [报告] |
 | C-11 | E | **CLI 表面积**。上游有 `--export_project`(4 模式)/`--export_metadata`(3)/`--export_stmap`(2)/`-p`/`-s`/`--preset`/`-t`/`-j`/`-d`/`--stdout_progress`/`--watch`/`--version`/`-f`。已补：多类型位置输入分流、`--preset`/`--export-project 1`/`-p`/`-s`/`-t`/`-f`/`--version`（`e7fb663`）。未补：`-j`/`-d`/`--watch`/`--open`/`-b`/`-r`/`--no-gpu-decoding`/`--export_metadata`；`--stdout_progress`（`6a81788`，JSON 行流）与 `--export-stmap`（`6a81788`，1=undistort/2=+redistort，接真实模型导出器）已补 | [报告] |
 | C-12 | R | **RenderQueue 是骨架**。上游 1740 行（并行渲染、暂停/取消、队列持久化、preset 批量、渲染前 autosync、缩略图、when_done）；我们 227 行顺序执行，export 类 job 只 `json.dump` options，stmap job 抛 `NotImplementedError` | [报告] |
 | C-13 | R | `compute_distort_map` 无畸变模型（见 G-06） —— 已修（`bcc927b`）：整网格喂 undistort_points_with_rolling_shutter（use_fovs=true、全额校正，逐行旋转由点族内部处理），未收敛点归零 | [实测] |
@@ -407,6 +407,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | **D-06 参照**：`undistort_points` 对上游 Rust 逐值比对 | `6b7b84e` | `cpu_undistort.rs:649-803` 逐字节切出、`distortion_models/` 与 `gyro_source/splines.rs` 整流原样复制，编译后跑 26 用例 304 个坐标值，全部落在 3.7e-7 相对误差内（f32 vs f64 的本底）。**这一步查出上面三条缺陷**，其中两条结构性测试按构造就测不到。参照工程不入库，`generate_undistort_points_reference.py --stage` 现场从只读的 `opensource/gyroflow/` 抽取，所以不存在第二份会漂的副本 |
 | CPU 采样器消费 input_rotation（D-13） | `5e1b3be` | 7 项测试。90/180 度坐标映射按手算值比对（绕中心旋转，非角对称——首版测试在此翻过车）、零旋转恒等、fringe clamp 用旋转宽度、背景 clamp 天花板用未旋转宽度（1079 不被压到 1077，怪癖专测）、at_timestamp 打包两向、梯度帧端到端逐像素值 |
 | rs-sync 优化器 crate 移植 + 桥接（B-04） | `8ff80fa` + `00b6478` | 25 项模块测试 + 桥接后 e2e。梯度链（运动/延迟）对有限差分 <1e-5；端到端正弦场景恢复 −50 ms、代价 ~1e-6、残差景观真值处单点凹陷（**恒定角速度对该残差退化**——θ(t₁)+θ(t₂) 平移不变，须非线性 pan，记入测试 docstring）；向量化与标量路径 max diff 0.0（手展开公式在 y 分量翻过车，旋转轴对齐时差异项恰好消失——教训在提交信息）；e2e 实测 +191.6/200 ms |
+| settings 文件驱动 CLI 默认（C-10） | `71f7308` | 4 项测试：文件默认生效、显式旗标覆盖、坏文件静默不崩、sync_params 到达 synchronize。GUI 态键（窗口布局等）无 CLI 对应物，表里写明不再逐一映射 |
 | IMU 变换 setter 全套 + recompute_gyro（C-14 收尾） | `76c28a0` | 4 项测试：双滤波、双旋转、朝向零偏写入 IMUTransforms，recompute 应用且 compute_id 前移 |
 | manager setter 面 24 个缺口（C-14 主体） | `b6ba695` | 17 项测试：逐 setter 落点、分量 setter 组合、背景 float32、horizon >0.01 启用门、数码镜头三态（None 首写默认零、越界忽略）、失效 ID 单调与缩放校验和清零。digital_lens 按 upstream 落镜头档案非 params |
 | filter_of_lines + get_of_lines_for_timestamp（B-13） | `b96c4bd` | 13 项测试：方向过滤（含正交多数全灭的朴素均值怪癖——上游语义）、缩放贯通、2 ms 容差两向、next_no 跳帧、filter 开关、多帧距显式未实现（不静默给错基线） |
