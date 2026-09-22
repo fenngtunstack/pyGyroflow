@@ -266,7 +266,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | B-16 | R | **`SyncParams` 结构缺失**：`custom_sync_pattern`/`auto_sync_points`/`every_nth_frame`/`calc_initial_fast`/`initial_offset_inv` 全无。且 `manager.py:673-674` 在 OptimSync 给 <2 点时直接放弃，上游 `render_queue.rs:1448-1462` 会退化成均匀分布 | [报告] |
 | B-17 | D | **逐点搜索窗口 120ms vs 上游 5000ms**（`manager.py:_SYNC_POINT_SEARCH_MS`） | [报告] |
 | B-18 | D | 流式 API 缺失：无 `feed_frame`、无取消、无增量估计、无 OF 缓存生命周期。批处理 `run()` 功能上够用，但长视频无进度/无中断 | [报告] |
-| B-19 | D | `guess_imu_orientation` 过程不同：我们用 6 个三帧窗口 + `_compute_cost`（`manager.py:852-964`）；上游 `rs_sync.rs:190-222` 是 48 个朝向的 `pre_sync` 代价求和 | [报告] |
+| B-19 | D | `guess_imu_orientation` 过程不同：我们用 6 个三帧窗口 + `_compute_cost`（`manager.py:852-964`）；上游 `rs_sync.rs:190-222` 是 48 个朝向的 `pre_sync` 代价求和 —— 48 个朝向的枚举已在（`_POSSIBLE_ORIENTATIONS` 恰 48 项）；差异仅在窗口选取（6 个三帧窗口 vs 全程）与代价函数（`_compute_cost` vs crate `pre_sync`）。B-04 落地后代价侧可换 crate 的 pre_sync，留作后续 | [报告] |
 | B-20 | D | Almeida 的最终取逆方向与上游相反（`almeida.py:200-202` 返回相机旋转，`almeida.rs:34-36` 返回点旋转）。两者相对差一个逆——**所有 Almeida 推导出的欧拉角符号相反**。另 `_CameraK` 只有 K，无畸变/无逐帧内参 —— 已修（`034d033`）：delta 按上游 Camera::delta 独立重写并逐值比对，符号随之一致；_CameraK 持有 ComputeParams | [报告] |
 | B-21 | D | 方法 0 配置未复刻：上游用 LMEDS/prob 0.999/threshold 1e-5/maxIters 4000/focal 1e5（`find_essential_mat.rs:34-42`）；我们用 RANSAC/1.0px/真实 K（`eight_point.py:20-22`）。且我们的 method 0 与 method 2 **是同一个函数**（`__init__.py:79-98`），上游不是 —— 已修（`3697a72`）：method 0 → find_essential_mat.py（LMEDS/1e-5/4000/1e5），与 method 2 分离 | [报告] |
 | B-22 | D | 单应方法：上游 `find_homography_ext(RANSAC, 0.001, 2000, 0.999)` + 按 **max|t|²** 选分解（`find_homography.rs:38-52`）；我们 `cv2.findHomography(RANSAC, 5.0px)` + **取 `Rs[0]`** —— 已修（`3697a72`）：RANSAC 0.001/2000/0.999 + 单位阵 K 分解 + 取 |t|² 最小（上游 fold 原义） | [报告] |
@@ -281,7 +281,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 
 | # | 等级 | 项 | 证据 |
 |---|---|---|---|
-| C-01 | R | **输出编解码矩阵**。上游 H.264/H.265/AV1/ProRes(6 profile)/DNxHD(8)/CineForm/**EXR 序列**/**PNG 序列**；我们 libx264/libx265/prores_ks(坏)/libaom-av1，另加两个上游没有的（vp9/mpeg4）。**无序列输出**——输入侧做了序列，输出侧仍只有视频 | [实测] |
+| C-01 | R | **输出编解码矩阵**。上游 H.264/H.265/AV1/ProRes(6 profile)/DNxHD(8)/CineForm/**EXR 序列**/**PNG 序列**；我们 libx264/libx265/prores_ks(坏)/libaom-av1，另加两个上游没有的（vp9/mpeg4）。**无序列输出**——输入侧做了序列，输出侧仍只有视频 —— **序列输出已实现**（PNG/EXR：`_SEQUENCE_CODECS` + printf 模式校验 + image2 容器 + 音频跳过 + CLI 模式生成，`tests/test_rendering.py` 覆盖）；ProRes 编码已在 G-01 修复。DNxHD/CineForm/AV1 profile 细项仍缺 | [实测] |
 | C-02 | R | **逐平面/位深/HDR 管线缺失**。上游按解码器原生格式逐平面处理（NV12/P010/YUV420P10/16、GBRPF32LE、RGB48BE…，`mod.rs:563-651`），按位深设 `pixel_value_limit`；我们 `ffmpeg_processor.py:216` 一律 `to_ndarray("rgb24")` 再编码回 yuv420p。**10/12/16-bit 与浮点输入在稳定化前就被量化到 8bit**
 
 **C-02 勘察记录（2026-09-22，C-03 落地后）**。实现原生平面管线需要过四道关，前两道是环境硬阻塞：
