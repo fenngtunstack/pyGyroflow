@@ -250,15 +250,15 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 |---|---|---|---|
 | B-01 | R | offset method 0 未移植（见 G-09） | [实测] |
 | B-02 | R | offset method 1 未移植；`estimate_rolling_shutter` 模式完全缺失（全树无 `for_rs`） | [实测] |
-| B-03 | R | **rs-sync 缺 `− readout/2` 修正**。`autosync.py:265` `return -delay_ms`；上游 `rs_sync.rs:179` `offset = -delay - frame_readout_time/2`。符号约定本身一致 | [实测] |
+| B-03 | R | **rs-sync 缺 `− readout/2` 修正**。`autosync.py:265` `return -delay_ms`；上游 `rs_sync.rs:179` `offset = -delay - frame_readout_time/2`。符号约定本身一致 —— 已在 `recompute_smoothing`/autosync 补上（随 rs-sync 移植修正，`return -delay_ms - frame_readout_time_ms / 2.0`） | [实测] |
 | B-04 | R | rs-sync 优化器退化。上游 = 3ms 粗网格 + LBFGS 逐帧平移向量 + Backtrack 延迟优化 + 鲁棒损失 `ρ=√log(1+r²)` + LMedS 平移方向估计；我们 = 3ms 粗网格 + 四次网格细分，无平移模型/无鲁棒损失/无梯度 | [实测] |
-| B-05 | R | **rs-sync 不做镜头畸变校正**。`rs_sync.py:195` 注释自认畸变系数 "not yet used"；`camera_matrix=None` 时把原始像素坐标当归一化坐标（`:218-220`）。上游在归一化前过 `undistort_points_for_optical_flow` | [实测] |
+| B-05 | R | **rs-sync 不做镜头畸变校正**。`rs_sync.py:195` 注释自认畸变系数 "not yet used"；`camera_matrix=None` 时把原始像素坐标当归一化坐标（`:218-220`）。上游在归一化前过 `undistort_points_for_optical_flow` —— 已换（`76de345`）：add_track_from_frames 走 undistort_points_for_optical_flow | [实测] |
 | B-06 | R | `calc_initial_fast` 缺失（上游用本质矩阵估中位数偏移、把 search_size 收窄到 3000ms 再跑 rs-sync） | [报告] |
 | B-07 | R | `initial_offset_inv` 缺失（±initial_offset 各跑一次取点多者） | [报告] |
 | B-08 | R | **接受条件不同**。上游 `|offset−initial| < radius·0.9`；我们换成自造"平坦地形"启发式（`cost > 0.97·邻域中位数` 即拒绝，`autosync.py:243-261`） | [实测] |
-| B-09 | D | 精搜窗口 ±2 ms vs 上游 ±1 ms（`visual_features.py:31`） | [实测] |
-| B-10 | R | **AKAZE 三个常数不同**。我们 threshold `0.001`、Lowe ratio `0.7`、无上限（`akaze.py:34,78`）；上游 `0.0007`、`0.5`、`maximum_features=200`（`akaze.rs:26,13`）。ratio 0.7 放进大量歧义匹配 | [实测] |
-| B-11 | D | **DIS 用错 preset**。我们 `PRESET_MEDIUM`（`opencv_dis.py:41`）；上游 `PRESET_FAST`（`opencv_dis.rs:59`） | [实测] |
+| B-09 | D | 精搜窗口 ±2 ms vs 上游 ±1 ms（`visual_features.py:31`） —— 已对齐（`d1036a5`）：忠实的逐点搜索细搜 ±1 ms；互相关回退仍 ±2 ms | [实测] |
+| B-10 | R | **AKAZE 三个常数不同**。我们 threshold `0.001`、Lowe ratio `0.7`、无上限（`akaze.py:34,78`）；上游 `0.0007`、`0.5`、`maximum_features=200`（`akaze.rs:26,13`）。ratio 0.7 放进大量歧义匹配 —— 已修：threshold 0.0007 / maximum 200 / ratio 0.5（akaze.py:30-32，docstring 记录） | [实测] |
+| B-11 | D | **DIS 用错 preset**。我们 `PRESET_MEDIUM`（`opencv_dis.py:41`）；上游 `PRESET_FAST`（`opencv_dis.rs:59`） —— 已修：DISOPTICAL_FLOW_PRESET_FAST（opencv_dis.py:43） | [实测] |
 | B-12 | R | **`per_frame_time_offsets` 全链路无消费者**。`file_metadata.py:59` 声明、`:90` 置空、全仓库无读取点。上游 `frame_transform.rs:216` 在查四元数前加此偏移 | [实测] |
 | B-13 | R | `filter_of_lines`（30° 平均角过滤）+ `get_of_lines_for_timestamp`（按帧距取缓存 OF）缺失 | [报告] |
 | B-14 | R | `cache_optical_flow` / 多帧距 OF / `cleanup` / `processed_frames` / `get_ranges`（>100ms 断档切分）缺失。`FrameResult` 只有 d=1 的点对 | [报告] |
@@ -267,14 +267,14 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | B-17 | D | **逐点搜索窗口 120ms vs 上游 5000ms**（`manager.py:_SYNC_POINT_SEARCH_MS`） | [报告] |
 | B-18 | D | 流式 API 缺失：无 `feed_frame`、无取消、无增量估计、无 OF 缓存生命周期。批处理 `run()` 功能上够用，但长视频无进度/无中断 | [报告] |
 | B-19 | D | `guess_imu_orientation` 过程不同：我们用 6 个三帧窗口 + `_compute_cost`（`manager.py:852-964`）；上游 `rs_sync.rs:190-222` 是 48 个朝向的 `pre_sync` 代价求和 | [报告] |
-| B-20 | D | Almeida 的最终取逆方向与上游相反（`almeida.py:200-202` 返回相机旋转，`almeida.rs:34-36` 返回点旋转）。两者相对差一个逆——**所有 Almeida 推导出的欧拉角符号相反**。另 `_CameraK` 只有 K，无畸变/无逐帧内参 | [报告] |
-| B-21 | D | 方法 0 配置未复刻：上游用 LMEDS/prob 0.999/threshold 1e-5/maxIters 4000/focal 1e5（`find_essential_mat.rs:34-42`）；我们用 RANSAC/1.0px/真实 K（`eight_point.py:20-22`）。且我们的 method 0 与 method 2 **是同一个函数**（`__init__.py:79-98`），上游不是 | [报告] |
-| B-22 | D | 单应方法：上游 `find_homography_ext(RANSAC, 0.001, 2000, 0.999)` + 按 **max|t|²** 选分解（`find_homography.rs:38-52`）；我们 `cv2.findHomography(RANSAC, 5.0px)` + **取 `Rs[0]`** | [报告] |
-| B-23 | R | **OptimSync 频谱公式不同**。`optimsync.py:129` 用 `np.abs(np.fft.rfft(chunk))`（模长）；上游 `optimsync.rs:98-101` 是 `zip(cm, cm.rev()).take(n/2).map(a+b).norm()`，即 bin k = `cm[k] + cm[n-1-k]`，对实信号 = `cm[k] + conj(cm[k+1])` —— **相邻两 bin 的带相位求和**。下游阈值（rank<50、450/650、0.1）按折返尺度标定 → 用模长等于换了尺度。**注：本条初稿写作「2·|Re(FFT)|」是错的**，已用 rustfft 参照程序推翻（参照向量 bin2：折返 11.58 vs 模长 0.56） | [实测] |
+| B-20 | D | Almeida 的最终取逆方向与上游相反（`almeida.py:200-202` 返回相机旋转，`almeida.rs:34-36` 返回点旋转）。两者相对差一个逆——**所有 Almeida 推导出的欧拉角符号相反**。另 `_CameraK` 只有 K，无畸变/无逐帧内参 —— 已修（`034d033`）：delta 按上游 Camera::delta 独立重写并逐值比对，符号随之一致；_CameraK 持有 ComputeParams | [报告] |
+| B-21 | D | 方法 0 配置未复刻：上游用 LMEDS/prob 0.999/threshold 1e-5/maxIters 4000/focal 1e5（`find_essential_mat.rs:34-42`）；我们用 RANSAC/1.0px/真实 K（`eight_point.py:20-22`）。且我们的 method 0 与 method 2 **是同一个函数**（`__init__.py:79-98`），上游不是 —— 已修（`3697a72`）：method 0 → find_essential_mat.py（LMEDS/1e-5/4000/1e5），与 method 2 分离 | [报告] |
+| B-22 | D | 单应方法：上游 `find_homography_ext(RANSAC, 0.001, 2000, 0.999)` + 按 **max|t|²** 选分解（`find_homography.rs:38-52`）；我们 `cv2.findHomography(RANSAC, 5.0px)` + **取 `Rs[0]`** —— 已修（`3697a72`）：RANSAC 0.001/2000/0.999 + 单位阵 K 分解 + 取 |t|² 最小（上游 fold 原义） | [报告] |
+| B-23 | R | **OptimSync 频谱公式不同**。`optimsync.py:129` 用 `np.abs(np.fft.rfft(chunk))`（模长）；上游 `optimsync.rs:98-101` 是 `zip(cm, cm.rev()).take(n/2).map(a+b).norm()`，即 bin k = `cm[k] + cm[n-1-k]`，对实信号 = `cm[k] + conj(cm[k+1])` —— **相邻两 bin 的带相位求和**。下游阈值（rank<50、450/650、0.1）按折返尺度标定 → 用模长等于换了尺度。**注：本条初稿写作「2·|Re(FFT)|」是错的**，已用 rustfft 参照程序推翻（参照向量 bin2：折返 11.58 vs 模长 0.56） —— 已修：相邻 bin 带相位求和已实现（optimsync.py:132-136 注释记录推导） | [实测] |
 | B-24 | R | **OptimSync 缺低运动分支**。上游 `mf_max < 50.0` 时切 `(lf+mf)/penalty`（`optimsync.rs:134-148`）；我们恒走正常公式。慢速平移的能量全在 2Hz 以下，正常公式会把它罚没，结果是选不出任何同步点 | [实测] |
 | B-25 | D | OptimSync 返回**已裁**的 rank（`:219`，就地清零于 `:177-189`）；上游返回未裁的 `rank_clone` | [报告] |
 | B-26 | D | 多同步点窗口筛选用陀螺时间戳去筛**视频**帧（`manager.py:684`）。偏移量级相对 ±500ms 窗口可忽略，但两套时间线混用。**（子代理报的"键落在错误时间线"不成立——`points_ms` 来自 `OptimusSync(ts_ms,...)`，`ts_ms` 在 `manager.py:664` 明确取自 gyro_data）** | [实测] |
-| B-27 | D | 上游同步期 `keyframes.clear()` + `lens_correction_amount = 1.0`（`autosync.rs:86-89`）；我们无强制校正也无关键帧抑制 | [报告] |
+| B-27 | D | 上游同步期 `keyframes.clear()` + `lens_correction_amount = 1.0`（`autosync.rs:86-89`）；我们无强制校正也无关键帧抑制 —— 已修（`034d033`）：_build_sync_compute_params: keyframes 清空 + lens_correction_amount=1.0 | [报告] |
 | B-28 | D | Python 侧自加的安全启发式（上游无）：DJI 先验 8ms/窗口 40ms、互相关峰 0.5 门、RS 平坦地形 0.97、≥5 视觉旋转、≥3 RS 轨迹、采样内存上限 | [报告] |
 
 ### C. 渲染 / 输出管线
@@ -304,28 +304,28 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | # | 等级 | 项 | 证据 |
 |---|---|---|---|
 | D-01 | R | **逐时间戳镜头数据路径整体缺失**。上游 `frame_transform.rs:82-155`（70 行）做四件事：按 `lens_positions` 插值变焦内参、按 `lens_params` 覆盖内参与畸变系数并重算 `radial_distortion_limit`、按 `digital_zoom` 缩放、非对称镜头 `invert_asym_lens`。我们 `_get_lens_data_at_timestamp`（`frame_transform.py:190-220`）**连时间戳参数都不用** → **变焦镜头全程用一组静态内参**。（`LensProfile.get_interpolated_profile_at` 数学正确但无逐帧调用点）—— 已实现（`3be3629`）：四件事全部落地（`lens_positions` 插值 / `lens_params` 覆盖内参与畸变系数 + 重算 `radial_distortion_limit` / `digital_zoom` / `invert_asym_lens`），配套移植 `MapClosest`（`util.ClosestMap`）；Sony 解析器逐包读 `0x8005` 焦距喂 `lens_positions`。**留一处有意不改**：`_build_compute_params` 把 `calib_width/height` 设成视频尺寸，标定分辨率缩放仍是 no-op | [实测] |
-| D-02 | R | **`additional_rotation` 是死的**。`compute_params.py:107` 定义、`manager.py:1239` 拷贝、`gui/main_window.py:306` 唯一写入方（水平锁滑块 → additional_rotation[2]），但 `recompute_smoothing`（`manager.py:333-384`）**不乘这个旋转**。上游 `gyro_source/mod.rs:611-624` 在平滑/锁定**之前**对每个 org 四元数左乘。**GUI 上那个滑块对平滑结果无效** | [实测] |
-| D-03 | R | **`optimal_fov` 未应用**。`frame_transform.py:302` 注释自认 `# (simplified: not handling lens.optimal_fov here)`；上游 `frame_transform.rs:185-191` 有 `fov *= adj` / `ui_fov /= adj` 分支 | [实测] |
+| D-02 | R | **`additional_rotation` 是死的**。`compute_params.py:107` 定义、`manager.py:1239` 拷贝、`gui/main_window.py:306` 唯一写入方（水平锁滑块 → additional_rotation[2]），但 `recompute_smoothing`（`manager.py:333-384`）**不乘这个旋转**。上游 `gyro_source/mod.rs:611-624` 在平滑/锁定**之前**对每个 org 四元数左乘。**GUI 上那个滑块对平滑结果无效** —— 已修：recompute_smoothing 步骤 1 逐时间戳（关键帧或静态值）乘 additional_rotation | [实测] |
+| D-03 | R | **`optimal_fov` 未应用**。`frame_transform.py:302` 注释自认 `# (simplified: not handling lens.optimal_fov here)`；上游 `frame_transform.rs:185-191` 有 `fov *= adj` / `ui_fov /= adj` 分支 —— 已修：frame_transform.py:667-671 fov *= adj / ui_fov /= adj | [实测] |
 | D-04 | R | **地平线锁顺序反了且应用两次**（见 G-08） | [实测] |
-| D-05 | R | **max-zoom 反馈回路缺失**。上游 `lib.rs:548-605` 最多 5 轮 {夹紧 FOV 上限 → 按阈值 `[0.95,0.9,0.85,0.8]` 逐帧缩放 `smoothing_fov_limit_per_frame` → 重平滑 → 重缩放}。我们 `recompute_adaptive_zoom`（`manager.py:386-404`）只算一次；`ComputeParams` 无 `smoothing_fov_limit_per_frame` 字段，`default_algo.py:423`/`plain.py:141` 用 `getattr(...,{})` 读，**永远是空字典**。另无 `video_speed_affects_zooming_limit` | [实测] |
+| D-05 | R | **max-zoom 反馈回路缺失**。上游 `lib.rs:548-605` 最多 5 轮 {夹紧 FOV 上限 → 按阈值 `[0.95,0.9,0.85,0.8]` 逐帧缩放 `smoothing_fov_limit_per_frame` → 重平滑 → 重缩放}。我们 `recompute_adaptive_zoom`（`manager.py:386-404`）只算一次；`ComputeParams` 无 `smoothing_fov_limit_per_frame` 字段，`default_algo.py:423`/`plain.py:141` 用 `getattr(...,{})` 读，**永远是空字典**。另无 `video_speed_affects_zooming_limit` —— 已修：manager._apply_max_zoom_limit：max_zoom_iters 轮反馈 + 阈值 (0.95,0.9,0.85,0.8)，smoothing_fov_limit_per_frame 已有生产者 | [实测] |
 | D-06 | R | **`at_timestamp_for_points` / `undistort_points*` 家族整体缺失**。上游 `frame_transform.rs:344-430` + `cpu_undistort.rs:634-803`：逐点按各自行时刻取旋转、逐点 IBIS 位移、mesh 校正、数字镜头、GoPro 数字镜头 0.91/0.81 x 修正。我们只有 `zooming/fov_iterative.py:104-253` 一个简化版；`almeida.py:43-44` 注释自认点**没有**畸变校正。**自动同步与自适应缩放的采样点全程跑在畸变坐标上** —— **家族本身已实现（`c7cbf1f`，参照见 `6b7b84e`）**：`util.map_coord`、`splines.as_catmull_rom`、`ComputeParams` 的 mesh/stab/digital-lens 四字段与 manager 接线、`frame_transform.at_timestamp_for_points` + 三个辅助、`cpu_undistort` 的七个函数全部落地。`fov_iterative` 的调用方也已换过来，那份副本已删除（见下方「D-06 余下」行） | [实测] |
 | D-07 | E | **`frame_readout_time` 未按传感器裁切缩放**。上游 `frame_transform.rs:22-36` 乘 `capture_area_size/sensor_size_px`；我们 `frame_transform.py:83-107` 只移植符号逻辑 —— 已实现（`3be3629`）：从 `lens_params` 的 `capture_area_size[1]/sensor_size_px[1]` 取到缩放 | [实测] |
 | D-08 | E | **焦距平滑整文件缺失**。上游 `smoothing/focal_length.rs:8-146`（高斯 + 自适应两套）+ `lib.rs:442-513` 编排 + `frame_transform.rs:71-80` `focal_length_fov_compensation`。字段在（`stabilization_params.py:104-106`）但从不填充 —— 已实现（`cb606bb`）：两个滤波器 + 编排 + 补偿全部移植，`zooming.get_checksum` 顺带补齐两个字段。**唯一没做到的是真机端到端**：解析器只填 `lens_positions`，`lens_params` 的写入侧仍是缺口，没有现成素材带逐帧焦距，验证止步于「与上游 Rust 逐位一致 + 合成内参接线」 | [实测] |
 | D-09 | R | **自适应缩放丢失全部关键帧支持**。`zooming/__init__.py:52-100` 构造工作副本时**不传 `keyframes`**（默认空 KeyframeManager）也不传 `sync_offsets_adjusted`；上游 `zooming/mod.rs:40` 克隆完整 params。连带 `zoom_dynamic.py:27-66` 只有静态窗口路径（无 `DataPerTimestamp`/`min_rolling_dynamic`/`convolve_dynamic`/逐时间戳 envelope alpha），`fov_iterative.py:308-312` 只用常量 kv | [实测] |
-| D-10 | R | **关键帧查询忽略陀螺同步偏移**。`keyframes/manager.py:302-311` `value_at_gyro_timestamp` 直接委托 `value_at_video_timestamp`，无偏移（docstring 自认）；无 `update_gyro`、无 `gyro_offsets`。上游 `keyframes.rs:79,205-208` | [报告] |
+| D-10 | R | **关键帧查询忽略陀螺同步偏移**。`keyframes/manager.py:302-311` `value_at_gyro_timestamp` 直接委托 `value_at_video_timestamp`，无偏移（docstring 自认）；无 `update_gyro`、无 `gyro_offsets`。上游 `keyframes.rs:79,205-208` —— 已实现（`8cf03b8`）：gyro_offsets 镜像 + value_at_gyro_timestamp 加偏移 + manager 三包装 | [报告] |
 | D-11 | E | **`camera_diagonal_fovs` 塌缩为单值**。上游 `compute_params.rs:140-155` 变焦镜头逐帧一值；我们 `manager.py:1189-1219` 恒 `[单值]` —— 已实现（`3be3629`）：`ComputeParams.calculate_camera_fovs()`，仅当 `lens_params` 多于一项（标定真在动）才逐帧算，定焦保持单值以免做 `frame_count` 次恒等查找 | [实测] |
-| D-12 | R | **`framebuffer_inverted` 时自适应缩放中心未翻转**。上游 `frame_transform.rs:310-312` `adaptive_zoom_center_y *= -1.0` | [报告] |
+| D-12 | R | **`framebuffer_inverted` 时自适应缩放中心未翻转**。上游 `frame_transform.rs:310-312` `adaptive_zoom_center_y *= -1.0` —— 已修：frame_transform.py:848-849 打包 translation2d 前翻转，位置与上游一致 | [报告] |
 | D-13 | R | **`input_rotation`/`output_rotation` 完全未处理**。`types/kernel_params.py:63-64` 有字段，**从不设置也从不读取**。上游 `cpu_undistort.rs:483-489,590-596` 按旋转量转 uv 与帧尺寸 | [报告] |
 | D-14 | R | **速度斜坡缺失**。`stabilization_params.py:65` 有 `speed_ramped_timestamps` 字段，**无生产者无消费者**。上游 `stabilization_params.rs:230-283` 用于输出时间→源时间映射 | [实测] |
-| D-15 | R | **Sony 标识符哈希序列化不一致**：`camera/identifier.py:313-320` 用 `json.dumps(..., sort_keys=True)`（分隔符 `", "`/`": "`）；上游 `camera_identifier.rs:114-131` 用 `serde_json::json!({...}).to_string()`（紧凑）。实测 `'{"a": 1, "b": "x"}'` vs `'{"a":1,"b":"x"}'` → **CRC32 不同 → 镜头库里 Rust 侧生成的 Sony 标识符永远匹配不上** | [实测] |
+| D-15 | R | **Sony 标识符哈希序列化不一致**：`camera/identifier.py:313-320` 用 `json.dumps(..., sort_keys=True)`（分隔符 `", "`/`": "`）；上游 `camera_identifier.rs:114-131` 用 `serde_json::json!({...}).to_string()`（紧凑）。实测 `'{"a": 1, "b": "x"}'` vs `'{"a":1,"b":"x"}'` → **CRC32 不同 → 镜头库里 Rust 侧生成的 Sony 标识符永远匹配不上** —— 已修：compact 分隔符 + Rust 参照程序验证（906280fe），见 _sony_distortion_hash docstring | [实测] |
 | D-16 | R | `adjust_lens_profile` / `rescale_coeffs` 缺失。前者在加载时把 superview(4:3→×1.3333)/hyperview(8:7→×1.5556) 的标定尺寸与 `lens_model` 改对（`distortion_models/mod.rs:43-47`）；后者是 hugin 半径归一化系数重标定（`k[0] *= s²/(1−k0)³` 等） | [报告] |
 | D-17 | R | 关键帧序列化格式不兼容：上游 easing 序列化为**字符串**（`"EaseInOut"`）、`id` 缺失时随机；我们序列化为 **int**（`kf.easing.value`）、`id` 必需（`KeyError`）。**`.gyroflow` 工程无法往返** | [报告] |
 | D-18 | R | `zooming` 的 `get_checksum` 少两个焦距平滑字段（`zooming/__init__.py:127-161` vs `zooming/mod.rs:72-95`）——修了 D-08 才有意义 | [报告] |
-| D-19 | R | `keyframes.clear()` 语义不同：上游 `*self = Self::new()`（含 custom_provider/timestamp_scale/gyro_offsets）；我们只清关键帧，**显式保留** provider 与 scale（`manager.py:413-417`） | [报告] |
+| D-19 | R | `keyframes.clear()` 语义不同：上游 `*self = Self::new()`（含 custom_provider/timestamp_scale/gyro_offsets）；我们只清关键帧，**显式保留** provider 与 scale（`manager.py:413-417`） —— 已修：clear() 连 custom_provider/timestamp_scale/gyro_offsets 一起清 | [报告] |
 | D-20 | D | **关键帧时间戳缩放应用两次**（潜伏）。`manager.py:299` `timestamp_us = round(ms*1000*scale)` → `value_at_timestamp` → `:240` `ts_ms = timestamp_us/1000*scale`。上游只应用一次。当前树内无 provider 注册，故潜伏 | [实测] |
-| D-21 | D | **FOV 迭代次数 5 vs 上游 4**（`fov_iterative.py:372` `range(5)` vs `fov_iterative.rs:110` `1..5`） | [报告] |
+| D-21 | D | **FOV 迭代次数 5 vs 上游 4**（`fov_iterative.py:372` `range(5)` vs `fov_iterative.rs:110` `1..5`） —— 已修：range(4) | [报告] |
 | D-22 | D | `_get_frames_per_window` 多一个 `max(frames, 3)` 下限（`zoom_dynamic.py:75`），上游无 | [实测] |
-| D-23 | D | 帧索引取整：我们用 `int(ts/1000*scaled_fps)` **截断**（`default_algo.py:434`、`plain.py:146`）；上游 `lib.rs:2060` 用 `.round()` | [实测] |
+| D-23 | D | 帧索引取整：我们用 `int(ts/1000*scaled_fps)` **截断**（`default_algo.py:434`、`plain.py:146`）；上游 `lib.rs:2060` 用 `.round()` —— 已修：default_algo.py:436 / plain.py:146 均 int(round(...)) | [实测] |
 | D-24 | D | `camera_identifier` tag 扫描语义不同：上游 GoPro 只看首个含 Default 组的 sample 然后 break、Sony 只看首个、通用分支最多 2 个；我们对每个 tag 独立扫**全部** sample（`identifier.py:208-230`）。通常更鲁棒，偶尔得出不同标识符 | [报告] |
 | D-25 | D | `FILL_WITH_BACKGROUND` 快路径 / `source_rect`/`output_rect` 映射缺失。两个 flag 我们从不设置，rect 恒为整帧（`frame_transform.py:472-473`）。当前等价，加子帧渲染会露 | [报告] |
 | D-26 | D | 除法保护：我们在 `default_algo.py:461-464,572-621` 加了 `max(...,1e-9)`/`if max_distance>0` 守卫；上游直接除（得 inf/NaN） | [报告] |
