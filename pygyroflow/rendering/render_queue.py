@@ -200,17 +200,34 @@ class RenderQueue:
             json.dump(data, f, indent=2)
 
     def _process_stmap_job(self, job: RenderJob) -> None:
-        """Generate an ST-map from the current stabilisation parameters.
+        """Generate ST-Maps for the job's clip through the real model.
 
-        Raises NotImplementedError: the queue-level ST-map path is not wired
-        to STMapExporter (which needs a full ComputeParams context). Writing
-        an identity-map placeholder would silently produce wrong output, so
-        we fail loudly instead. Use STMapExporter directly for real export.
+        Loads the input, runs the sync (options carry the same knobs the
+        video path honours: ``autosync``, ``lens``), and writes EXR maps
+        next to the output path — ``-undistort`` always, ``-redistort``
+        too when ``options["map_type"] == "both"`` (upstream's
+        ``generate_stmaps`` pair). The exporter itself walks the full
+        per-point model; see :mod:`pygyroflow.stmap.exporter`.
         """
-        raise NotImplementedError(
-            "RenderQueue ST-map export is not implemented. Use "
-            "pygyroflow.stmap.STMapExporter directly with a ComputeParams."
-        )
+        from pygyroflow.manager import StabilizationManager
+        from pygyroflow.stmap.exporter import STMapExporter
+
+        manager = StabilizationManager()
+        manager.load_video(job.input_path)
+        if job.options.get("autosync", False):
+            manager.synchronize()
+        manager.recompute_blocking()
+
+        stem = job.output_path.rpartition(".")[0] or job.output_path
+        map_type = job.options.get("map_type", "undistort")
+
+        exporter = STMapExporter(manager._build_compute_params())
+        targets = [("undistort", f"{stem}-undistort.exr")]
+        if map_type == "both":
+            targets.append(("distort", f"{stem}-redistort.exr"))
+        for kind, path in targets:
+            exporter.export(path, map_type=kind)
+            log.info("RenderQueue: ST-map %s -> %s", kind, path)
 
     def _process_project_job(self, job: RenderJob) -> None:
         """Save / export a full Gyroflow-compatible project file."""
