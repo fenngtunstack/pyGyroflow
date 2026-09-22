@@ -191,7 +191,7 @@ if self.smoothing.horizon_lock.lock_enabled:
 
 ---
 
-### G-09 [实测] 三个 offset method 只剩一个实现
+### G-09 [实测] ~~三个 offset method 只剩一个实现~~（method 0 已移植 `46be830`、method 1 已移植 `d1036a5`；`estimate_rolling_shutter` 的 for_rs 模式仍缺，见 B-02）
 
 ```python
 # pygyroflow/synchronization/find_offset/__init__.py:69
@@ -248,7 +248,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 
 | # | 等级 | 项 | 证据 |
 |---|---|---|---|
-| B-01 | R | offset method 0 未移植（见 G-09） | [实测] |
+| B-01 | R | offset method 0 未移植（见 G-09） —— 已移植（`46be830`）：`essential_matrix.rs::find_offsets` 的角速度匹配算法（尽管文件名如此，无本质矩阵）：20 Hz 前后向低通、70/70/100 加权平方差、ceil 查找不插值、过半匹配规则、<3 °/s 跳过、±search_size 1 ms 粗搜 + ±2 ms 0.01 ms 细搜、90 % 接受窗（此处为活守卫）。AutosyncProcess method 0 分支接线，无结果回落互相关 | [实测] |
 | B-02 | R | offset method 1 未移植；`estimate_rolling_shutter` 模式完全缺失（全树无 `for_rs`） | [实测] |
 | B-03 | R | **rs-sync 缺 `− readout/2` 修正**。`autosync.py:265` `return -delay_ms`；上游 `rs_sync.rs:179` `offset = -delay - frame_readout_time/2`。符号约定本身一致 —— 已在 `recompute_smoothing`/autosync 补上（随 rs-sync 移植修正，`return -delay_ms - frame_readout_time_ms / 2.0`） | [实测] |
 | B-04 | R | rs-sync 优化器退化。上游 = 3ms 粗网格 + LBFGS 逐帧平移向量 + Backtrack 延迟优化 + 鲁棒损失 `ρ=√log(1+r²)` + LMedS 平移方向估计；我们 = 3ms 粗网格 + 四次网格细分，无平移模型/无鲁棒损失/无梯度 | [实测] |
@@ -406,6 +406,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | D-06（家族本身）`at_timestamp_for_points` + `undistort_points*` 七个函数 | `c7cbf1f` | 45 项测试。级联顺序用「把某一级的输出当下一级的输入、结果不变」断言（数字镜头、mesh），不重推畸变数学——那部分由 `test_distortion_models.py`/`test_distortion_cv2_parity.py` 覆盖。未收敛点的 `(-1000000,-1000000)` 哨兵用 `k1=-0.5`、归一化半径 1.0 触发（实测该点 10 次迭代不收敛），并断言只有失败的那个点进哨兵。变异检查：把 `_partial_correction` 换成恒等函数，`test_zero_correction_redistorts_the_point_back_where_it_started` 立刻失败 |
 | **D-06 参照**：`undistort_points` 对上游 Rust 逐值比对 | `6b7b84e` | `cpu_undistort.rs:649-803` 逐字节切出、`distortion_models/` 与 `gyro_source/splines.rs` 整流原样复制，编译后跑 26 用例 304 个坐标值，全部落在 3.7e-7 相对误差内（f32 vs f64 的本底）。**这一步查出上面三条缺陷**，其中两条结构性测试按构造就测不到。参照工程不入库，`generate_undistort_points_reference.py --stage` 现场从只读的 `opensource/gyroflow/` 抽取，所以不存在第二份会漂的副本 |
 | CPU 采样器消费 input_rotation（D-13） | `5e1b3be` | 7 项测试。90/180 度坐标映射按手算值比对（绕中心旋转，非角对称——首版测试在此翻过车）、零旋转恒等、fringe clamp 用旋转宽度、背景 clamp 天花板用未旋转宽度（1079 不被压到 1077，怪癖专测）、at_timestamp 打包两向、梯度帧端到端逐像素值 |
+| offset method 0 角速度匹配（B-01） | `46be830` | 10 项测试。独立合成场景（视觉滞后 40 ms → −40 ±2，双信号等长——首版测试 10 s 视觉对 3 s IMU，过半匹配规则如实判 inf 的教训）；静默信号跳过、窗口边活守卫拒绝（与 method 1 的空洞守卫成对照）、z 轴 100/70 权重可分辨、ceil 查找、过半规则、run 分发与半窗换算 |
 | 速度斜坡改判为已覆盖（D-14） | — | 复核：上游活实现是 rendering/mod.rs 的编码回调斜坡，移植侧 FrameRateControl（C-05）已是其忠实移植（含关键帧速度）；stabilization_params 那对方法全仓库零调用，属上游死代码，不移植 |
 | 动态缩放关键帧窗口分支（D-09 动态半边） | `cfc6ceb` | 8 项测试。分支切换对输出有实际影响（关键帧近零窗口 → 早期帧不平滑）；video_speed 缩小窗口的方向性（alpha 变大 → 邻点贴近自身值）；**上游怪癖钉住**：Gaussian 分支的帧数与核恒取静态参数，均匀关键帧下与静态逐位相同——修「怪」即偏离 Gyroflow。envelope 正向遍历 alpha 正序配对（`.iter().rev().zip(&alphas)`）专测防错位；静态路径不回归 |
 | 关键帧序列化对齐上游（D-17） | `02b9dd0` | 9 项测试。上游形状写出（包装结构、变体名字符串、随机 id）、上游形状读入（缺 id、未知 easing 字符串）、旧扁平整数格式仍可读、timestamp_scale/gyro_offsets 往返、真实 save→load 文件往返（偏移经陀螺源权威路径镜像回）。变异检查：退回整数 easing 写出 → 变体名断言挂 |
