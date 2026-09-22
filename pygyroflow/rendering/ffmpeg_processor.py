@@ -447,6 +447,7 @@ class FfmpegProcessor(VideoProcessor):
         callback: FrameCallback,
         ranges_ms: list[tuple[float | None, float | None]] | None = None,
         speed=None,
+        progress_callback=None,
     ) -> None:
         """Decode all frames, apply *callback*, encode to output.
 
@@ -497,6 +498,12 @@ class FfmpegProcessor(VideoProcessor):
         range_idx = 0
         skipped = 0
         rate_control = FrameRateControl(fallback_fps, speed)
+
+        # A frame-count estimate for progress reporting: the decoder's
+        # duration at the container fps. VFR clips and trim ranges make the
+        # true count unknowable up front; the callback clamps to 1.0.
+        duration_s = float(in_info.get("duration") or 0.0)
+        estimated_total = int(duration_s * fallback_fps) if duration_s else 0
 
         # Three-stage pipeline: decode thread -> stabilize (this thread) ->
         # encode thread. Both C stages release the GIL (PyAV / numpy /
@@ -625,6 +632,10 @@ class FfmpegProcessor(VideoProcessor):
                 if failed:
                     break
                 self._frame_index += repeats
+                if progress_callback is not None and estimated_total > 0:
+                    progress_callback(
+                        min(1.0, self._frame_index / estimated_total)
+                    )
         except BaseException as exc:
             pipeline_error = exc
             raise

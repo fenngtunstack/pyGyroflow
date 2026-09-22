@@ -16,6 +16,9 @@ Options:
     --lens        Lens profile name or path
     --preset      Preset to apply (a .gyroflow, or inline JSON)
     --export-project N  Write a project file instead of rendering
+    --export-stmap N    Write ST-Maps instead of rendering (1 = undistort,
+                        2 = + redistort; EXR next to the video)
+    --stdout-progress   Log one JSON progress line per second on stdout
     --smoothness  Smoothness factor 0-1 (default: 0.5)
     --gpu         Enable GPU acceleration (experimental)
 """
@@ -123,8 +126,8 @@ def project_output_path(rendered_path, suffix=DEFAULT_SUFFIX):
     return os.path.join(folder, stem + ".gyroflow")
 
 
-def main() -> None:
-    """CLI entry point."""
+def main(argv=None) -> None:
+    """CLI entry point. *argv* defaults to ``sys.argv[1:]`` (test hook)."""
     parser = argparse.ArgumentParser(
         prog="pygyroflow",
         description="Video stabilization using PyGyroFlow",
@@ -218,6 +221,22 @@ def main() -> None:
              "caches a plugin reads. Matches upstream's GyroflowProjectType",
     )
     parser.add_argument(
+        "--export-stmap",
+        type=int,
+        default=0,
+        choices=[0, 1, 2],
+        metavar="N",
+        help="Write ST-Maps instead of rendering. 1 = undistort map only; "
+             "2 = both undistort and redistort (two files). Output goes "
+             "next to the video with -undistort/-redistort suffixes",
+    )
+    parser.add_argument(
+        "--stdout-progress",
+        action="store_true",
+        help="Emit one JSON progress line per second on stdout (for "
+             "wrappers); regular logs stay on stderr",
+    )
+    parser.add_argument(
         "--smoothness",
         type=float,
         default=0.5,
@@ -307,7 +326,7 @@ def main() -> None:
         help="Enable verbose logging",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Configure logging
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -510,6 +529,25 @@ def main() -> None:
                 log.info("Wrote project: %s", project_path)
                 continue
 
+            if args.export_stmap:
+                # Like --export-project: no render, the maps land where
+                # the video would have gone. EXR per upstream's stmap.rs.
+                from pygyroflow.stmap.exporter import STMapExporter
+
+                stem = output.rpartition(".")[0] or output
+                base = stem
+                paths = []
+                if args.export_stmap >= 1:
+                    paths.append(("undistort", f"{base}-undistort.exr"))
+                if args.export_stmap >= 2:
+                    paths.append(("distort", f"{base}-redistort.exr"))
+                exporter = STMapExporter(mgr._build_compute_params())
+                for map_type, path in paths:
+                    refuse_to_overwrite(path, args.overwrite)
+                    exporter.export(path, map_type=map_type)
+                    log.info("Wrote ST-Map: %s", path)
+                continue
+
             refuse_to_overwrite(output, args.overwrite)
 
             render_options = {
@@ -536,7 +574,27 @@ def main() -> None:
 
             # Render
             log.info("Rendering to: %s", output)
-            mgr.render(target, output, render_options)
+            progress_cb = None
+            if args.stdout_progress:
+                # One JSON line per callback, timestamped by wall clock so
+                # a wrapper can pace itself even when frames come in
+                # bursts. Regular logs stay wherever logging sends them.
+                started = time.time()
+
+                def progress_cb(fraction: float) -> None:
+                    print(
+                        json.dumps({
+                            "type": "progress",
+                            "fraction": round(max(0.0, min(1.0, float(fraction))), 4),
+                            "elapsed_s": round(time.time() - started, 1),
+                        }),
+                        flush=True,
+                    )
+
+            mgr.render(target, output, render_options,
+                       progress_callback=progress_cb)
+            if progress_cb is not None:
+                print(json.dumps({"type": "done", "output": output}), flush=True)
             log.info("Done: %s", output)
 
         except SystemExit:

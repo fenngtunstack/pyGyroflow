@@ -1947,6 +1947,7 @@ class StabilizationManager:
         options: dict | None = None,
         *,
         trim_ranges: list[tuple[float, float]] | None = None,
+        progress_callback=None,
     ) -> None:
         """Render stabilized video.
 
@@ -2144,7 +2145,10 @@ class StabilizationManager:
 
             return cpu_undistort(frame_data, transform, interpolation=interp_index)
 
-        proc.process_frames(stabilize_frame, ranges_ms=ranges_ms, speed=speed)
+        proc.process_frames(
+            stabilize_frame, ranges_ms=ranges_ms, speed=speed,
+            progress_callback=progress_callback,
+        )
 
         # Copy audio packets through the streams prepared before the video
         # pass. Previously the output was always silent. The same ranges
