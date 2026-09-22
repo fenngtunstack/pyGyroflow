@@ -282,7 +282,16 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | # | 等级 | 项 | 证据 |
 |---|---|---|---|
 | C-01 | R | **输出编解码矩阵**。上游 H.264/H.265/AV1/ProRes(6 profile)/DNxHD(8)/CineForm/**EXR 序列**/**PNG 序列**；我们 libx264/libx265/prores_ks(坏)/libaom-av1，另加两个上游没有的（vp9/mpeg4）。**无序列输出**——输入侧做了序列，输出侧仍只有视频 | [实测] |
-| C-02 | R | **逐平面/位深/HDR 管线缺失**。上游按解码器原生格式逐平面处理（NV12/P010/YUV420P10/16、GBRPF32LE、RGB48BE…，`mod.rs:563-651`），按位深设 `pixel_value_limit`；我们 `ffmpeg_processor.py:216` 一律 `to_ndarray("rgb24")` 再编码回 yuv420p。**10/12/16-bit 与浮点输入在稳定化前就被量化到 8bit** | [实测] |
+| C-02 | R | **逐平面/位深/HDR 管线缺失**。上游按解码器原生格式逐平面处理（NV12/P010/YUV420P10/16、GBRPF32LE、RGB48BE…，`mod.rs:563-651`），按位深设 `pixel_value_limit`；我们 `ffmpeg_processor.py:216` 一律 `to_ndarray("rgb24")` 再编码回 yuv420p。**10/12/16-bit 与浮点输入在稳定化前就被量化到 8bit**
+
+**C-02 勘察记录（2026-09-22，C-03 落地后）**。实现原生平面管线需要过四道关，前两道是环境硬阻塞：
+
+1. **PyAV `to_ndarray` 覆盖缺口**：`yuv444p10le` 直接 `ValueError: not yet supported`（10-bit 旗舰格式！）；4:2:0 的 10/12-bit 同样不支持。绕过须走 `frame.planes[i]` 原始字节缓冲 + line-size/stride 处理 + RGB48BE 等大端格式的字节序重排——这层胶水没有上游对应物可对照验证。
+2. **形状不一致**：`to_ndarray()` 对 `yuv444p` 给 `(3,H,W)`（平面在轴 0）、对 `yuv444p16le` 给 `(H,W,3)`（通道在尾轴）、`gbrpf32le` 给 `(H,W,3)` float。每个格式都要实测形状表（已探明：`yuv444p (3,48,64) u8`、`yuv444p16le (48,64,3) u16`、`gbrpf32le (48,64,3) f32`、`rgb48be (48,64,3) u16`、`gray (48,64) u8`）。
+3. **色度子采样坐标**：4:2:0/4:2:2 的色度平面是半分辨率。上游 shader 在归一化 uv 空间工作（`wgpu_undistort.wgsl` 只用 plane_index 做 fix_range 的 is_y 判定），坐标缩放藏在 `zero_copy.get_plane_buffer` 的缓冲几何里——移植前必须把这条坐标链读穿，否则色度映射差半像素是赌出来的。
+4. **编码器格式协商**：上游输入/输出帧格式由 ffmpeg 管线分别决定（平面表按 (in_frame, out_frame) 成对建），移植的输出流 pix_fmt 是按 codec 选的（`_PIX_FMT_MAP`）；「原生直通」要求两者一致时才可走，否则维持现有转换。
+
+建议路径：先做「平面几何 == 帧几何」的格式（yuv444p 族、GBRP、打包 RGB/AYUV——C-03 的表已列全），4:2:0/4:2:2 等色度坐标链读穿后再进。 | [实测] |
 | C-03 | R | **底层缺像素格式类型**。上游 `pixel_formats.rs` 12 种（含 NV12/P010/AYUV16/RGBAf16/BGRA8 通道交换 + Rec709 full→limited 重映射）；我们 `pixel_formats.py:15-55` 只做 dtype 探测。这是 C-02 的根因 | [报告] |
 | C-04 | E | **trim ranges 渲染时不生效**。`params.trim_ranges` 只有平滑用；`manager.render` 与 `ffmpeg_processor` 完全忽略 → 永远整片渲染。上游 `mod.rs:194-200,278-280` 定位+时间戳重基+`pad_with_black`+`export_trims_separately` —— 已实现（`11294ef`） | [实测] |
 | C-05 | E | **帧率控制 / 变速缺失**。上游回调可设 `repeat_times`/`out_timestamp_us`（`mod.rs:460-479`）+ `fps_scale` VFR；我们的回调只读时间戳，`video_speed`/`fps_scale` 渲染时被忽略 —— 已实现（`6a95077`），两个机制分开：`video_speed` 改帧数、`fps_scale` 只改查询时间戳 | [实测] |
