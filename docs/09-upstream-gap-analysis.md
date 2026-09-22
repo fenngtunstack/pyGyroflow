@@ -147,7 +147,7 @@ kernel_params.interpolation = 2   # 注释写 "Bilinear"
 
 ---
 
-### G-06 [实测] STMap 的 redistort 图没有畸变模型，且不可达
+### G-06 [实测] ~~STMap 的 redistort 图没有畸变模型~~ 已修（`bcc927b`，图本体）；可达性（render_queue 的 stmap job）仍属 C-12
 
 `pygyroflow/stmap/exporter.py:225-236` 是逐像素 Python 双重循环，只把 `matrices[0]` 的 3×3 求逆。注释自认 "simplified approach"。
 
@@ -302,7 +302,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | C-10 | R | **`settings.py` 是死代码**。106 行类，**全仓库零引用**。CLI 默认值硬编码在 argparse。上游 settings.json 约 25 个键驱动导出/同步默认值 | [报告] |
 | C-11 | E | **CLI 表面积**。上游有 `--export_project`(4 模式)/`--export_metadata`(3)/`--export_stmap`(2)/`-p`/`-s`/`--preset`/`-t`/`-j`/`-d`/`--stdout_progress`/`--watch`/`--version`/`-f`。已补：多类型位置输入分流、`--preset`/`--export-project 1`/`-p`/`-s`/`-t`/`-f`/`--version`（`e7fb663`）。未补：`-j`/`-d`/`--watch`/`--open`/`-b`/`-r`/`--no-gpu-decoding`/`--stdout_progress`/`--export_metadata`/`--export_stmap` | [报告] |
 | C-12 | R | **RenderQueue 是骨架**。上游 1740 行（并行渲染、暂停/取消、队列持久化、preset 批量、渲染前 autosync、缩略图、when_done）；我们 227 行顺序执行，export 类 job 只 `json.dump` options，stmap job 抛 `NotImplementedError` | [报告] |
-| C-13 | R | `compute_distort_map` 无畸变模型（见 G-06） | [实测] |
+| C-13 | R | `compute_distort_map` 无畸变模型（见 G-06） —— 已修（`bcc927b`）：整网格喂 undistort_points_with_rolling_shutter（use_fovs=true、全额校正，逐行旋转由点族内部处理），未收敛点归零 | [实测] |
 | C-14 | R | **manager setter 面**：上游约 45 个 `set_*`，我们 10 个。功能性缺失：`frame_readout_direction`/`additional_rotation`/`additional_translation`/`zooming_method`/`max_zoom`/`video_speed`/`digital_lens`/背景全套/IMU 变换全套 | [报告] |
 | C-15 | R | **`util.rs` 辅助缺失**：`get_video_metadata`（扩展名白名单）、base91+zlib 编解码（**工程文件陀螺载荷用**）、`MapClosest::get_closest`（100ms 容差就近取）、`merge_json`（镜头库 sync_settings 合并）、`map_coord`。`util.py` 只有 `timestamp_at_frame`/`frame_at_timestamp` | [实测] |
 | C-16 | R | **`LensProfile` 保存/命名/校验缺失**，且 `get_all_matching_profiles`（`lens/profile.py:430-523`）**把 `sync_settings` 覆盖整个丢掉**——其余 20 项覆盖都移植对了 | [报告] |
@@ -407,6 +407,7 @@ ts = fr.timestamp_us          # ← 就是帧时间戳，没有中点
 | **D-06 参照**：`undistort_points` 对上游 Rust 逐值比对 | `6b7b84e` | `cpu_undistort.rs:649-803` 逐字节切出、`distortion_models/` 与 `gyro_source/splines.rs` 整流原样复制，编译后跑 26 用例 304 个坐标值，全部落在 3.7e-7 相对误差内（f32 vs f64 的本底）。**这一步查出上面三条缺陷**，其中两条结构性测试按构造就测不到。参照工程不入库，`generate_undistort_points_reference.py --stage` 现场从只读的 `opensource/gyroflow/` 抽取，所以不存在第二份会漂的副本 |
 | CPU 采样器消费 input_rotation（D-13） | `5e1b3be` | 7 项测试。90/180 度坐标映射按手算值比对（绕中心旋转，非角对称——首版测试在此翻过车）、零旋转恒等、fringe clamp 用旋转宽度、背景 clamp 天花板用未旋转宽度（1079 不被压到 1077，怪癖专测）、at_timestamp 打包两向、梯度帧端到端逐像素值 |
 | rs-sync 优化器 crate 移植 + 桥接（B-04） | `8ff80fa` + `00b6478` | 25 项模块测试 + 桥接后 e2e。梯度链（运动/延迟）对有限差分 <1e-5；端到端正弦场景恢复 −50 ms、代价 ~1e-6、残差景观真值处单点凹陷（**恒定角速度对该残差退化**——θ(t₁)+θ(t₂) 平移不变，须非线性 pan，记入测试 docstring）；向量化与标量路径 max diff 0.0（手展开公式在 y 分量翻过车，旋转轴对齐时差异项恰好消失——教训在提交信息）；e2e 实测 +191.6/200 ms |
+| STMap distort 图走真实模型（C-13/G-06） | `bcc927b` | 6 项测试：畸变改变图（旧逆矩阵恒等场景给恒等网格——判别性断言）、恒等场景逐像素回自身、主点径向不动、卷帘逐行差异 >0.05 px、哨兵归零不泄漏、尺寸覆盖 |
 | 视频输出原子发布 + 元数据拷贝（C-09 部分） | `1304d50` | 5 项测试：close 后改名发布且 .tmp 消失、flush 失败最终名不出现（PyAV 惰性建文件的断言边界写进注释）、未知扩展名警告直写、序列输出无改名路径、title 元数据往返 |
 | estimate_rolling_shutter（for_rs 分支） | `be76284` | 4 项机制测试：已知最小值恢复（12.34 ms，粗搜+细搜落点 ±0.02）、半开区间边界（[-33,+32] @30fps，Rust 语义）、空输入、params 私有副本换字段且不改动调用方。场景级对称不敏感的发现见 B-02 行 |
 | pose method 2 的 ARRSAC + eight-point 真身 | `5ad7bd1` | 13 项测试。精确场景 0.00000°、30% 外点仍 0.00000°（SPRT 的意义）；残差尺度校准专测（正确 ~1e-16 / 错解 ~2.0，阈值按此标定）；批量与标量残差逐位一致；列主序 reshape 的翻车记录（行主序当转置用 → 2° 偏差）。接线测试：单位射线断言、mild-lens 场景 0.07° |
