@@ -98,3 +98,42 @@ class TestUniformSyncPointFallback:
         centres = [chunks / 2.0 + i * chunks for i in range(n)]
         assert centres[0] == pytest.approx(1000.0)
         assert centres[-1] == pytest.approx(9000.0)
+
+
+class TestPerPointSearchWindow:
+    def test_profile_sync_settings_override_the_window(self, monkeypatch):
+        """``render_queue.rs:1470``: a profile's ``search_size`` is in
+        *seconds* and reaches the per-point search scaled to ms."""
+        from pygyroflow.manager import StabilizationManager
+        import pygyroflow.synchronization.optimsync as os_mod
+
+        mgr = StabilizationManager()
+        mgr.params.duration_ms = 15_000.0  # past the <12 s guard
+        monkeypatch.setattr(
+            os_mod.OptimSync, "run", lambda self, **k: ([], [], 0.05)
+        )
+        seen = {}
+
+        class Recorder:
+            def __init__(self, *a, **k):
+                pass
+
+            def run(self, frames, gyro, search_range_ms=None, **k):
+                seen["search_ms"] = search_range_ms
+                return None
+
+        import pygyroflow.synchronization as sync_pkg
+        monkeypatch.setattr(sync_pkg, "AutosyncProcess", Recorder)
+
+        # Enough frames to pass the >=60 gate and fill the first window.
+        frames = [(k * 33_333, np.zeros((4, 4), np.uint8)) for k in range(60)]
+        gyro = [(k * 33_333, np.array([0.0, 10.0, 0.0])) for k in range(60)]
+
+        mgr.lens.sync_settings = {"search_size": 1.5}  # seconds
+        mgr._refine_sync_points(frames, gyro, 0.0, None, 0.0)
+        assert seen["search_ms"] == pytest.approx(1500.0)
+
+        mgr.lens.sync_settings = None
+        seen.clear()
+        mgr._refine_sync_points(frames, gyro, 0.0, None, 0.0)
+        assert seen["search_ms"] == pytest.approx(mgr._SYNC_POINT_SEARCH_MS)

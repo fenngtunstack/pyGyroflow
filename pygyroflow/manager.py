@@ -1605,6 +1605,22 @@ class StabilizationManager:
         # Built once for the whole pass: every window in it shares a lens.
         sync_params = self._build_sync_compute_params()
 
+        # Per-point search window (B-17): upstream's default search_size is
+        # 5 s (cli.rs:623) and a lens profile's sync_settings can override
+        # it — in *seconds*, which render_queue.rs:1470 scales to ms. The
+        # port honours the profile override but keeps a narrower default
+        # than upstream's 5000 ms: the serial Python offset searches cost
+        # ~40x their rayon-parallel originals, and the refinement pass runs
+        # one search per sync point.
+        search_ms = self._SYNC_POINT_SEARCH_MS
+        if isinstance(self.lens.sync_settings, dict):
+            try:
+                profile_ms = float(self.lens.sync_settings.get("search_size", 0.0)) * 1000.0
+                if profile_ms > 0.0:
+                    search_ms = profile_ms
+            except (TypeError, ValueError):
+                pass
+
         for p_ms in points_ms:
             center_us = int(p_ms * 1000.0)
             window = [f for f in frames if center_us - win_us <= f[0] <= center_us + win_us]
@@ -1623,7 +1639,7 @@ class StabilizationManager:
                 off = proc.run(
                     window,
                     gyro_data,
-                    search_range_ms=self._SYNC_POINT_SEARCH_MS,
+                    search_range_ms=search_ms,
                     sample_count=None,
                     quaternions=quaternions,
                     frame_readout_time_ms=frame_readout_time_ms,
