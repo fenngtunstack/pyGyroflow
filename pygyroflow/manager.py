@@ -722,6 +722,12 @@ class StabilizationManager:
             value = stab.get(key, default)
             return default if value is None else value
 
+        # Keyframes first: the smoothing-parameter keys below may be keyframed,
+        # and upstream's ComputeParams serde carries the KeyframeManager inside
+        # this same section (serialize shape: keyframes.rs:76-83).
+        if isinstance(stab.get("keyframes"), dict):
+            self.keyframes.deserialize(stab["keyframes"])
+
         p.fov = float(get("fov", p.fov))
         # The sign is kept, not dropped: upstream reads a negative readout time
         # as "this sensor reads bottom to top" and nothing else carries that.
@@ -871,6 +877,7 @@ class StabilizationManager:
         )
         proj.stabilization = {
             **proj.stabilization,
+            "keyframes": self.keyframes.serialize(),
             "fov": p.fov,
             "method": self.smoothing.current().get_name(),
             "smoothing_params": [

@@ -30,6 +30,19 @@ def _new_id() -> int:
     return random.randint(*_ID_RANGE)
 
 
+def _parse_easing(raw) -> Easing:
+    """Easing from a serialized value: the upstream variant-name string or a
+    legacy integer. Unknown strings fall back to the default (NoEasing)
+    rather than raising — a project from a newer Gyroflow should not fail to
+    load over one enum member."""
+    if isinstance(raw, str):
+        try:
+            return Easing[raw]
+        except KeyError:
+            return Easing.NoEasing
+    return Easing(raw)
+
+
 class KeyframeManager:
     """Manages keyframes for all keyframe types with interpolation.
 
@@ -453,25 +466,56 @@ class KeyframeManager:
     # ------------------------------------------------------------------
 
     def serialize(self) -> dict:
-        """Serialize all keyframes to a JSON-compatible dict."""
-        result = {}
+        """Serialize to the shape upstream's serde derive writes.
+
+        ``keyframes.rs:76-83``: ``{"keyframes": {TypeName: {ts_us:
+        {"id", "value", "easing"}}}, "gyro_offsets": {...}, "timestamp_scale":
+        ...}`` — the easing is the *variant name string* (serde's unit-enum
+        form), which is what a real ``.gyroflow`` file carries. The old port
+        format (flat map, easing as an int) is still accepted on read.
+        """
+        keyframes = {}
         for key, kfs in self._keyframes.items():
-            result[key.name] = {
-                str(ts): {"id": kf.id, "value": kf.value, "easing": kf.easing.value}
+            keyframes[key.name] = {
+                str(ts): {
+                    "id": int(kf.id),
+                    "value": float(kf.value),
+                    "easing": kf.easing.name,
+                }
                 for ts, kf in kfs.items()
             }
-        # Upstream's serde derives include gyro_offsets (keyframes.rs:79).
-        if self.gyro_offsets:
-            result["gyro_offsets"] = {
-                str(ts): off for ts, off in self.gyro_offsets.items()
-            }
-        return result
+        return {
+            "keyframes": keyframes,
+            "gyro_offsets": {
+                str(ts): float(off) for ts, off in self.gyro_offsets.items()
+            },
+            "timestamp_scale": self.timestamp_scale,
+        }
 
     def deserialize(self, data: dict) -> None:
-        """Deserialize keyframes from a dict, replacing current state."""
+        """Deserialize keyframes from a dict, replacing current state.
+
+        Accepts the upstream serde shape and the old port format (flat
+        ``{TypeName: {ts: {...}}}`` with integer easings). A keyframe whose
+        ``id`` is missing gets a fresh random one — upstream's
+        ``#[serde(default = "default_id")]`` (``keyframes.rs:70``) — which is
+        what makes profiles and projects written by other tools readable.
+        """
         self._keyframes.clear()
         self._timestamps.clear()
         self.gyro_offsets = {}
+        self.timestamp_scale = None
+
+        wrapper = data.get("keyframes") if isinstance(data.get("keyframes"), dict) else None
+        if wrapper is not None:
+            offsets = data.get("gyro_offsets")
+            if isinstance(offsets, dict):
+                self.gyro_offsets = {
+                    int(ts): float(off) for ts, off in offsets.items()
+                }
+            scale = data.get("timestamp_scale")
+            self.timestamp_scale = None if scale is None else float(scale)
+            data = wrapper
 
         for type_name, ts_map in data.items():
             if type_name == "gyro_offsets":
@@ -488,9 +532,9 @@ class KeyframeManager:
             for ts_str, kf_data in ts_map.items():
                 ts = int(ts_str)
                 kf = Keyframe(
-                    id=kf_data["id"],
-                    value=kf_data["value"],
-                    easing=Easing(kf_data["easing"]),
+                    id=_new_id() if "id" not in kf_data else int(kf_data["id"]),
+                    value=float(kf_data["value"]),
+                    easing=_parse_easing(kf_data["easing"]),
                 )
                 self._keyframes[key][ts] = kf
                 self._insert_sorted(key, ts)
