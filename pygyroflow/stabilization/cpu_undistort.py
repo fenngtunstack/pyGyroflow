@@ -377,6 +377,27 @@ def cpu_undistort(
 
     src_x, src_y, valid = _rotate_and_distort(xs, ys, m, kp, model, ibis_active=ibis_any)
 
+    # Input rotation (cpu_undistort.rs:483-489): a decoder that delivers
+    # already-rotated frames tags them with a rotation, and the map above
+    # works in the *stored* orientation — so the coordinates are rotated into
+    # the delivered frame's geometry and the effective frame size becomes the
+    # rotated bounding box. The background-mode clamps below deliberately
+    # keep the *unrotated* params size (upstream bounds them with
+    # params.width/height, cpu_undistort.rs:492-500); only the sampling
+    # bounds further down follow the rotated geometry, which is the shape of
+    # the frame array this function receives.
+    samp_w, samp_h = in_w, in_h
+    if kp.input_rotation != 0.0:
+        rotation = math.radians(kp.input_rotation)
+        cos_r = math.cos(rotation)
+        sin_r = math.sin(rotation)
+        samp_w = int(round(abs(cos_r * in_w - sin_r * in_h)))
+        samp_h = int(round(abs(sin_r * in_w + cos_r * in_h)))
+        dx = src_x - in_w / 2.0
+        dy = src_y - in_h / 2.0
+        src_x = cos_r * dx - sin_r * dy + samp_w / 2.0
+        src_y = sin_r * dx + cos_r * dy + samp_h / 2.0
+
     # EWA needs the Jacobian of this map, and it has to be measured before the
     # background-mode extension below: a repeated or mirrored region is flat,
     # which would collapse the ellipse into its degenerate case.  Upstream
@@ -416,10 +437,10 @@ def cpu_undistort(
     map_x = src_x.astype(np.float32)
     map_y = src_y.astype(np.float32)
 
-    fringe_x = (map_x >= in_w - 1) & (map_x < in_w)
-    map_x[fringe_x] = np.float32(in_w - 1) - np.float32(1e-4)
-    fringe_y = (map_y >= in_h - 1) & (map_y < in_h)
-    map_y[fringe_y] = np.float32(in_h - 1) - np.float32(1e-4)
+    fringe_x = (map_x >= samp_w - 1) & (map_x < samp_w)
+    map_x[fringe_x] = np.float32(samp_w - 1) - np.float32(1e-4)
+    fringe_y = (map_y >= samp_h - 1) & (map_y < samp_h)
+    map_y[fringe_y] = np.float32(samp_h - 1) - np.float32(1e-4)
 
     sentinel = np.float32(-1e5)
     map_x = np.where(valid, map_x, sentinel)
@@ -462,7 +483,7 @@ def cpu_undistort(
             frame, map_x, map_y, interp_flag,
             borderMode=cv2.BORDER_REPLICATE,
         )
-        oob = (src_x < 0) | (src_x >= in_w) | (src_y < 0) | (src_y >= in_h)
+        oob = (src_x < 0) | (src_x >= samp_w) | (src_y < 0) | (src_y >= samp_h)
         paint = ~valid | oob
         if paint.any():
             if channels == 1:

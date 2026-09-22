@@ -597,6 +597,8 @@ class FrameTransform:
         params: ComputeParams,
         timestamp_ms: float,
         frame: int,
+        input_rotation: float = 0.0,
+        output_rotation: float = 0.0,
     ) -> FrameTransform:
         """Compute frame transform at a given timestamp.
 
@@ -860,6 +862,15 @@ class FrameTransform:
 
         # Source/output rectangles (full image by default)
         kernel_params.source_rect = (ctypes.c_int32 * 4)(0, 0, params.width, params.height)
+
+        # Frame rotation metadata from the decoder (upstream carries it on
+        # the render buffers, stabilization/mod.rs:315-319): nonzero only
+        # when the decoder delivers *already-rotated* frames, in which case
+        # the CPU sampler re-maps coordinates into that geometry
+        # (cpu_undistort.rs:483-489). PyAV hands out raw frames, so callers
+        # leave both at 0.0 unless they pre-rotate.
+        kernel_params.input_rotation = float(input_rotation)
+        kernel_params.output_rotation = float(output_rotation)
         kernel_params.output_rect = (ctypes.c_int32 * 4)(0, 0, params.output_width, params.output_height)
 
         # Safe-area rect must cover the full frame: the shader's
