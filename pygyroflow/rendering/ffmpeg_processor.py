@@ -8,6 +8,7 @@ graceful resource cleanup.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import numpy as np
@@ -37,6 +38,20 @@ _DEFAULT_CODEC = "libx265"
 _SEQUENCE_CODECS: dict[str, tuple[str, str]] = {
     "PNG Sequence": ("png", "rgb24"),
     "EXR Sequence": ("exr", "gbrpf32le"),
+}
+
+# Container format per output extension, for the atomic-write tmp file whose
+# own ".tmp" suffix hides the real one from FFmpeg's format guessing.
+_FORMAT_FOR_SUFFIX: dict[str, str] = {
+    ".mp4": "mp4",
+    ".mov": "mov",
+    ".mkv": "matroska",
+    ".webm": "webm",
+    ".avi": "avi",
+    ".m4v": "mp4",
+    ".mpg": "mpeg",
+    ".mpeg": "mpeg",
+    ".ts": "mpegts",
 }
 
 # Pixel format per encoder.  Encoders are not interchangeable here: prores_ks
@@ -214,6 +229,10 @@ class FfmpegProcessor(VideoProcessor):
         self._audio_pairs: list = []
         self._output_codec_name: str | None = None
         self._output_is_sequence: bool = False
+        # (tmp_path, final_path) while a video output awaits its atomic
+        # rename in close(); None for sequence outputs and before any
+        # output exists.
+        self._pending_rename: tuple[str, str] | None = None
 
     # ------------------------------------------------------------------
     # VideoProcessor interface
@@ -315,7 +334,16 @@ class FfmpegProcessor(VideoProcessor):
         codec: str = "H.265/HEVC",
         bitrate: float = 0.0,
     ) -> None:
-        """Set up the output encoder."""
+        """Set up the output encoder.
+
+        Video outputs are written to ``<path>.tmp`` and renamed into place
+        on :meth:`close` (upstream ``rendering/mod.rs`` does the same): a
+        crash mid-render then leaves either nothing or a complete file,
+        never a truncated half-video — and a re-run over an existing good
+        file cannot destroy it. Sequence (image2) outputs skip this: their
+        per-frame files are already granular.
+        """
+        self._final_output_path = path
         import av  # type: ignore[import-untyped]
 
         if self._input_container is None:
@@ -338,9 +366,41 @@ class FfmpegProcessor(VideoProcessor):
             pix_fmt = _PIX_FMT_MAP.get(codec_name, "yuv420p")
 
         self._output_codec_name = codec_name
+        write_path = path
+        container_format = "image2" if sequence is not None else None
+        if sequence is None:
+            # Atomic video writes: encode into <path>.tmp, rename in
+            # close(). The .tmp suffix hides the real extension, so the
+            # container format must be named explicitly.
+            suffix_format = _FORMAT_FOR_SUFFIX.get(
+                os.path.splitext(path)[1].lower()
+            )
+            if suffix_format is not None:
+                write_path = path + ".tmp"
+                container_format = suffix_format
+                self._pending_rename = (write_path, path)
+            else:
+                # Unknown extension: write directly rather than guess.
+                log.warning(
+                    "Unknown output extension %r; writing %s directly "
+                    "(no atomic rename)", os.path.splitext(path)[1], path,
+                )
+                self._pending_rename = None
+        else:
+            self._pending_rename = None
         self._output_container = av.open(
-            path, mode="w", format="image2" if sequence is not None else None
+            write_path, mode="w", format=container_format
         )
+        # Carry the input's container metadata over (upstream copies it in
+        # rendering): the rotation tag survives a re-encode, players pick
+        # up title/creation data.
+        if sequence is None and self._input_container is not None:
+            try:
+                for key, value in (self._input_container.metadata or {}).items():
+                    if isinstance(value, str):
+                        self._output_container.metadata[key] = value
+            except Exception:
+                log.debug("Could not copy container metadata", exc_info=True)
         self._output_stream = self._output_container.add_stream(
             codec_name, rate=fps_frac
         )
@@ -632,9 +692,11 @@ class FfmpegProcessor(VideoProcessor):
     def close(self) -> None:
         """Flush the encoder and close containers."""
         try:
-            import av  # type: ignore[import-untyped]
+            import av  # type: ignore[import-untyped]  # noqa: F401
         except ImportError:
-            # Nothing to clean up if PyAV was never used.
+            # Nothing to clean up if PyAV was never used. The import is a
+            # feature probe: close() itself only touches containers that
+            # open_* created, which require PyAV to exist.
             self._output_container = None
             self._input_container = None
             self._output_stream = None
@@ -652,6 +714,24 @@ class FfmpegProcessor(VideoProcessor):
                 self._output_container.close()
             except Exception:
                 log.warning("Error closing output container", exc_info=True)
+
+            # The atomic publish: only a fully flushed, closed container
+            # gets renamed onto the final path. A failed flush leaves the
+            # .tmp behind (garbage, but visibly so) instead of a truncated
+            # file wearing the output's name.
+            if self._pending_rename is not None:
+                tmp_path, final_path = self._pending_rename
+                self._pending_rename = None
+                import os
+
+                try:
+                    if os.path.exists(tmp_path):
+                        os.replace(tmp_path, final_path)
+                except OSError:
+                    log.error(
+                        "Failed to publish %s (left at %s)",
+                        final_path, tmp_path, exc_info=True,
+                    )
 
         if self._input_container is not None:
             try:

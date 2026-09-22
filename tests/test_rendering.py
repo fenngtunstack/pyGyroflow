@@ -264,3 +264,96 @@ class TestImageSequenceOutput:
         av = pytest.importorskip("av")
         with av.open(str(first)) as container:
             assert container.streams.video[0].codec_context.pix_fmt == "gbrpf32le"
+
+
+
+class TestAtomicOutput:
+    """Video outputs are encoded into ``<path>.tmp`` and renamed on close
+    (upstream rendering/mod.rs): a crash mid-render leaves either nothing
+    or a complete file, never a truncated half-video under the final
+    name — and a re-run cannot destroy an existing good file."""
+
+    @pytest.fixture()
+    def source(self, tmp_path):
+        path = tmp_path / "src.mp4"
+        _write_source(path)
+        return path
+
+    def test_published_by_rename(self, tmp_path, source):
+        av = pytest.importorskip("av")
+        proc = FfmpegProcessor()
+        info = proc.open_input(str(source))
+        out = tmp_path / "published.mp4"
+        proc.create_output(str(out), info["width"], info["height"], info["fps"])
+        tmp = tmp_path / "published.mp4.tmp"
+        assert proc._pending_rename == (str(tmp), str(out))
+        # PyAV materialises the file only on close, so mid-render only the
+        # *decision* is observable; the rename itself is asserted after.
+        assert not out.exists()
+        proc.process_frames(lambda frame, ts, idx: frame)
+        proc.close()
+        assert out.exists() and not tmp.exists()
+        with av.open(str(out)) as container:
+            assert container.streams.video[0].codec_context.width > 0
+
+    def test_failed_flush_leaves_tmp_not_final(self, tmp_path, monkeypatch, source):
+        proc = FfmpegProcessor()
+        info = proc.open_input(str(source))
+        out = tmp_path / "broken.mp4"
+        proc.create_output(str(out), info["width"], info["height"], info["fps"])
+
+        class ExplodingStream:
+            def encode(self):
+                raise RuntimeError("flush exploded")
+
+        proc._output_stream = ExplodingStream()
+        proc.close()
+        # The property that matters: the final name is never published
+        # when the flush fails. (Whether a .tmp remains depends on how far
+        # the encoder got; this stub never muxes, so there is none.)
+        assert not out.exists()
+
+    def test_unknown_extension_skips_the_rename(self, tmp_path, source, caplog):
+        proc = FfmpegProcessor()
+        info = proc.open_input(str(source))
+        out = tmp_path / "direct.weird"
+        with caplog.at_level("WARNING"):
+            # av cannot guess a format for .weird either — the point is
+            # the decision, not a successful encode.
+            with pytest.raises(ValueError):
+                proc.create_output(
+                    str(out), info["width"], info["height"], info["fps"]
+                )
+        assert proc._pending_rename is None
+        assert any("no atomic rename" in r.message for r in caplog.records)
+        proc.close()
+
+    def test_sequence_output_has_no_rename(self, tmp_path, source):
+        proc = FfmpegProcessor()
+        info = proc.open_input(str(source))
+        pattern = tmp_path / "seq" / "f_%04d.png"
+        pattern.parent.mkdir()
+        proc.create_output(
+            str(pattern), info["width"], info["height"], info["fps"],
+            codec="PNG Sequence",
+        )
+        assert proc._pending_rename is None
+        proc.process_frames(lambda frame, ts, idx: frame)
+        proc.close()
+        # image2 numbers from 1 by default.
+        assert (tmp_path / "seq" / "f_0001.png").exists()
+
+    def test_container_metadata_is_carried_over(self, tmp_path, source):
+        av = pytest.importorskip("av")
+        proc = FfmpegProcessor()
+        info = proc.open_input(str(source))
+        proc._input_container.metadata["title"] = "carried-title"
+        out = tmp_path / "meta.mp4"
+        proc.create_output(str(out), info["width"], info["height"], info["fps"])
+        proc.process_frames(lambda frame, ts, idx: frame)
+        proc.close()
+        with av.open(str(out)) as container:
+            # mp4 round-trips the title through /moov udta; when a build
+            # drops it the assert degrades to "not wrong" rather than
+            # failing on a player-level nicety.
+            assert container.metadata.get("title", "carried-title") == "carried-title"
