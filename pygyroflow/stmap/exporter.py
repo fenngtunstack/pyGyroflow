@@ -159,13 +159,18 @@ class STMapExporter:
     ) -> NDArray[np.float32]:
         """Compute the distort coordinate map (input -> output).
 
-        For each source pixel in the original frame, computes where it maps
-        to in the stabilized output.  This is the forward-direction mapping
-        that compositing tools use to push pixels.
+        Port of the ``dist`` half of ``generate_stmaps``
+        (``stmap.rs:104-119``): for each pixel of the *input* frame, the
+        full model — ``at_timestamp_for_points(..., use_fovs = True)`` +
+        ``undistort_points`` at ``lens_correction_amount = 1.0`` — yields
+        the stabilized-space coordinate. The old port approximated this
+        with the inverse of ``matrices[0]``'s 3×3, which carries no lens,
+        no per-row rolling shutter and no FOV scaling: any non-zero
+        distortion produced a wrong map (gap item G-06).
 
-        Implementation: computes an undistort map at the input resolution,
-        then the forward map is the inverse relationship.  For simplicity,
-        we compute it by evaluating the transform at each input pixel.
+        The whole grid goes through the points family in one call — it
+        computes one rotation per row for rolling shutter exactly as the
+        per-pixel upstream loop does, vectorised.
 
         Args:
             timestamp_ms: Frame timestamp in milliseconds.
@@ -181,60 +186,24 @@ class STMapExporter:
         w = width or params.width
         h = height or params.height
 
-        # Build a modified params for forward mapping:
-        # Input dimensions are the source, output is the stabilized result
-        from copy import deepcopy
-        fwd_params = deepcopy(params)
-        fwd_params.width = w
-        fwd_params.height = h
-        fwd_params.output_width = w
-        fwd_params.output_height = h
+        from pygyroflow.stabilization.cpu_undistort import (
+            undistort_points_with_rolling_shutter,
+        )
 
-        transform = self._transform_factory(fwd_params, timestamp_ms, frame)
-        transform.kernel_params.width = w
-        transform.kernel_params.height = h
-        transform.kernel_params.output_width = w
-        transform.kernel_params.output_height = h
+        xs, ys = np.meshgrid(np.arange(w, dtype=np.float64),
+                             np.arange(h, dtype=np.float64))
+        points = np.column_stack([xs.ravel(), ys.ravel()])
 
-        kp = transform.kernel_params
-        matrices = transform.matrices
+        mapped = undistort_points_with_rolling_shutter(
+            points, timestamp_ms, frame, params, 1.0, True,
+        )
+        mapped = np.asarray(mapped, dtype=np.float64).reshape(h, w, 2)
 
-        # For the distort map we iterate source pixels and apply the
-        # inverse of the undistort transform.  In Gyroflow's Rust code,
-        # this uses undistort_points().  Here we use a simplified approach:
-        # compute the stabilization matrix inverse to map source -> output.
-        coord_map = np.zeros((h, w, 2), dtype=np.float32)
+        from pygyroflow.stabilization.cpu_undistort import _POINT_FAILURE
 
-        # Extract the 3x3 inverse transform from matrices[0]
-        # The matrix stored is (new_k @ R)^-1, so to go forward we need
-        # to invert it back: new_k @ R applied to source coords gives output.
-        if len(matrices) > 0:
-            m = matrices[0]
-            # Reconstruct the 3x3 forward matrix (inverse of what's stored)
-            inv_mat = np.array([
-                [m[0], m[1], m[2]],
-                [m[3], m[4], m[5]],
-                [m[6], m[7], m[8]],
-            ], dtype=np.float64)
-
-            try:
-                fwd_mat = np.linalg.inv(inv_mat)
-            except np.linalg.LinAlgError:
-                fwd_mat = np.eye(3, dtype=np.float64)
-
-            for y in range(h):
-                for x in range(w):
-                    # Apply forward transform: output = fwd_mat @ [x, y, 1]
-                    homogeneous = np.array([x, y, 1.0], dtype=np.float64)
-                    result = fwd_mat @ homogeneous
-
-                    if result[2] > 0.0:
-                        out_x = result[0] / result[2]
-                        out_y = result[1] / result[2]
-                        coord_map[y, x, 0] = out_x
-                        coord_map[y, x, 1] = out_y
-
-        return coord_map
+        failure = np.isclose(mapped, _POINT_FAILURE).all(axis=-1)
+        mapped[failure] = 0.0
+        return mapped.astype(np.float32)
 
     def export(
         self,
