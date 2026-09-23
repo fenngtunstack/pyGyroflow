@@ -8,8 +8,10 @@ was an empty scaffold and has been removed; this parser is the sole path.)
 from __future__ import annotations
 
 import logging
+import mmap
 import os
 import struct
+import weakref
 
 from pygyroflow.gyro_source.file_metadata import FileMetadata
 from pygyroflow.types.enums import ReadoutDirection
@@ -136,31 +138,66 @@ def _parse_embedded(
 # ---------------------------------------------------------------------------
 
 # Upstream telemetry-parser reads only the head and the tail of the file for
-# format detection (util::read_beginning_and_end, 5 MB each side below 5 GB —
-# see lib.rs::from_stream_with_options). That bound is load-bearing, not an
-# optimisation: every one of these markers is a fourcc, so the full-file
-# search that was done here before finds them inside compressed video data.
-# On a 470 MB Sony clip 'dvtm' occurs at 201 MB and 'djmd' at 236 MB, both
-# inside the H.264 payload; the parser then called the file DJI, never
-# reached the Sony branch, and returned zero IMU samples — a silently
-# unstabilized output. Every false positive found so far sits outside the
-# window.
+# format detection (util::read_beginning_and_end; per-side size tiers in
+# lib.rs::from_stream_with_options, see _detect_window_for). That bound is
+# load-bearing, not an optimisation: every one of these markers is a fourcc,
+# so the full-file search that was done here before finds them inside
+# compressed video data. On a 470 MB Sony clip 'dvtm' occurs at 201 MB and
+# 'djmd' at 236 MB, both inside the H.264 payload; the parser then called
+# the file DJI, never reached the Sony branch, and returned zero IMU
+# samples — a silently unstabilized output. Every false positive found so
+# far sits outside the window.
 _DETECT_WINDOW = 5 * 1024 * 1024
 
 
 def _read_all(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
+    """Byte-addressable view of the whole file — without a whole-file copy.
+
+    Upstream parses from a seekable stream, reading each sample by its
+    absolute table offset (lib.rs ``from_stream_with_options`` hands the
+    *stream* to ``parse``). The Python parsers slice one full-file buffer
+    instead, which is an OOM on 4K-length clips. An ``mmap`` view keeps the
+    exact slice/``find``/``len``/int-index contract they are written
+    against, while the resident set stays at touched pages only —
+    kernel-evictable, the same memory profile as upstream's stream reads.
+    """
+    if os.path.getsize(path) == 0:
+        return b""
+    f = open(path, "rb")
+    try:
+        view = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    except ValueError:  # truncated to zero between size() and mmap
+        f.close()
+        return b""
+    weakref.finalize(view, f.close)
+    return view
+
+
+def _detect_window_for(size: int) -> int:
+    """Upstream's size-tiered detection window (lib.rs:73-84): the bigger
+    the file, the bigger the head/footer region a moov or trailer may hide
+    in. Returns bytes per side."""
+    GIB = 1024 * 1024 * 1024
+    if size > 100 * GIB:
+        return 500 * 1024 * 1024
+    if size > 60 * GIB:
+        return 220 * 1024 * 1024
+    if size > 30 * GIB:
+        return 180 * 1024 * 1024
+    if size > 5 * GIB:
+        return 50 * 1024 * 1024
+    return _DETECT_WINDOW  # 5 MiB
 
 
 def _detect_buffer(path: str) -> bytes:
     """Head + tail of *path*, mirroring upstream's detection buffer."""
     size = os.path.getsize(path)
+    window = _detect_window_for(size)
     with open(path, "rb") as f:
-        if size > 2 * _DETECT_WINDOW:
-            head = f.read(_DETECT_WINDOW)
-            f.seek(-_DETECT_WINDOW, os.SEEK_END)
-            return head + f.read(_DETECT_WINDOW)
+        if size > 2 * window:
+            head = f.read(window)
+            f.seek(-window, os.SEEK_END)
+            return head + f.read(window)
         return f.read()
 
 
