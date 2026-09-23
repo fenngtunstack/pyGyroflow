@@ -1493,6 +1493,62 @@ class StabilizationManager:
     _SYNC_POINT_SEARCH_MS = 120.0
     _SYNC_POINT_MIN_DRIFT_MS = 15.0
     _SYNC_POINT_MAX_RESIDUAL_MS = 10.0
+
+    @staticmethod
+    def _resolve_syncpoint_pattern(
+        o: object, duration_ms: float, fps: float
+    ) -> list[float]:
+        """Port of render_queue.rs:1690-1727 resolve_syncpoint_pattern.
+
+        Durations arrive as numbers (FRAME COUNTS, scaled by fps) or strings
+        ("12ms" / "2.5s" / bare "300" = frames). Items expand to sync-point
+        timestamps: start, then every interval, split around gap.
+        """
+        def duration_to_ms(d: object) -> float | None:
+            if isinstance(d, bool) or not isinstance(d, (int, float, str)):
+                return None
+            if isinstance(d, str):
+                if d.endswith("ms"):
+                    try:
+                        return float(d[:-2])
+                    except ValueError:
+                        return None
+                if d.endswith("s"):
+                    try:
+                        return float(d[:-1]) * 1000.0
+                    except ValueError:
+                        return None
+                try:
+                    return float(d) / fps * 1000.0
+                except ValueError:
+                    return None
+            return float(d) / fps * 1000.0
+
+        def resolve_item(x: object) -> list[float]:
+            if not isinstance(x, dict):
+                return []
+            start = duration_to_ms(x.get("start")) or 0.0
+            interval = duration_to_ms(x.get("interval"))
+            if interval is None:
+                interval = duration_ms
+            gap = duration_to_ms(x.get("gap")) or 0.0
+            out: list[float] = []
+            i = start
+            while i < duration_ms:
+                out.append(i - gap / 2.0)
+                if gap > 0.0:
+                    out.append(i + gap / 2.0)
+                i += interval
+            return out
+
+        timestamps: list[float] = []
+        if isinstance(o, list):
+            for x in o:
+                timestamps.extend(resolve_item(x))
+        elif isinstance(o, dict):
+            timestamps.extend(resolve_item(o))
+        timestamps.sort()
+        return timestamps
     # DJI cameras show a consistent ~+8 ms telemetry-vs-video offset
     # (Osmo Nano autosync lock 7.92 ms, Avata offset sweep optimum +8 ms).
     # A narrow window around the prior also guards against the FPV
@@ -1572,30 +1628,54 @@ class StabilizationManager:
         from pygyroflow.synchronization import AutosyncProcess
         from pygyroflow.synchronization.optimsync import OptimSync
 
+        # SyncParams knobs (render_queue.rs:1443-1459): max_sync_points
+        # drives the point count, auto_sync_points=false skips the optimal
+        # selection, custom_sync_pattern replaces the fallback spread.
+        sync_settings = self.lens.sync_settings if isinstance(
+            self.lens.sync_settings, dict) else {}
         try:
-            ts_ms = np.array([t / 1000.0 for t, _ in gyro_data], dtype=np.float64)
-            w = np.array([g for _, g in gyro_data], dtype=np.float64)
-            points_ms, _rank, _step = OptimSync(ts_ms, w).run(
-                target_sync_points=self._SYNC_POINT_COUNT,
-                trim_ranges_s=[(0.0, self.params.duration_ms / 1000.0)],
-            )
-        except Exception:
-            log.warning("Auto-sync: OptimSync point selection failed", exc_info=True)
-            points_ms = []
-        if len(points_ms) < 2:
+            max_points = int(sync_settings.get(
+                "max_sync_points", self._SYNC_POINT_COUNT))
+        except (TypeError, ValueError):
+            max_points = self._SYNC_POINT_COUNT
+        if max_points <= 0:
+            max_points = self._SYNC_POINT_COUNT
+        auto_sync_points = bool(sync_settings.get("auto_sync_points", True))
+        pattern = sync_settings.get("custom_sync_pattern")
+
+        points_ms: list[float] = []
+        if auto_sync_points:
+            try:
+                ts_ms = np.array([t / 1000.0 for t, _ in gyro_data], dtype=np.float64)
+                w = np.array([g for _, g in gyro_data], dtype=np.float64)
+                points_ms, _rank, _step = OptimSync(ts_ms, w).run(
+                    target_sync_points=max_points,
+                    trim_ranges_s=[(0.0, self.params.duration_ms / 1000.0)],
+                )
+            except Exception:
+                log.warning("Auto-sync: OptimSync point selection failed", exc_info=True)
+                points_ms = []
+        if len(points_ms) < 2 or not auto_sync_points:
             # Upstream (render_queue.rs:1451-1453): when the optimal-point
-            # selection comes back empty, the sync points fall back to a
-            # uniform spread — chunk centres of max_sync_points over the
-            # clip — instead of abandoning multi-point refinement.
-            chunks = self.params.duration_ms / self._SYNC_POINT_COUNT
+            # selection comes back empty (or auto_sync_points is off), the
+            # sync points fall back to a uniform spread — chunk centres of
+            # max_sync_points over the clip.
+            chunks = self.params.duration_ms / max_points
             start = chunks / 2.0
-            points_ms = [
-                start + i * chunks for i in range(self._SYNC_POINT_COUNT)
-            ]
-            log.info(
-                "Auto-sync: no optimal sync points; falling back to %d "
-                "uniform points", self._SYNC_POINT_COUNT,
-            )
+            points_ms = [start + i * chunks for i in range(max_points)]
+            if pattern is not None:
+                # render_queue.rs:1456-1459: a non-null custom pattern
+                # REPLACES the uniform spread (also ms-filtered to duration).
+                points_ms = [
+                    t for t in self._resolve_syncpoint_pattern(
+                        pattern, self.params.duration_ms, self.params.fps)
+                    if t <= self.params.duration_ms
+                ]
+            else:
+                log.info(
+                    "Auto-sync: no optimal sync points; falling back to %d "
+                    "uniform points", max_points,
+                )
 
         height, width = frames[0][1].shape[:2]
         camera_matrix = self.lens.get_camera_matrix(size=(width, height))

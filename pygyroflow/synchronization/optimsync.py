@@ -199,6 +199,11 @@ class OptimSync:
         ratio = step_size / sr  # seconds per rank bin
         total_duration = n_windows * ratio
 
+        # Upstream returns rank_clone — a copy taken BEFORE the clipping
+        # below (optimsync.rs:151 vs :155-165); the selected points come
+        # from the clipped array, the return value from the unclipped one.
+        rank_unclipped = rank.copy()
+
         # Zero out low-rank bins and bins outside trim ranges
         for i in range(n_windows):
             t = i * ratio
@@ -242,4 +247,4 @@ class OptimSync:
             )
             selected.append(time_ms)
 
-        return selected, rank, ratio
+        return selected, rank_unclipped, ratio

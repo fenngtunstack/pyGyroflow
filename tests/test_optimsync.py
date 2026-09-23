@@ -83,3 +83,24 @@ class TestLowMotionBranch:
 
     def test_threshold_constant(self):
         assert _LOW_MOTION_MF_MAX == 50.0
+
+
+class TestUnclippedRank:
+    """B-25: run() returns rank_clone — the copy taken BEFORE the low-rank
+    and trim-range zeroing (optimsync.rs:151). Selection uses the clipped
+    array; the returned rank must still carry the outside-trim values."""
+
+    def test_outside_trim_bins_survive_in_returned_rank(self):
+        sr = 200.0
+        dur_s = 20.0
+        t = np.arange(int(sr * dur_s)) / sr
+        signal = (20.0 * np.sin(2 * np.pi * 10.0 * t)).astype(np.float64)
+        gyro = np.stack([signal, signal, signal * 0.5], axis=1)
+        ts = np.arange(len(signal)) / sr * 1000.0
+        points, rank, ratio = OptimSync(ts, gyro).run(
+            target_sync_points=3, trim_ranges_s=[(0.0, 5.0)])
+        # selection stayed inside the trim range
+        assert all(p / 1000.0 <= 5.0 for p in points)
+        # but the returned rank still carries the t>5s energy
+        beyond = rank[int(6.0 / ratio):]
+        assert beyond.max() > 0.0

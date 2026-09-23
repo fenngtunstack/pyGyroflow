@@ -197,3 +197,65 @@ class TestRsSyncOffsetArithmetic:
             search_range_ms=500.0, initial_offset_ms=-300.0,
         )
         assert offset == pytest.approx(-300.0)
+
+
+class TestSyncPointPattern:
+    """B-16 remainder: custom_sync_pattern resolution
+    (render_queue.rs:1690-1727) and the auto_sync_points switch."""
+
+    def test_bare_numbers_are_frame_counts(self):
+        ts = StabilizationManager._resolve_syncpoint_pattern(
+            {"start": 0, "interval": 30, "gap": 0}, 60000.0, 30.0)
+        # 30 frames at 30 fps = 1000 ms
+        assert ts[:3] == [0.0, 1000.0, 2000.0]
+        assert ts[-1] < 60000.0
+        assert len(ts) == 60
+
+    def test_gap_splits_each_point(self):
+        ts = StabilizationManager._resolve_syncpoint_pattern(
+            {"start": "1s", "interval": "2s", "gap": "500ms"}, 10000.0, 30.0)
+        # i=1000: 750/1250; i=3000: 2750/3250; ...
+        assert ts[:4] == [750.0, 1250.0, 2750.0, 3250.0]
+        assert len(ts) == 10
+
+    def test_interval_defaults_to_duration(self):
+        ts = StabilizationManager._resolve_syncpoint_pattern(
+            {"start": "0s"}, 5000.0, 30.0)
+        assert ts == [0.0]
+
+    def test_array_items_merge_and_sort(self):
+        ts = StabilizationManager._resolve_syncpoint_pattern(
+            [{"start": "2s"}, {"start": "1s"}], 10000.0, 30.0)
+        assert ts == sorted(ts) == [1000.0, 2000.0]
+
+    def test_auto_sync_off_skips_optimsync(self, monkeypatch):
+        """auto_sync_points=false must skip the optimal selection entirely
+        (render_queue.rs:1451: `timestamps_fract.is_empty() ||
+        !sync_params.auto_sync_points`)."""
+        import pygyroflow.synchronization.optimsync as om
+
+        calls = []
+        real_run = om.OptimSync.run
+
+        def spy(self, **kw):
+            calls.append(kw)
+            return real_run(self, **kw)
+
+        monkeypatch.setattr(om.OptimSync, "run", spy)
+        monkeypatch.setattr(
+            "pygyroflow.synchronization.AutosyncProcess.run", lambda self, *a, **k: None)
+
+        mgr = StabilizationManager()
+        mgr.params.duration_ms = 30_000
+        mgr.params.fps = 30.0
+        mgr.lens.sync_settings = {
+            "auto_sync_points": False,
+            "custom_sync_pattern": {"start": "1s", "interval": "5s",
+                                    "gap": "500ms"},
+        }
+        frames = [(i, np.zeros((4, 4), np.uint8)) for i in range(60)]
+        out = mgr._refine_sync_points(frames=frames, gyro_data=[],
+                                      global_offset=0.0, quaternions=None,
+                                      frame_readout_time_ms=0.0)
+        assert calls == []  # optimal selection skipped
+        assert out == {}    # zero-image windows yield no offsets
