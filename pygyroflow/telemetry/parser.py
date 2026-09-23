@@ -96,6 +96,7 @@ def detect_telemetry_format(path: str) -> str:
         ("DJI", _detect_dji),
         ("Sony", _detect_sony),
         ("Insta360", _detect_insta360),
+        ("GyroflowProtobuf", _detect_gproto),
     ):
         if probe(window):
             return name
@@ -263,6 +264,36 @@ _INSTA360_HEADER_SIZE = 32 + 4 + 4 + 32  # padding(32) + size(4) + version(4) + 
 def _detect_insta360(data: bytes) -> bool:
     """Detect Insta360 extra-info trailer (magic at end of file)."""
     return data[-len(_INSTA360_MAGIC):] == _INSTA360_MAGIC
+
+
+def _detect_gproto(buf: bytes) -> bool:
+    """Gyroflow Protobuf detection — the magic string in any metadata
+    sample (binary.rs:158)."""
+    return buf.find(b"GyroflowProtobuf") >= 0
+
+
+def _parse_gflow_proto(data: bytes, fps: float,
+                       video_size: tuple[int, int] = (0, 0)) -> FileMetadata:
+    """Extract per-sample Main messages from the metadata track and run the
+    gyroflow_proto converter."""
+    from pygyroflow.telemetry.gyroflow_proto import parse_gyroflow_proto
+
+    messages: list[bytes] = []
+    sample_ts_ms: list[float] = []
+    for codec in ("meta", "gpmd", "rtmd", "djmd", "gyro"):
+        timed = _mp4_find_timed_data_track_samples(data, codec)
+        payloads = [data[o:o + s] for o, s, _d in timed if s > 0]
+        if any(b"GyroflowProtobuf" in p for p in payloads):
+            cum = 0.0
+            for _o, _s, dur in timed:
+                messages.append(data[_o:_o + _s])
+                sample_ts_ms.append(cum)
+                cum += dur
+            break
+    if not messages:
+        log.warning("Gyroflow Protobuf: no metadata track samples found")
+        return FileMetadata(detected_source="Gyroflow")
+    return parse_gyroflow_proto(messages, fps, video_size, sample_ts_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -2397,4 +2428,5 @@ _TELEMETRY_PARSERS = {
     "DJI": _parse_dji,
     "Sony": _parse_sony,
     "Insta360": _parse_insta360,
+    "GyroflowProtobuf": _parse_gflow_proto,
 }

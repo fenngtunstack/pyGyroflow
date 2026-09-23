@@ -836,6 +836,19 @@ def get_mesh_correction(
     mesh_data = decode_mesh(tags[T_MESH_DATA]) if T_MESH_DATA in tags else None
     focal_plane_data = decode_focal_plane(tags[T_FPD_DATA]) \
         if T_FPD_DATA in tags else None
+    return get_mesh_correction_from(
+        mesh_data, focal_plane_data, crop_origin, crop_size, cache)
+
+
+def get_mesh_correction_from(
+    mesh_data: dict | None,
+    focal_plane_data: dict | None,
+    crop_origin: tuple[float, float],
+    crop_size: tuple[float, float],
+    cache: dict,
+) -> tuple[list[float], list[float]] | None:
+    """Dict-level core (decoders already applied) — shared with the
+    Gyroflow-proto path, which synthesizes the sony-shaped dicts directly."""
 
     crc = zlib.crc32(_mesh_jsonish(mesh_data, focal_plane_data,
                                    crop_origin, crop_size).encode())
