@@ -24,10 +24,15 @@ _CODEC_MAP: dict[str, str] = {
     "H.264/AVC": "libx264",
     "H.265/HEVC": "libx265",
     "ProRes": "prores_ks",
+    "DNxHD": "dnxhd",
     "AV1": "libaom-av1",
     "VP9": "libvpx-vp9",
     "MPEG-4": "mpeg4",
 }
+
+# AV1 encoders, in preference order: libaom-av1 is the reference encoder but
+# many FFmpeg builds ship only SVT-AV1. Resolved at open time.
+_AV1_ENCODERS = ("libaom-av1", "libsvtav1")
 
 # Default codec when an unknown name is given.
 _DEFAULT_CODEC = "libx265"
@@ -62,7 +67,9 @@ _PIX_FMT_MAP: dict[str, str] = {
     "libx264": "yuv420p",
     "libx265": "yuv420p",
     "prores_ks": "yuv422p10le",
+    "dnxhd": "yuv422p",
     "libaom-av1": "yuv420p",
+    "libsvtav1": "yuv420p",
     "libvpx-vp9": "yuv420p",
     "mpeg4": "yuv420p",
 }
@@ -71,6 +78,21 @@ _PIX_FMT_MAP: dict[str, str] = {
 # is a quarter-resolution mezzanine — the wrong thing to hand someone who
 # asked for ProRes output.  3 = HQ.
 _ENCODER_PROFILE: dict[str, int] = {"prores_ks": 3}
+
+# DNxHD refuses to open without an explicit bit rate (and only accepts
+# specific bitrate/resolution/fps combos — 36 Mb/s is the canonical 8-bit
+# 4:2:2 1080p entry). When the user gave no bitrate, this default applies.
+_ENCODER_DEFAULT_BITRATE: dict[str, int] = {"dnxhd": 36_000_000}
+
+
+def _encoder_available(name: str) -> bool:
+    import av  # lazily imported by this module
+
+    try:
+        av.codec.Codec(name, "w")
+        return True
+    except Exception:
+        return False
 
 
 def _put_unless_failed(q, item, failed: list, stop=None) -> bool:
@@ -363,6 +385,12 @@ class FfmpegProcessor(VideoProcessor):
                 )
         else:
             codec_name = _CODEC_MAP.get(codec, _DEFAULT_CODEC)
+            if codec_name == "libaom-av1" and not _encoder_available("libaom-av1"):
+                # AV1 fallback: reference encoder missing in this build → SVT
+                codec_name = next(
+                    (e for e in _AV1_ENCODERS if _encoder_available(e)),
+                    codec_name,
+                )
             pix_fmt = _PIX_FMT_MAP.get(codec_name, "yuv420p")
 
         self._output_codec_name = codec_name
@@ -420,6 +448,8 @@ class FfmpegProcessor(VideoProcessor):
 
         if bitrate > 0:
             self._output_stream.bit_rate = int(bitrate * 1_000_000)
+        elif codec_name in _ENCODER_DEFAULT_BITRATE:
+            self._output_stream.bit_rate = _ENCODER_DEFAULT_BITRATE[codec_name]
 
     def prepare_audio(self) -> None:
         """Add output audio streams mirroring the input's audio streams.

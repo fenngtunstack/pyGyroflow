@@ -357,3 +357,51 @@ class TestAtomicOutput:
             # drops it the assert degrades to "not wrong" rather than
             # failing on a player-level nicety.
             assert container.metadata.get("title", "carried-title") == "carried-title"
+
+
+class TestDnxhdAndAv1:
+    """C-01 remainder: DNxHD output (needs an explicit bit rate to open)
+    and the AV1 encoder fallback (libaom-av1 is absent from many builds;
+    libsvtav1 takes over)."""
+
+    def test_dnxhd_output_opens_and_encodes(self, tmp_path):
+        # DNxHD only accepts its profile resolutions (e.g. 1920x1080); a
+        # tiny 64x48 output is rejected by the encoder itself.
+        src = tmp_path / "in.mp4"
+        _write_source(src, width=1920, height=1080, frames=3)
+        out = tmp_path / "out_dnxhd.mov"
+        proc = FfmpegProcessor()
+        proc.open_input(str(src))
+        proc.create_output(str(out), 1920, 1080, 30.0, codec="DNxHD")
+        assert proc._output_stream.pix_fmt == "yuv422p"
+        proc.process_frames(lambda img, ts, idx: img)
+        proc.close()
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_dnxhd_default_bitrate_applied(self, tmp_path):
+        src = tmp_path / "in.mp4"
+        _write_source(src)
+        proc = FfmpegProcessor()
+        proc.open_input(str(src))
+        proc.create_output(str(tmp_path / "o.mov"), 64, 48, 30.0,
+                           codec="DNxHD", bitrate=0)
+        assert proc._output_stream.bit_rate == 36_000_000
+        proc.close()
+
+    def test_av1_falls_back_to_an_available_encoder(self, tmp_path):
+        from pygyroflow.rendering.ffmpeg_processor import (
+            _AV1_ENCODERS,
+            _encoder_available,
+        )
+        available = [e for e in _AV1_ENCODERS if _encoder_available(e)]
+        if not available:
+            pytest.skip("no AV1 encoder in this ffmpeg build")
+        src = tmp_path / "in.mp4"
+        _write_source(src)
+        out = tmp_path / "out_av1.mkv"
+        proc = FfmpegProcessor()
+        proc.open_input(str(src))
+        proc.create_output(str(out), 64, 48, 30.0, codec="AV1")
+        proc.process_frames(lambda img, ts, idx: img)
+        proc.close()
+        assert out.exists() and out.stat().st_size > 0
