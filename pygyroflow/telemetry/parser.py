@@ -1599,6 +1599,10 @@ def _parse_sony(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -
     # every RTMD packet, and on a zoom it changes between them. This is what
     # feeds FileMetadata.lens_positions, i.e. per-timestamp lens data.
     focal_per_sample: list[float | None] = []
+    # Per-sample tag maps + timestamps for the deep pass below (the
+    # gyro_source/sony.py port needs the full tag dict per sample).
+    per_sample_tags: list[dict] = []
+    sample_ts_ms: list[float] = []
 
     for sample_idx, (offset, size, duration_ms) in enumerate(timed_samples):
         chunk = data[offset : offset + size]
@@ -1606,6 +1610,8 @@ def _parse_sony(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -
             continue
         tags: dict[int, bytes] = {}
         _sony_walk_tlv(chunk, 0x1C, len(chunk), tags)
+        per_sample_tags.append(tags)
+        sample_ts_ms.append(total_duration_ms)
 
         packet_focal: float | None = None
         if 0x8005 in tags and len(tags[0x8005]) >= 2:
@@ -1684,6 +1690,56 @@ def _parse_sony(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -
     # The 0xe40e value is signed ms (rtmd_tags.rs:414) — the sign feeds
     # upstream's direction derivation.
     metadata.frame_readout_direction = _readout_direction_from(readout_ms)
+
+    # ---- Sony deep pass (gyro_source/sony.rs, ported in gyro_source/sony.py)
+    # Mirrors mod.rs:415-504: per-sample time offsets, lens profile/params,
+    # IBIS/OIS collection, mesh correction — then splines and the
+    # readout-time rescale.
+    if per_sample_tags:
+        from pygyroflow.gyro_source.sony import (
+            ISTemp,
+            collect_lens_params,
+            get_mesh_correction,
+            get_time_offset,
+            init_lens_profile,
+            stab_calc_splines,
+            stab_collect,
+        )
+        from pygyroflow.gyro_source.file_metadata import LensParams
+
+        from pygyroflow.gyro_source.source import GyroSource
+
+        sample_rate = GyroSource.get_sample_rate(metadata)
+        original_sample_rate = sample_rate
+        lens_state = LensParams()
+        is_temp = ISTemp()
+        mesh_cache: dict = {}
+
+        for tags, ts_ms in zip(per_sample_tags, sample_ts_ms):
+            ts_us = int(round(ts_ms * 1000.0))
+            to = get_time_offset(metadata, tags, sample_rate, model)
+            if to is not None:
+                original_sample_rate = to[0]
+                metadata.per_frame_time_offsets.append(to[1])
+            entry = collect_lens_params(lens_state, tags, ts_us)
+            if entry is not None:
+                metadata.lens_params[ts_us] = entry
+            init_lens_profile(metadata, tags, video_size, ts_ms, model,
+                              lens_name)
+            if fps > 0:
+                stab_collect(is_temp, tags, fps)
+            mesh = get_mesh_correction(tags, mesh_cache)
+            if mesh is not None:
+                metadata.mesh_correction.append(mesh)
+
+        stab = stab_calc_splines(metadata, is_temp)
+        if stab is not None:
+            metadata.camera_stab_data = stab
+        if metadata.frame_readout_time and original_sample_rate:
+            metadata.frame_readout_time = (metadata.frame_readout_time
+                                           / original_sample_rate
+                                           * sample_rate)
+
     metadata.frame_rate = fps if fps > 0 else None
     metadata.has_accurate_timestamps = True
     if model:

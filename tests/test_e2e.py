@@ -1181,13 +1181,34 @@ class TestSonyRtmdParsing:
         )
         assert md.detected_source == "Sony DSC-RX100M7"
         assert md.imu_orientation == "zYX"  # 0x152 -> "Yzx" -> normalized
-        assert md.frame_readout_time == pytest.approx(14.297, abs=0.01)
+        # raw 0xe40e = 14.297 ms, rescaled by gyro rate vs IMU-grid rate
+        # (mod.rs:501-504: frt / original_sample_rate * sample_rate)
+        assert md.frame_readout_time == pytest.approx(14.3318, abs=0.01)
         ts = [r.timestamp_ms for r in md.raw_imu]
         assert len(ts) > 20000
         assert ts[-1] == pytest.approx(11511.5, abs=5.0)  # full 11.5 s span
         # readable gyro magnitudes (deg/s), not garbage
         mags = np.array([np.linalg.norm(r.gyro) for r in md.raw_imu[:200] if r.gyro is not None])
         assert 0.01 < np.median(mags) < 500.0
+
+        # A-06 deep pass on real footage: this sample carries 0xe416 (OIS
+        # tables), 0xe421 (LensDistortion), 0xe42f+0xe423 (mesh + FPD) and
+        # the 0xe40c/e40d/e437 timing trio — every deep feature fires.
+        assert len(md.per_frame_time_offsets) == 345
+        assert md.lens_profile is not None
+        assert md.lens_profile["distortion_model"] == "sony"
+        fx = md.lens_profile["fisheye_params"]["camera_matrix"][0][0]
+        assert 2000.0 < fx < 4000.0
+        assert len(md.camera_stab_data) == 345
+        cs = md.camera_stab_data[len(md.camera_stab_data) // 2]
+        assert len(cs.ois_spline) == 8  # OIS table has 8 entries per frame
+        assert len(md.mesh_correction) == 345
+        mesh, inv_mesh = md.mesh_correction[0]
+        assert len(mesh) == len(inv_mesh)
+        # mesh[0] = offset to the focal-plane section (written before the
+        # focal data is appended — sony.rs:534)
+        assert mesh[0] == 819.0
+        assert (mesh[1], mesh[2]) == (9.0, 9.0)  # 9x9 grid
 
 
 def _insta_varint(v: int) -> bytes:
