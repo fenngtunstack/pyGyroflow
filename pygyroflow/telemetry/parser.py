@@ -607,6 +607,22 @@ def _gpmf_read_klv(data: bytes, pos: int, end: int):
     return fourcc, type_byte, struct_size, repeat, payload_start, payload_bytes, next_pos
 
 
+def _readout_direction_from(fr: float | None) -> ReadoutDirection:
+    """Upstream's universal readout-direction derivation
+    (gyro_source/mod.rs:398-405): the sign of the raw frame-readout time
+    encodes the scan direction, and a ±10000 ms sentinel switches to the
+    horizontal codes (GCSV writes it there)."""
+    if fr is None:
+        fr = 0.0
+    if fr < 0.0:
+        if abs(fr) > 10000.0:
+            return ReadoutDirection.RightToLeft
+        return ReadoutDirection.BottomToTop
+    if abs(fr) > 10000.0:
+        return ReadoutDirection.LeftToRight
+    return ReadoutDirection.TopToBottom
+
+
 def _parse_gopro(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -> FileMetadata:
     """Parse GoPro GPMF telemetry from raw MP4 file data.
 
@@ -647,6 +663,10 @@ def _parse_gopro(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) 
     quats: dict[int, Quat64] = {}
     frame_ms = 1000.0 / fps if fps > 0 else 0.0
     frame_idx = 0
+    # Flat streams feeding image_orientations / gravity_vectors
+    # (gyro_source/mod.rs accumulates them across packets the same way).
+    grav_flat: list = []
+    iori_mod_flat: list = []
 
     # Raw IMU timestamps follow upstream telemetry-parser's
     # util::normalized_imu + GoPro::get_avg_sample_duration: GoPro gyro/accel
@@ -667,12 +687,13 @@ def _parse_gopro(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) 
         if offset + size > len(data):
             continue
         gpmf_chunk = data[offset:offset + size]
-        pkt_model, gyro_rows, accl_rows, pkt_gyro_count, pkt_stmp_us = (
+        pkt_model, gyro_rows, accl_rows, pkt_gyro_count, pkt_stmp_us, pkt_grav = (
             _parse_gpmf_chunk(gpmf_chunk, stream_info, camera_tags)
         )
         model = pkt_model or model
         rows.extend(zip(gyro_rows, accl_rows))
         total_duration_ms += duration_ms
+        grav_flat.extend(pkt_grav)
 
         if pkt_gyro_count > 0:
             total_gyro_count += pkt_gyro_count
@@ -682,7 +703,7 @@ def _parse_gopro(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) 
                 stmp_first_us = pkt_stmp_us
             stmp_last_us = pkt_stmp_us
 
-        cori, iori = _parse_gpmf_orientation_chunk(gpmf_chunk)
+        cori, iori, iori_mod = _parse_gpmf_orientation_chunk(gpmf_chunk)
         # Upstream: only emit when both streams are present and equal length
         if cori and len(cori) == len(iori):
             for c, i in zip(cori, iori):
@@ -690,6 +711,7 @@ def _parse_gopro(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) 
                 ts_us = int(round(frame_idx * frame_ms * 1000.0))
                 quats[ts_us] = Quat64.from_quaternion(np.array([w, x, y, z]))
                 frame_idx += 1
+        iori_mod_flat.extend(iori_mod)
 
     # Modern GoPros (verified Hero8/10) write the camera-identification DEVC
     # (VFOV/EISA/EISE/ZFOV/PRJT) at the very end of mdat, AFTER the last
@@ -742,6 +764,38 @@ def _parse_gopro(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) 
         metadata.quaternions = quats
         log.info("GoPro: extracted %d CORI*IORI quaternions", len(quats))
 
+        # image_orientations: IORI zipped onto the quaternion timestamps
+        # (mod.rs:337-343). The entries use the *rearranged* variant (see
+        # _parse_gpmf_orientation_chunk) — upstream quirk, preserved.
+        if iori_mod_flat:
+            metadata.image_orientations = {
+                ts: Quat64.from_quaternion(np.array(q))
+                for ts, q in zip(quats.keys(), iori_mod_flat)
+            }
+
+        # gravity_vectors (mod.rs:271-284, 344-353): an all-zero stream is
+        # discarded; the vectors must pair 1:1 with the quats and are rotated
+        # by the matching IORI entry when counts line up.
+        if grav_flat and not any(g.any() for g in grav_flat):
+            grav_flat = []
+        if grav_flat and len(grav_flat) == len(quats):
+            from scipy.spatial.transform import Rotation
+
+            if len(grav_flat) == len(iori_mod_flat):
+                grav_flat = [
+                    Rotation.from_quat([q[1], q[2], q[3], q[0]]).apply(g)
+                    for q, g in zip(iori_mod_flat, grav_flat)
+                ]
+            metadata.gravity_vectors = dict(zip(quats.keys(), grav_flat))
+            log.info("GoPro: extracted %d gravity vectors", len(grav_flat))
+
+    # digital_zoom (mod.rs:262-266): DZST is a percent, DZMX the per-model
+    # max zoom (1.4 when absent); the last nonzero DZST wins.
+    dzst = camera_tags.get("DZST")
+    if dzst:
+        dzmx = float(camera_tags.get("DZMX", 1.4))
+        metadata.digital_zoom = 1.0 + (float(dzst) / 100.0) * (dzmx - 1.0)
+
     metadata.frame_rate = fps if fps > 0 else None
     metadata.has_accurate_timestamps = True
 
@@ -754,6 +808,7 @@ def _parse_gopro(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) 
             (readout_ms,) = struct.unpack(">f", data[srot_pos + 8 : srot_pos + 12])
             if 0.1 < readout_ms < 100.0:
                 metadata.frame_readout_time = float(readout_ms)
+                metadata.frame_readout_direction = _readout_direction_from(readout_ms)
                 log.info("GoPro: SROT frame_readout_time = %.2f ms", readout_ms)
 
     # Camera model from the MINF tag (e.g. "HERO12 Black") for automatic
@@ -794,10 +849,18 @@ def _parse_gpmf_orientation_chunk(gpmf_data: bytes) -> tuple[list, list]:
     array scaled by SCAL (default 32767), converted with the SAME sign
     convention as upstream: (w/s, -x/s, y/s, z/s).
 
-    Returns (cori_list, iori_list) of [w, x, y, z] float lists.
+    Returns (cori_list, iori_list, iori_mod_list). *iori_mod* is the
+    variant gyro_source/mod.rs:314-326 builds for FileMetadata
+    image_orientations (and reuses to rotate gravity vectors): it drops
+    the -x flip AND rearranges the payload — Quaternion fields are filled
+    in payload order (w,x,y,z)=(a,b,c,d), but the tag is constructed via
+    Quaternion::from_vector(Vector4::new(v.x, v.y, v.z, v.w)) and nalgebra
+    reads Vector4 coords as (w,x,y,z), so the stored quat is
+    (b/s, c/s, d/s, a/s). Upstream behavior, preserved verbatim.
     """
     cori: list[list[float]] = []
     iori: list[list[float]] = []
+    iori_mod: list[list[float]] = []
 
     pos = 0
     end = len(gpmf_data)
@@ -851,10 +914,17 @@ def _parse_gpmf_orientation_chunk(gpmf_data: bytes) -> tuple[list, list]:
                     for k in range(n):
                         w, x, y, z = vals[k * 4:k * 4 + 4]
                         target.append([w / stream_scal, -x / stream_scal, y / stream_scal, z / stream_scal])
+                if iori_payload is not None:
+                    ps, pb = iori_payload
+                    n = pb // 8
+                    vals = struct.unpack(f">{n * 4}h", gpmf_data[ps:ps + n * 8])
+                    for k in range(n):
+                        a, b, c, d = vals[k * 4:k * 4 + 4]
+                        iori_mod.append([b / stream_scal, c / stream_scal, d / stream_scal, a / stream_scal])
             dpos = c_np
         break  # only the first DEVC per chunk carries these streams
 
-    return cori, iori
+    return cori, iori, iori_mod
 
 
 def _gopro_orientations_to_matrix(orin: str, orio: str) -> list[float] | None:
@@ -937,13 +1007,15 @@ def _parse_gpmf_chunk(
     Extracts ACCL and GYRO streams from each DEVC/STRM and returns physical-
     unit rows for the whole packet:
 
-    Returns (model, gyro_rows, accl_rows, gyro_count, last_stamp_us).
-    Timestamps are NOT assigned here — upstream telemetry-parser lays GoPro
-    IMU readings on a uniform whole-file grid (see _parse_gopro), so per-
-    packet STMP values are only reported for the grid-step estimate.
+    Returns (model, gyro_rows, accl_rows, gyro_count, last_stamp_us,
+    grav_rows). Timestamps are NOT assigned here — upstream telemetry-parser
+    lays GoPro IMU readings on a uniform whole-file grid (see _parse_gopro),
+    so per-packet STMP values are only reported for the grid-step estimate.
 
     DEVC-level camera tags (EISA/EISE/VFOV/ZFOV/PRJT) are collected into
     *camera_tags* (first occurrence wins) for lens-profile auto-loading.
+    DZST/DZMX (digital zoom) are collected with **overwrite** semantics —
+    upstream's zoom walk keeps the last nonzero DZST (mod.rs:262-266).
     """
     import numpy as np
 
@@ -954,6 +1026,7 @@ def _parse_gpmf_chunk(
     model: str | None = None
     gyro_rows: list = []
     accl_rows: list = []
+    grav_rows: list = []
     chunk_gyro_count = 0
     last_stamp_us = 0
 
@@ -980,6 +1053,11 @@ def _parse_gpmf_chunk(
         gyro_count = 0
         gyro_struct_size = 6
 
+        grav_samples = None
+        grav_scal = 1.0
+        grav_count = 0
+        grav_axes = 3
+
         # Parse DEVC children
         dpos = payload_start
         while dpos < devc_end - _GPMF_HEADER_SIZE:
@@ -1001,6 +1079,12 @@ def _parse_gpmf_chunk(
                     val = struct.unpack(">f", gpmf_data[child[4] : child[4] + 4])[0]
                 if val is not None:
                     camera_tags.setdefault(c_fourcc, val)
+            elif c_fourcc == "DZST" and camera_tags is not None:
+                if c_type == ord("L") and child[5] >= 4:
+                    camera_tags["DZST"] = struct.unpack(">I", gpmf_data[child[4]:child[4] + 4])[0]
+            elif c_fourcc == "DZMX" and camera_tags is not None:
+                if c_type in (ord("F"), ord("f")) and child[5] >= 4:
+                    camera_tags["DZMX"] = struct.unpack(">f", gpmf_data[child[4]:child[4] + 4])[0]
             elif c_fourcc == "STRM" and c_type == 0:
                 # Parse STRM contents for ACCL/GYRO (+ orientation tags)
                 _parse_gpmf_strm(
@@ -1011,17 +1095,19 @@ def _parse_gpmf_chunk(
                     accl_ref := [accl_samples, accl_scale, 0, accl_count, accl_struct_size],
                     gyro_ref := [gyro_samples, gyro_scale, gyro_stamp_us, gyro_count, gyro_struct_size],
                     stream_info,
+                    grav_ref := [grav_samples, grav_scal, grav_count, grav_axes],
                 )
                 # Read back updated values
                 accl_samples, accl_scale, _accl_stamp, accl_count, accl_struct_size = accl_ref
                 gyro_samples, gyro_scale, gyro_stamp_us, gyro_count, gyro_struct_size = gyro_ref
+                grav_samples, grav_scal, grav_count, grav_axes = grav_ref
                 if gyro_stamp_us:
                     last_stamp_us = gyro_stamp_us
 
             dpos = c_np
 
         # Emit physical-unit rows for this DEVC
-        if accl_count == 0 and gyro_count == 0:
+        if accl_count == 0 and gyro_count == 0 and grav_count == 0:
             pos = next_pos
             continue
 
@@ -1050,10 +1136,16 @@ def _parse_gpmf_chunk(
             gyro_rows.append(gyro)
             accl_rows.append(accl)
 
+        for i in range(grav_count):
+            raw_vals = grav_samples[i * grav_axes:(i + 1) * grav_axes]
+            scale = grav_scal if grav_scal != 1.0 else 32767.0
+            grav_rows.append(np.array(
+                [v / scale for v in raw_vals], dtype=np.float64))
+
         chunk_gyro_count += gyro_count
         pos = next_pos
 
-    return model, gyro_rows, accl_rows, chunk_gyro_count, last_stamp_us
+    return model, gyro_rows, accl_rows, chunk_gyro_count, last_stamp_us, grav_rows
 
 
 def _parse_gpmf_strm(
@@ -1064,8 +1156,15 @@ def _parse_gpmf_strm(
     accl_ref: list,
     gyro_ref: list,
     stream_info: dict[str, dict] | None = None,
+    grav_ref: list | None = None,
 ) -> None:
-    """Parse a STRM block, updating accl_ref / gyro_ref in place."""
+    """Parse a STRM block, updating accl_ref / gyro_ref / grav_ref in place.
+
+    *grav_ref* collects the GRAV (gravity vector) stream: [raw i16 tuple,
+    scal, count, axes]. Unlike GYRO/ACCL (physical-unit scalars), upstream's
+    gravity group scales by the SCAL tag with a **default of 32767**
+    (gyro_source/mod.rs:270) — normalized-vector semantics.
+    """
     spos = strm_ps
     stream_name = ""
     stream_stamp = 0
@@ -1126,6 +1225,13 @@ def _parse_gpmf_strm(
             gyro_ref[2] = stream_stamp
             gyro_ref[3] = t_rep
             gyro_ref[4] = t_ss
+
+        elif t_fourcc == "GRAV" and t_type == ord("s") and grav_ref is not None:
+            n_axes = t_ss // 2
+            grav_ref[0] = struct.unpack(f">{n_axes * t_rep}h", gpmf_data[t_ps:t_ps + t_pb])
+            grav_ref[1] = stream_scal
+            grav_ref[2] = t_rep
+            grav_ref[3] = n_axes
 
         spos = t_np
 
@@ -1371,6 +1477,7 @@ def _parse_dji(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) ->
 
     metadata.quaternions = quats
     metadata.has_accurate_timestamps = True
+    metadata.frame_readout_direction = _readout_direction_from(metadata.frame_readout_time)
     metadata.frame_rate = fps if fps > 0 else None
 
     if quats:
@@ -1574,6 +1681,9 @@ def _parse_sony(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0)) -
     metadata.raw_imu = raw_imu
     metadata.imu_orientation = orientation
     metadata.frame_readout_time = readout_ms
+    # The 0xe40e value is signed ms (rtmd_tags.rs:414) — the sign feeds
+    # upstream's direction derivation.
+    metadata.frame_readout_direction = _readout_direction_from(readout_ms)
     metadata.frame_rate = fps if fps > 0 else None
     metadata.has_accurate_timestamps = True
     if model:
@@ -1833,9 +1943,62 @@ def _parse_insta360(data: bytes, fps: float, video_size: tuple[int, int] = (0, 0
             n, "raw" if is_raw_gyro else "double", gyro_range, acc_range,
         )
 
+    # ---- Per-frame time offsets from the Exposure/TimeMap records ----
+    # (gyro_source/mod.rs:470-492). Exposure records (id 4 and 12) carry
+    # [u64 ts][f64 shutter] pairs; their timestamps get the same fft/raw
+    # treatment as gyro but NO gyro_timestamp subtraction (mod.rs:219-226).
+    exp: list[tuple[float, float]] = []
+    for rid, _fmt, payload in records:
+        if rid not in (4, 12):
+            continue
+        for base in range(0, len(payload) - 15, 16):
+            (t,) = struct.unpack("<Q", payload[base : base + 8])
+            (v,) = struct.unpack("<d", payload[base + 8 : base + 16])
+            t = t / 1000.0 - fft
+            if is_raw_gyro:
+                t /= 1000.0
+            exp.append((t, v))
+
+    tm: list[tuple[float, float]] = []
+    for rid, _fmt, payload in records:
+        if rid != 128 or len(payload) < 16:
+            continue
+        (num_trims,) = struct.unpack("<I", payload[4:8])
+        pos = 16 + num_trims * 32 + 8
+        while pos + 16 <= len(payload):
+            t = struct.unpack("<d", payload[pos : pos + 8])[0]
+            v = struct.unpack("<d", payload[pos + 8 : pos + 16])[0]
+            tm.append((t, v))
+            pos += 16
+
+    # The 0.9 ms addition is a mystery upstream too ("The additional 0.9 ms
+    # is a mystery" — mod.rs:486). Requires a video fps to make sense.
+    if fps > 0 and exp:
+        video_ts = 0.0
+        zero_ref: float | None = None
+        prev_t = 0.0
+        i = 0
+        for t, v in exp:
+            if t > prev_t or t == 0.0:
+                if zero_ref is None:
+                    zero_ref = t * 1000.0
+                tm_diff = (tm[i][0] - tm[i][1]) if i < len(tm) else 0.0
+                diff = (video_ts - t) * 1000.0
+                metadata.per_frame_time_offsets.append(
+                    -(v * 1000.0 / 2.0) - 0.9 - diff - tm_diff - zero_ref)
+                video_ts += 1.0 / fps
+                prev_t = t
+                i += 1
+        if metadata.per_frame_time_offsets:
+            log.info(
+                "Insta360: %d per-frame time offsets from exposure records",
+                len(metadata.per_frame_time_offsets),
+            )
+
     metadata.raw_imu = raw_imu
     metadata.imu_orientation = imu_orientation
     metadata.frame_readout_time = rolling_shutter_ms
+    metadata.frame_readout_direction = _readout_direction_from(rolling_shutter_ms)
     metadata.frame_rate = fps if fps > 0 else None
     metadata.has_accurate_timestamps = True
     if model:

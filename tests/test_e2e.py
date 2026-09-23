@@ -541,7 +541,7 @@ class TestSyntheticGpmfParsing:
                          _gpmf_klv("ZFOV", ord("f"), struct.pack(">f", 100.0)) +
                          _gpmf_klv("STRM", 0, strm))
         tags = {}
-        model, g_rows, a_rows, g_count, stamp = _parse_gpmf_chunk(devc, None, tags)
+        model, g_rows, a_rows, g_count, stamp, grav_rows = _parse_gpmf_chunk(devc, None, tags)
         assert tags == {"VFOV": "W", "EISA": "N", "ZFOV": pytest.approx(100.0)}
         assert g_count == 2 and len(g_rows) == 2
 
@@ -805,12 +805,14 @@ class TestTelemetryParity:
         ])
         devc = klv("DEVC", 0, klv("STRM", 0, strm_cori) + klv("STRM", 0, strm_iori))
 
-        cori, iori = _parse_gpmf_orientation_chunk(devc)
+        cori, iori, iori_mod = _parse_gpmf_orientation_chunk(devc)
         assert len(cori) == 2 and len(iori) == 2
         # first CORI: (1.0, +16384/32767, 0, 0) — x sign flipped by upstream convention
         assert cori[0] == pytest.approx([1.0, 16384 / 32767, 0.0, 0.0], abs=1e-9)
         # IORI identity
         assert iori[0] == pytest.approx([1.0, 0.0, 0.0, 0.0], abs=1e-9)
+        # the gyro_source variant rearranges to (x, y, z, w) instead
+        assert iori_mod[0] == pytest.approx([0.0, 0.0, 0.0, 1.0], abs=1e-9)
 
 # ---------------------------------------------------------------------------
 # 5. Full render through real codecs
